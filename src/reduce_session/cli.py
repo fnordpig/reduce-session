@@ -36,7 +36,12 @@ from reduce_session.reduction import (
 
 def parse_args():
     p = argparse.ArgumentParser(description="Reduce Claude Code session JSONL")
-    p.add_argument("input", help="Path to session JSONL file")
+    p.add_argument("input", nargs="?", default=None, help="Path to session JSONL file")
+    p.add_argument(
+        "--browse",
+        action="store_true",
+        help="Launch interactive TUI session browser",
+    )
     p.add_argument(
         "--tokens", action="store_true", help="Print token estimate by category"
     )
@@ -184,6 +189,24 @@ def _print_history(result):
 
 def main():
     args = parse_args()
+
+    # Launch TUI if --browse or no positional arg (and no action flags)
+    if args.browse or (
+        args.input is None and not any([args.restore, args.history, args.init])
+    ):
+        from .tui import SessionBrowserApp
+
+        app = SessionBrowserApp()
+        app.run()
+        return
+
+    if args.input is None:
+        print(
+            "Error: a session file path is required for this operation.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     INPUT = args.input
     OUTPUT = INPUT + ".reduced"
 
