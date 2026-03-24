@@ -84,6 +84,13 @@ class SessionBrowserApp(App):
         tree.clear()
         tree.root.expand()
 
+        if not self._sessions:
+            tree.root.add_leaf(Text("No sessions found", style="dim italic"))
+            self.query_one("#aggregate-stats", Static).update(
+                f" 0 sessions  ({self.projects_dir})"
+            )
+            return
+
         # Group sessions by project name
         projects: dict[str, list[SessionInfo]] = {}
         for session in self._sessions:
@@ -115,8 +122,18 @@ class SessionBrowserApp(App):
         label.append(session.short_id, style="bold")
         label.append("  ", style="dim")
         label.append(_format_tokens_short(session.token_estimate), style="dim")
-        label.append("  ", style="dim")
-        label.append(session.age_display, style="dim")
+        label.append("  ")
+
+        # Dim age more aggressively for old sessions (>7 days)
+        age_style = "dim"
+        if session.age_display.endswith("d"):
+            try:
+                days = int(session.age_display[:-1])
+                if days > 7:
+                    age_style = "#555555"
+            except ValueError:
+                pass
+        label.append(session.age_display, style=age_style)
 
         if session.parse_error:
             label.append("  ", style="dim")
@@ -148,10 +165,11 @@ class SessionBrowserApp(App):
         return self._node_to_session.get(id(node))
 
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
-        """Handle Enter/click on a session node."""
+        """Handle Enter/click on a session node (opens reduce modal)."""
         session = self._node_to_session.get(id(event.node))
         if session is not None:
             self.action_reduce()
+        # Project nodes: Textual Tree toggles expand/collapse by default
 
     def action_reduce(self) -> None:
         """Open reduce modal for the highlighted session."""
@@ -160,12 +178,20 @@ class SessionBrowserApp(App):
                 ReduceModal(self.selected_session, read_only=False),
                 callback=self._on_modal_dismiss,
             )
+        else:
+            self.notify(
+                "Select a session first (not a project folder)", severity="warning"
+            )
 
     def action_dry_run(self) -> None:
         """Run dry-run analysis for the highlighted session."""
         if self.selected_session:
             self.push_screen(
                 ReduceModal(self.selected_session, read_only=True),
+            )
+        else:
+            self.notify(
+                "Select a session first (not a project folder)", severity="warning"
             )
 
     def _on_modal_dismiss(self, applied: bool | None) -> None:

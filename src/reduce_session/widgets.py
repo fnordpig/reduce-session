@@ -221,8 +221,9 @@ class ReduceModal(ModalScreen[bool]):
         self.query_one("#safety-checks", Static).update("")
         self.query_one("#spinner", LoadingIndicator).display = True
 
-        # Update cut/fade display
-        cut, fade = 50, 75
+        # Update cut/fade display based on profile
+        cut_fade = {"gentle": (60, 85), "standard": (50, 75), "aggressive": (40, 65)}
+        cut, fade = cut_fade.get(profile, (50, 75))
         self.query_one("#cut-fade-display", Static).update(f"  cut={cut}% fade={fade}%")
 
         # Capture source mtime for staleness check

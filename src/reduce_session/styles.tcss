@@ -90,7 +90,7 @@ ReduceModal {
 
 #profile-bar {
     layout: horizontal;
-    height: 1;
+    height: auto;
     padding: 0 0 1 0;
 }
 
@@ -117,7 +117,14 @@ ReduceModal {
     margin: 0 0 0 1;
 }
 
-#spinner-container {
+#cut-fade-display {
+    color: $text-muted;
+    content-align: center middle;
+    padding: 1 0;
+}
+
+#spinner {
     height: 3;
     content-align: center middle;
 }
+
