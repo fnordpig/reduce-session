@@ -17,7 +17,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Header, Static, Tree
 
 from .session import SessionInfo, scan_projects
-from .widgets import ConversationPreview, InfoBar, token_color
+from .widgets import ConversationPreview, InfoBar, ReduceModal, token_color
 
 
 def get_projects_dir() -> Path:
@@ -138,20 +138,40 @@ class SessionBrowserApp(App):
         info_bar.update_session(session)
         preview.update_session(session)
 
+    @property
+    def selected_session(self) -> SessionInfo | None:
+        """Return the currently highlighted session, or None."""
+        tree: Tree = self.query_one("#session-tree", Tree)
+        node = tree.cursor_node
+        if node is None:
+            return None
+        return self._node_to_session.get(id(node))
+
     def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
         """Handle Enter/click on a session node."""
         session = self._node_to_session.get(id(event.node))
         if session is not None:
-            # Placeholder for Task 7 reduce modal
-            self.notify(f"Selected {session.short_id} -- reduce modal coming in Task 7")
+            self.action_reduce()
 
     def action_reduce(self) -> None:
         """Open reduce modal for the highlighted session."""
-        self.notify("Reduce modal coming in Task 7")
+        if self.selected_session:
+            self.push_screen(
+                ReduceModal(self.selected_session, read_only=False),
+                callback=self._on_modal_dismiss,
+            )
 
     def action_dry_run(self) -> None:
         """Run dry-run analysis for the highlighted session."""
-        self.notify("Dry run modal coming in Task 7")
+        if self.selected_session:
+            self.push_screen(
+                ReduceModal(self.selected_session, read_only=True),
+            )
+
+    def _on_modal_dismiss(self, applied: bool | None) -> None:
+        """Handle modal dismissal -- refresh tree if reduction was applied."""
+        if applied:
+            self._load_sessions()
 
     def action_history(self) -> None:
         """Show reduction history summary."""
