@@ -44,14 +44,17 @@ graph TD
     Left --> Tree["Tree: projects > sessions"]
     Left --> AggregateStats["Static: project/session counts"]
 
+    Right --> EmptyState["Static: 'Select a session to preview' (when none selected)"]
     Right --> InfoBar["Static: session ID, token gauge, age"]
-    Right --> ConvoLog["RichLog: conversation tail"]
+    Right --> ConvoLog["Static with Rich markup: conversation tail"]
 
-    App -.-> ReduceModal["ReduceModal: Screen overlay"]
-    ReduceModal --> Stats["Static: reduction stats"]
-    ReduceModal --> TokenViz["Static: token before/after bars"]
-    ReduceModal --> ProfileButtons["Horizontal: gentle|standard|aggressive"]
-    ReduceModal --> Actions["Horizontal: Apply | Cancel"]
+    App -.-> ReduceModal["ReduceModal: ModalScreen overlay"]
+    ReduceModal --> ProfileBar["Horizontal: gentle|standard|aggressive + cut/fade"]
+    ReduceModal --> DryRunStats["Static: lines/bytes before/after/saved"]
+    ReduceModal --> TokenViz["Static: token before/after gauge bars"]
+    ReduceModal --> StrategiesGrid["Static: two-column strategy counts"]
+    ReduceModal --> SafetyChecks["Static: parentUuid, git, .bak status"]
+    ReduceModal --> Actions["Horizontal: Apply | Cancel (Apply hidden in read-only mode)"]
 ```
 
 ## Session Discovery
@@ -60,9 +63,21 @@ graph TD
 
 Scan `~/.claude/projects/*/` for `*.jsonl` files:
 - Skip files ending in `.bak`, `.bak2`, `.reduced`
-- Skip continuation files (`UUID.TIMESTAMP.jsonl`) — group them with their parent session
-- Derive project name from directory slug: `-Users-rwaugh-src-mine-ripvec` → last path component → `ripvec`
+- Identify continuation files by pattern: `UUID.TIMESTAMP.jsonl` (UUID followed by a dot and digits). Group them with their parent `UUID.jsonl`. The main file is the one without a timestamp suffix.
+- Derive project name from directory slug: split on `-`, reverse-map to path segments, take the last meaningful component. If two projects share the same leaf name, include the parent: `work/api`, `personal/api`.
 - Session short ID: first 8 chars of the UUID filename
+
+### Error Handling
+
+Session discovery wraps all I/O in try/except:
+- `PermissionError` on directory listing: skip the project, log a warning
+- `json.JSONDecodeError` on tail parsing: mark the session with `parse_error=True`, show a warning indicator in the tree, still show file size/age
+- Zero-byte files: skip entirely
+- Truncated JSON lines (active session being written to): the tail reader already handles partial first lines by discarding them (seek to offset, skip to next newline)
+
+### Continuation Files (v1 behavior)
+
+For v1, the reduce modal operates on **the main session file only**. If continuation files exist, show an info note in the modal: "This session has N continuation file(s). Reduction applies to the main file only." Reducing all files is a v2 feature.
 
 ### Per-Session Metadata (quick-read from tail)
 
@@ -85,12 +100,12 @@ class SessionInfo:
     short_id: str          # first 8 chars
     size_bytes: int
     token_estimate: int    # from usage or heuristic
-    last_timestamp: datetime
+    last_timestamp: datetime | None
     age_display: str       # "4h", "2d", "14d"
     line_count: int
     continuation_files: list[Path]  # grouped UUID.TIMESTAMP.jsonl files
-    has_git: bool          # project dir has .git
     last_exchanges: list[Exchange]  # for preview
+    parse_error: bool      # True if tail parsing failed
 
 @dataclass
 class Exchange:
@@ -120,9 +135,19 @@ Extract last ~15 meaningful exchanges from the session tail. For each JSONL line
 | progress, system, file-history-snapshot | Skip entirely |
 | Thinking blocks | Skip (not user-facing) |
 
+### Empty State
+
+When no session is selected (app launch, project node highlighted), the preview pane shows:
+
+```
+Select a session to preview its conversation
+```
+
+Centered, dimmed, with a subtle hint about keybindings.
+
 ### Info Bar
 
-Above the conversation log, a one-line metadata bar:
+Above the conversation log, a two-line metadata bar:
 
 ```
 db776eab  ~950k tokens  4 days ago  16.5 MB  10,426 lines
@@ -130,6 +155,8 @@ db776eab  ~950k tokens  4 days ago  16.5 MB  10,426 lines
 ```
 
 Token gauge color: green (< 200k), yellow (200-500k), orange (500-800k), red (> 800k).
+
+The conversation preview uses a `Static` widget with Rich markup (not `RichLog`) to avoid append-only flicker. On session change, re-render the entire widget content.
 
 ## Health Indicators
 
@@ -139,13 +166,13 @@ In the session tree, each session node shows:
 db776eab  ~950k tok  4d  ●
 ```
 
-Where the dot is colored by token pressure (green/yellow/orange/red). Age is dimmed for sessions older than 7 days.
+Where the dot is colored by token pressure (green/yellow/orange/red). Age is dimmed for sessions older than 7 days. Sessions with `parse_error=True` show a `⚠` instead.
 
 Sorting: newest first within each project. Projects sorted alphabetically.
 
 ## Reduce Modal
 
-Pressing `r` on a selected session opens a full-screen modal overlay.
+Pressing `r` on a selected session opens a modal screen overlay (textual `ModalScreen`).
 
 ### Modal Layout
 
@@ -185,31 +212,18 @@ Pressing `r` on a selected session opens a full-screen modal overlay.
 
 ### Modal Behavior
 
-1. On open: immediately runs the reduction pipeline in-process with `--dry-run` semantics using `standard` profile
-2. Profile buttons re-run the pipeline when clicked/pressed (g/s/a keys)
-3. Results update in-place
-4. **Apply**: calls `do_apply()` (git snapshot + .bak + replace), shows success message, refreshes session list
-5. **Cancel**: discards the `.reduced` file, returns to browser
-6. Staleness check: if the session file's mtime changed since the modal opened, show a warning and refuse to apply
+1. On open: capture the file's mtime, then run the reduction pipeline in a textual Worker (`self.run_worker()`) with `standard` profile
+2. While running: show a spinner/loading indicator
+3. On completion: `Worker.StateChanged` handler updates all modal widgets on the main thread
+4. Profile buttons (g/s/a keys) **cancel** the in-flight worker before starting a new one, to prevent memory buildup from concurrent reductions on large files
+5. Results update in-place when the new worker completes
+6. **Apply**: check mtime hasn't changed since step 1. If changed, show warning and refuse. Otherwise call `do_apply()` (git snapshot + .bak + replace), show success message, dismiss modal, refresh session list.
+7. **Cancel**: discard the `.reduced` file if it exists, dismiss modal
+8. **Read-only mode** (`d` keybinding): same modal but Apply button is hidden. Only Cancel/Esc available.
 
-### History Sub-Modal
+### Staleness Check
 
-Pressing `h` on a session shows reduction history (from git tags) in a simpler modal:
-
-```
-┌─ History: db776eab ──────────────────────────────────────────────────────┐
-│                                                                          │
-│  2026-03-23 08:11  standard cut=50 fade=75                              │
-│    23.4 MB → 12.0 MB  (49% saved)                                       │
-│                                                                          │
-│  2026-03-23 19:03  standard cut=50 fade=75                              │
-│    16.5 MB → 13.5 MB  (18% saved)                                       │
-│                                                                          │
-│  2 reductions. Current: 13.5 MB                                          │
-│                                                                          │
-│  [r]estore to pre-reduction    [Esc] close                              │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+Capture `os.path.getmtime(path)` at worker start (not modal open), check at apply time. If the file changed between worker-start and apply, the reduction was computed against stale data. Show: "Session file was modified since analysis. Re-run reduction first."
 
 ## Key Bindings
 
@@ -219,33 +233,41 @@ Pressing `h` on a session shows reduction history (from git tags) in a simpler m
 | `Enter` | Tree (project node) | Expand/collapse project |
 | `Enter` or `r` | Tree (session node) | Open reduce modal |
 | `d` | Tree (session node) | Open reduce modal in read-only mode (no Apply) |
+| `h` | Tree (session node) | Show reduction history (v2 — for now print to status bar) |
 | `i` | Tree (session node) | Init git repo for that project |
-| `h` | Tree (session node) | Show reduction history |
 | `R` | Global | Refresh session list |
 | `q` | Global | Quit |
 | `Esc` | Modal | Close modal |
 | `g`/`s`/`a` | Reduce modal | Switch profile (gentle/standard/aggressive) |
-| `Enter` | Reduce modal | Apply |
+| `Enter` | Reduce modal | Apply (if not read-only) |
 
 ## Module Structure
 
 ```
 src/reduce_session/
     __init__.py
-    cli.py              # existing CLI entry point (unchanged)
-    tui.py              # SessionBrowserApp, main TUI
+    cli.py              # CLI entry point: parse_args, main, do_init/apply/restore/history
+    tui.py              # SessionBrowserApp, screen composition
     session.py          # SessionInfo discovery, tail parsing, Exchange extraction
-    widgets.py          # TokenGauge, ConversationPreview, ReduceModal, HistoryModal
-    reduction.py        # extracted reduction pipeline (refactored from cli.py)
+    widgets.py          # TokenGauge, ConversationPreview, ReduceModal
+    reduction.py        # reduction pipeline + ReductionResult + TokenBudget + PROFILES
+    git_ops.py          # git preservation: ensure_git_repo, git_snapshot, restore, tags, history
     styles.tcss         # textual CSS stylesheet
 ```
 
-### Refactoring cli.py
+### Module Boundaries
 
-The reduction pipeline logic (passes 1-5: build maps, drop/reparent, cross-message intelligence, position-aware trimming, orphan repair) needs to be callable from both the CLI and the TUI modal. Extract into `reduction.py`:
+**`reduction.py`** — everything needed to run a reduction:
+- `PROFILES` dict
+- `CHARS_PER_TOKEN`, `ENVELOPE_FIELDS`
+- `TokenBudget` class
+- All helper functions: `truncate`, `trim_string`, `strip_shell_banners`, `strip_cargo_noise`, `clean_bash_text`, `get_content_blocks`, `text_of`, `get_msg_type`, `is_droppable_line`
+- All detection functions: `detect_stale_reads`, `detect_duplicate_blocks`, `detect_error_retries`, `dedup_system_reminders`, `detect_constant_envelope_fields`, `fix_orphaned_tool_results`
+- All trimming functions: `make_aggressiveness_fn`, `blended_limit`, `trim_tool_result`, `trim_toolUseResult`
+- `extract_last_usage()`
+- `reduce_session()` orchestrator → `ReductionResult`
 
 ```python
-# reduction.py
 @dataclass
 class ReductionResult:
     kept_lines: list[str]
@@ -254,21 +276,39 @@ class ReductionResult:
     orig_size: int
     new_count: int
     new_size: int
-    token_budget: TokenBudget | None
-
-def reduce_session(
-    input_path: str,
-    profile: str = "standard",
-    cut: int = 50,
-    fade: int = 75,
-    estimate_tokens: bool = False,
-    chars_per_token: float = 3.7,
-) -> ReductionResult:
-    """Run the full reduction pipeline and return results without writing."""
-    ...
+    orig_budget: TokenBudget | None   # token estimate of original
+    reduced_budget: TokenBudget | None  # token estimate after reduction
+    api_tokens: int | None            # from last message.usage (for calibration)
 ```
 
-`cli.py` calls `reduce_session()` then handles output/apply/restore. `widgets.py` calls `reduce_session()` in a worker thread to keep the TUI responsive.
+**`git_ops.py`** — all git operations (used by both cli.py and widgets.py):
+- `GITIGNORE_CONTENT`
+- `_run_git`, `ensure_git_repo`, `_write_gitignore`, `_update_gitignore`
+- `git_snapshot`, `git_restore_from_tag`
+- `session_short_id`, `make_tag`, `get_reduction_tags`, `get_tag_file_size`
+- `do_init`, `do_apply`, `do_restore`, `do_history`, `find_backups`
+
+**`cli.py`** — CLI-only concerns:
+- `parse_args()` (updated: no args launches TUI, `--browse` explicit flag)
+- `main()` — dispatches to TUI or CLI reduction/apply/restore/init/history
+- Imports from `reduction` and `git_ops`
+
+**`session.py`** — session discovery (used by TUI):
+- `SessionInfo`, `Exchange` dataclasses
+- `scan_projects()` → `list[SessionInfo]`
+- `parse_tail()` → extracts exchanges, token estimate, timestamp from tail
+- `format_age()` → "4h", "2d", "14d"
+
+**`tui.py`** — app composition (used by cli.py when no args):
+- `SessionBrowserApp` — mounts Header, Horizontal(tree, preview), Footer
+- Key binding handlers
+- `on_tree_node_highlighted` → updates preview pane
+
+**`widgets.py`** — custom widgets (used by tui.py):
+- `SessionTree` — Tree with project/session nodes, health indicators
+- `ConversationPreview` — Static with Rich markup for exchanges
+- `TokenGauge` — colored bar widget
+- `ReduceModal` — ModalScreen with all reduction UI, worker management
 
 ### Entry Points
 
@@ -277,7 +317,7 @@ def reduce_session(
 reduce-session = "reduce_session.cli:main"
 ```
 
-Update `cli.py` `parse_args()`: when invoked with no args, launch the TUI instead of erroring. Add `--browse` as an explicit flag too.
+No args → TUI. Any flag (`--dry-run`, `--apply`, etc.) → CLI behavior (unchanged).
 
 ## Dependencies
 
@@ -287,9 +327,17 @@ dependencies = ["textual>=1.0"]
 
 ## Visual Design Notes
 
-- Dark theme default (textual's dark mode) — these are terminal users
-- Token gauges use textual's `ProgressBar` or custom `Static` with Rich markup for colored block chars (▓░)
-- Conversation preview uses Rich markup for role colors (cyan user, amber assistant, dim tool calls, red errors)
-- Modal uses textual `Screen` with semi-transparent background overlay
-- Tree uses textual `Tree` widget with custom node rendering for session metadata
-- Aim for striking: the token gauge and reduction before/after bars should be the visual anchors
+- Dark theme (textual dark mode) — terminal users
+- Token gauges: custom `Static` with Rich markup for colored block chars (▓░), not ProgressBar (more control over color breakpoints)
+- Conversation preview: `Static` with Rich markup (cyan user, amber assistant, dim tools, red errors). Re-render on selection change, no append-only flicker.
+- Modal: textual `ModalScreen` with semi-transparent background
+- Tree: textual `Tree` widget with custom `TreeNode` labels using Rich `Text` for inline color/dimming
+- Aim for striking: the token gauge bars and before/after reduction visualization should be the visual anchors
+
+## v2 Features (deferred)
+
+- History sub-modal with restore capability (currently CLI-only via `--history` / `--restore`)
+- Reduce all continuation files in one operation
+- Batch reduce across multiple sessions
+- Interactive cut/fade sliders in the modal
+- `[i]` in-TUI git init (for now, show message directing to `reduce-session --init`)
