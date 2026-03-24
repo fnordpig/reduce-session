@@ -1,0 +1,1003 @@
+"""Core reduction pipeline for Claude Code session JSONL files.
+
+This module contains all the logic for analyzing and reducing session files.
+It is used by both the CLI and the TUI. The main entry point is reduce_session(),
+which reads a file and returns a ReductionResult with no side effects.
+"""
+
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
+
+# --- Limit profiles ---
+
+PROFILES = {
+    "aggressive": {
+        "aggressive": {
+            "Bash": 1000,
+            "Read": 1000,
+            "Agent": 2000,
+            "Write": 500,
+            "Edit": 500,
+            "mcp": 2000,
+            "default": 1000,
+            "tur.originalFile": 100,
+            "tur.stdout": 1000,
+            "tur.content": 500,
+            "tur.oldString": 500,
+            "tur.newString": 500,
+            "tur.file": 500,
+            "tool_input.Write": 500,
+            "tool_input.Edit": 500,
+            "tool_input.Agent": 1000,
+            "thinking": 0,
+            "user_text": 1000,
+        },
+        "gentle": {
+            "Bash": 4000,
+            "Read": 6000,
+            "Agent": 8000,
+            "Write": 3000,
+            "Edit": 2000,
+            "mcp": 8000,
+            "default": 4000,
+            "tur.originalFile": 500,
+            "tur.stdout": 4000,
+            "tur.content": 3000,
+            "tur.oldString": 2000,
+            "tur.newString": 2000,
+            "tur.file": 3000,
+            "tool_input.Write": 3000,
+            "tool_input.Edit": 2000,
+            "tool_input.Agent": 4000,
+            "thinking": 2000,
+            "user_text": 6000,
+        },
+    },
+    "standard": {
+        "aggressive": {
+            "Bash": 1500,
+            "Read": 2000,
+            "Agent": 3000,
+            "Write": 1000,
+            "Edit": 800,
+            "mcp": 4000,
+            "default": 2000,
+            "tur.originalFile": 200,
+            "tur.stdout": 1500,
+            "tur.content": 1000,
+            "tur.oldString": 800,
+            "tur.newString": 800,
+            "tur.file": 1000,
+            "tool_input.Write": 1000,
+            "tool_input.Edit": 800,
+            "tool_input.Agent": 1500,
+            "thinking": 0,
+            "user_text": 2000,
+        },
+        "gentle": {
+            "Bash": 6000,
+            "Read": 8000,
+            "Agent": 12000,
+            "Write": 4000,
+            "Edit": 3000,
+            "mcp": 16000,
+            "default": 8000,
+            "tur.originalFile": 1000,
+            "tur.stdout": 6000,
+            "tur.content": 4000,
+            "tur.oldString": 3000,
+            "tur.newString": 3000,
+            "tur.file": 4000,
+            "tool_input.Write": 4000,
+            "tool_input.Edit": 3000,
+            "tool_input.Agent": 6000,
+            "thinking": 4000,
+            "user_text": 10000,
+        },
+    },
+    "gentle": {
+        "aggressive": {
+            "Bash": 3000,
+            "Read": 4000,
+            "Agent": 6000,
+            "Write": 2000,
+            "Edit": 1500,
+            "mcp": 8000,
+            "default": 4000,
+            "tur.originalFile": 500,
+            "tur.stdout": 3000,
+            "tur.content": 2000,
+            "tur.oldString": 1500,
+            "tur.newString": 1500,
+            "tur.file": 2000,
+            "tool_input.Write": 2000,
+            "tool_input.Edit": 1500,
+            "tool_input.Agent": 3000,
+            "thinking": 1000,
+            "user_text": 4000,
+        },
+        "gentle": {
+            "Bash": 12000,
+            "Read": 16000,
+            "Agent": 20000,
+            "Write": 8000,
+            "Edit": 6000,
+            "mcp": 32000,
+            "default": 16000,
+            "tur.originalFile": 2000,
+            "tur.stdout": 12000,
+            "tur.content": 8000,
+            "tur.oldString": 6000,
+            "tur.newString": 6000,
+            "tur.file": 8000,
+            "tool_input.Write": 8000,
+            "tool_input.Edit": 6000,
+            "tool_input.Agent": 12000,
+            "thinking": 8000,
+            "user_text": 20000,
+        },
+    },
+}
+
+ENVELOPE_FIELDS = {"cwd", "version", "gitBranch", "slug", "userType"}
+CHARS_PER_TOKEN = 3.7
+
+
+# --- Gradient functions ---
+
+
+def make_aggressiveness_fn(cut_pct, fade_pct):
+    """Return a function mapping position [0,1] to aggressiveness [0,1]."""
+    cut = cut_pct / 100.0
+    fade = fade_pct / 100.0
+    span = fade - cut if fade > cut else 0.01
+
+    def fn(position):
+        if position < cut:
+            return 1.0
+        elif position < fade:
+            return 1.0 - (position - cut) / span
+        else:
+            return 0.0
+
+    return fn
+
+
+def blended_limit(key, aggr, aggressive_limits, gentle_limits):
+    g = gentle_limits.get(key, gentle_limits["default"])
+    a = aggressive_limits.get(key, aggressive_limits["default"])
+    return int(g + aggr * (a - g))
+
+
+# --- Token estimator ---
+
+
+def extract_last_usage(messages):
+    """Find the last main-chain assistant message.usage for calibration."""
+    for line in reversed(messages):
+        obj = json.loads(line) if isinstance(line, str) else line
+        if obj.get("type") != "assistant":
+            continue
+        if obj.get("isSidechain"):
+            continue
+        usage = obj.get("message", {}).get("usage")
+        if usage and isinstance(usage, dict):
+            inp = usage.get("input_tokens", 0) or 0
+            cache_read = usage.get("cache_read_input_tokens", 0) or 0
+            cache_create = usage.get("cache_creation_input_tokens", 0) or 0
+            total = inp + cache_read + cache_create
+            if total > 0:
+                return total
+    return None
+
+
+class TokenBudget:
+    """Track estimated context-window token usage by category.
+
+    Only counts text payloads within message.content blocks -- the part that
+    fills the context window. If the original file has message.usage data,
+    we calibrate our chars/token ratio against the real API count.
+    """
+
+    def __init__(self, chars_per_token=CHARS_PER_TOKEN, api_tokens=None):
+        self.cpt = chars_per_token
+        self.api_tokens = api_tokens  # from last message.usage, for calibration
+        self.context = {
+            "user_prompts": 0,
+            "tool_results": 0,
+            "tool_calls": 0,
+            "assistant_text": 0,
+            "thinking": 0,
+            "system": 0,
+        }
+        self._raw_chars = 0  # total chars before token conversion
+
+    def _tok(self, chars):
+        return int(chars / self.cpt)
+
+    def add(self, bucket, chars):
+        self._raw_chars += chars
+        self.context[bucket] = self.context.get(bucket, 0) + self._tok(chars)
+
+    def _tool_result_text(self, block):
+        """Extract only the text payload from a tool_result block."""
+        content = block.get("content", "")
+        if isinstance(content, str):
+            return len(content)
+        if isinstance(content, list):
+            total = 0
+            for item in content:
+                if isinstance(item, dict):
+                    total += len(item.get("text", ""))
+            return total
+        return 0
+
+    def _tool_use_text(self, block):
+        """Extract the text payload from a tool_use block's input.
+
+        Only counts string values in the input dict -- the actual content
+        the model sees. JSON structure, keys, and UUIDs are not tokens.
+        """
+        inp = block.get("input", {})
+        if not isinstance(inp, dict):
+            return 0
+        total = 0
+        # Count the tool name
+        total += len(block.get("name", ""))
+        # Count string values in input (file paths, content, prompts, commands)
+        for v in inp.values():
+            if isinstance(v, str):
+                total += len(v)
+        return total
+
+    def add_obj(self, obj):
+        t = obj.get("type", "")
+        if t == "system":
+            c = obj.get("message", {}).get("content", "")
+            self.add("system", len(c) if isinstance(c, str) else 0)
+            return
+
+        blocks = get_content_blocks(obj)
+        if t == "user":
+            msg = obj.get("message", {})
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                self.add("user_prompts", len(content))
+            for b in blocks:
+                bt = b.get("type", "")
+                if bt == "tool_result":
+                    self.add("tool_results", self._tool_result_text(b))
+                elif bt == "text":
+                    self.add("user_prompts", len(b.get("text", "")))
+        elif t == "assistant":
+            for b in blocks:
+                bt = b.get("type", "")
+                if bt == "text":
+                    self.add("assistant_text", len(b.get("text", "")))
+                elif bt == "tool_use":
+                    self.add("tool_calls", self._tool_use_text(b))
+                elif bt == "thinking":
+                    self.add("thinking", len(b.get("thinking", "")))
+
+    @property
+    def context_total(self):
+        return sum(self.context.values())
+
+    def report(self, reduced_chars=None):
+        """Report token estimates. If reduced_chars given, also estimate reduced tokens."""
+        # Calibrate if we have real API data
+        calibrated_cpt = self.cpt
+        if self.api_tokens and self._raw_chars > 0:
+            calibrated_cpt = self._raw_chars / self.api_tokens
+
+        ct = self.context_total
+        lines = []
+
+        if self.api_tokens:
+            lines.append(
+                f"\nToken estimate (calibrated: {calibrated_cpt:.1f} chars/tok from API usage):"
+            )
+            lines.append(f"  {'last API count':20s} {self.api_tokens:>8,}")
+            calibrated_total = int(self._raw_chars / calibrated_cpt)
+            lines.append(f"  {'our estimate':20s} {calibrated_total:>8,}")
+        else:
+            lines.append(
+                f"\nToken estimate (heuristic: {self.cpt:.1f} chars/tok, no API data to calibrate):"
+            )
+
+        lines.append(f"")
+        lines.append(f"  Breakdown by category:")
+        for bucket, tokens in sorted(self.context.items(), key=lambda x: -x[1]):
+            if tokens > 0:
+                pct = tokens / ct * 100 if ct else 0
+                lines.append(f"    {bucket:20s} {tokens:>8,} ({pct:4.1f}%)")
+
+        if reduced_chars is not None and self._raw_chars > 0:
+            ratio = reduced_chars / self._raw_chars
+            if self.api_tokens:
+                reduced_tokens = int(self.api_tokens * ratio)
+            else:
+                reduced_tokens = int(reduced_chars / self.cpt)
+            lines.append(f"")
+            lines.append(f"  Estimated after reduction: {reduced_tokens:,} tokens")
+            if reduced_tokens > 1_000_000:
+                lines.append(
+                    f"  ** exceeds 1M -- Claude Code will auto-compact on resume **"
+                )
+            elif (
+                self.api_tokens
+                and self.api_tokens > 1_000_000
+                and reduced_tokens <= 1_000_000
+            ):
+                lines.append(f"  ** fits in 1M context -- no auto-compact needed **")
+
+        return "\n".join(lines)
+
+
+# --- Text helpers ---
+
+
+def truncate(text, limit, label=""):
+    if not isinstance(text, str) or len(text) <= limit:
+        return text
+    half = limit // 2
+    return (
+        text[:half]
+        + f"\n[...{label} truncated {len(text)}->{limit}...]\n"
+        + text[-half:]
+    )
+
+
+def trim_string(obj, key, limit, label):
+    val = obj.get(key)
+    if isinstance(val, str) and len(val) > limit:
+        obj[key] = truncate(val, limit, label)
+
+
+def strip_shell_banners(text):
+    if not isinstance(text, str):
+        return text
+    lines = text.split("\n")
+    cleaned = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if sum(1 for c in line if c in "/_\\|") > 8 and any(
+            p in line for p in ["____", "/ /", "/_/", "\\__"]
+        ):
+            while i < len(lines) and (
+                (
+                    any(p in lines[i] for p in ["____", "/ /", "/_/", "\\__", "/ \\"])
+                    and sum(1 for c in lines[i] if c in "/_\\|") > 5
+                )
+                or (
+                    lines[i].strip() == ""
+                    and i + 1 < len(lines)
+                    and any(p in lines[i + 1] for p in ["____", "/ /", "/_/"])
+                )
+            ):
+                i += 1
+            while i < len(lines) and lines[i].strip() == "":
+                i += 1
+        else:
+            cleaned.append(line)
+            i += 1
+    return "\n".join(cleaned)
+
+
+def strip_cargo_noise(text):
+    if not isinstance(text, str):
+        return text
+    prefixes = ("Compiling ", "Downloading ", "Downloaded ", "Fresh ", "Updating ")
+    lines = text.split("\n")
+    cleaned = []
+    noise = 0
+    for line in lines:
+        if any(line.strip().startswith(p) for p in prefixes):
+            noise += 1
+            if noise == 1:
+                cleaned.append(line)
+        else:
+            if noise > 1:
+                cleaned.append(f"  [...{noise - 1} more cargo lines...]")
+            noise = 0
+            cleaned.append(line)
+    if noise > 1:
+        cleaned.append(f"  [...{noise - 1} more cargo lines...]")
+    return "\n".join(cleaned)
+
+
+def clean_bash_text(text):
+    return strip_cargo_noise(strip_shell_banners(text))
+
+
+# --- Content block helpers ---
+
+
+def get_content_blocks(msg):
+    m = msg.get("message", {})
+    content = m.get("content", [])
+    return content if isinstance(content, list) else []
+
+
+def text_of(block):
+    for key in ("text", "thinking", "content"):
+        val = block.get(key, "")
+        if isinstance(val, str) and val:
+            return val
+    return ""
+
+
+def get_msg_type(msg):
+    return msg.get("type", "unknown")
+
+
+# --- Line-level filtering ---
+
+
+def is_droppable_line(obj):
+    t = obj.get("type", "")
+    if t in ("progress", "file-history-snapshot", "queue-operation", "last-prompt"):
+        return t
+    if t == "user":
+        content = obj.get("message", {}).get("content", "")
+        if isinstance(content, str):
+            if "<task-notification>" in content:
+                return "task_notification"
+            if (
+                "<local-command-caveat>" in content
+                or "<local-command-stdout>" in content
+            ):
+                return "local_cmd_noise"
+            noise_cmds = [
+                "/reload-plugins",
+                "/plugin",
+                "/mcp",
+                "/login",
+                "/effort",
+                "/compact",
+            ]
+            if "<command-name>" in content:
+                for cmd in noise_cmds:
+                    if f">{cmd}<" in content:
+                        return "local_cmd_noise"
+    return None
+
+
+# --- Cross-message intelligence ---
+
+
+def detect_stale_reads(kept_objs):
+    file_events = {}
+    for pos, obj in enumerate(kept_objs):
+        for block in get_content_blocks(obj):
+            if block.get("type") == "tool_use":
+                name = block.get("name", "")
+                inp = block.get("input", {})
+                if not isinstance(inp, dict):
+                    continue
+                fp = inp.get("file_path", "")
+                if not fp:
+                    continue
+                if name in ("Read", "read"):
+                    file_events.setdefault(fp, []).append(
+                        (pos, "read", block.get("id", ""))
+                    )
+                elif name in ("Edit", "edit", "Write", "write"):
+                    file_events.setdefault(fp, []).append((pos, "edit", ""))
+    stale_ids = set()
+    for fp, events in file_events.items():
+        events.sort(key=lambda x: x[0])
+        for i, (pos, etype, tool_id) in enumerate(events):
+            if etype == "read" and tool_id:
+                if any(events[j][1] == "edit" for j in range(i + 1, len(events))):
+                    stale_ids.add(tool_id)
+    return stale_ids
+
+
+def detect_duplicate_blocks(kept_objs, min_size=1024):
+    block_hashes = {}
+    for pos, obj in enumerate(kept_objs):
+        for bi, block in enumerate(get_content_blocks(obj)):
+            text = text_of(block)
+            if len(text) >= min_size:
+                h = hashlib.md5(text.encode()).hexdigest()
+                block_hashes.setdefault(h, []).append((pos, bi, len(text)))
+    duplicates = set()
+    for h, occurrences in block_hashes.items():
+        if len(occurrences) > 1:
+            for pos, bi, _ in occurrences[1:]:
+                duplicates.add((pos, bi))
+    return duplicates
+
+
+def detect_error_retries(kept_objs):
+    tool_seq = []
+    for pos, obj in enumerate(kept_objs):
+        for block in get_content_blocks(obj):
+            if block.get("type") == "tool_use":
+                inp = json.dumps(block.get("input", {}), sort_keys=True)
+                h = hashlib.md5(inp.encode()).hexdigest()
+                tool_seq.append((pos, block.get("name", ""), h, False))
+            elif block.get("type") == "tool_result" and block.get("is_error"):
+                tool_seq.append((pos, "_error", "", True))
+    drop_positions = set()
+    i = 0
+    while i < len(tool_seq) - 2:
+        pos_a, name_a, hash_a, err_a = tool_seq[i]
+        if not err_a and name_a != "_error":
+            retries = []
+            j = i + 1
+            while j < len(tool_seq) - 1:
+                if not tool_seq[j][3]:
+                    break
+                if j + 1 < len(tool_seq):
+                    _, nr, hr, _ = tool_seq[j + 1]
+                    if nr == name_a and hr == hash_a:
+                        retries.append((tool_seq[j][0], tool_seq[j + 1][0]))
+                        j += 2
+                        continue
+                break
+            if retries:
+                for ep, rp in retries[:-1]:
+                    drop_positions.update((ep, rp))
+            i = j if retries else i + 1
+        else:
+            i += 1
+    return drop_positions
+
+
+def dedup_system_reminders(text):
+    if not isinstance(text, str) or "<system-reminder>" not in text:
+        return text
+    pattern = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+    seen = set()
+
+    def replacer(m):
+        h = hashlib.md5(m.group(0).encode()).hexdigest()
+        if h in seen:
+            return ""
+        seen.add(h)
+        return m.group(0)
+
+    result = pattern.sub(replacer, text)
+    return re.sub(r"\n{3,}", "\n\n", result).strip() if seen else text
+
+
+def detect_constant_envelope_fields(kept_objs):
+    field_values = {f: set() for f in ENVELOPE_FIELDS}
+    for obj in kept_objs:
+        for f in ENVELOPE_FIELDS:
+            if f in obj:
+                field_values[f].add(str(obj[f]))
+    return {f for f, vals in field_values.items() if len(vals) == 1}
+
+
+def fix_orphaned_tool_results(kept_objs):
+    use_ids = set()
+    for obj in kept_objs:
+        for block in get_content_blocks(obj):
+            if block.get("type") == "tool_use":
+                uid = block.get("id", "")
+                if uid:
+                    use_ids.add(uid)
+    orphans = 0
+    result = []
+    for obj in kept_objs:
+        blocks = get_content_blocks(obj)
+        has_orphan = any(
+            b.get("type") == "tool_result"
+            and b.get("tool_use_id", "") not in use_ids
+            and b.get("tool_use_id", "")
+            for b in blocks
+        )
+        if not has_orphan:
+            result.append(obj)
+            continue
+        new_blocks = [
+            b
+            for b in blocks
+            if not (
+                b.get("type") == "tool_result"
+                and b.get("tool_use_id", "")
+                and b.get("tool_use_id", "") not in use_ids
+            )
+        ]
+        orphans += len(blocks) - len(new_blocks)
+        if new_blocks:
+            obj = json.loads(json.dumps(obj))
+            if "message" in obj and isinstance(obj["message"].get("content"), list):
+                obj["message"]["content"] = new_blocks
+            result.append(obj)
+        else:
+            orphans += 1
+    return result, orphans
+
+
+# --- Position-aware trimming ---
+
+
+def trim_tool_result(block, tool_name, aggr, agg_lim, gen_lim):
+    inner = block.get("content")
+    key = (
+        tool_name
+        if tool_name in gen_lim
+        else ("mcp" if tool_name.startswith("mcp__") else "default")
+    )
+    limit = blended_limit(key, aggr, agg_lim, gen_lim)
+    if isinstance(inner, str):
+        if tool_name == "Bash":
+            inner = clean_bash_text(inner)
+        inner = dedup_system_reminders(inner)
+        block["content"] = truncate(inner, limit, tool_name)
+    elif isinstance(inner, list):
+        for item in inner:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text", "")
+                if tool_name == "Bash":
+                    text = clean_bash_text(text)
+                text = dedup_system_reminders(text)
+                item["text"] = truncate(text, limit, tool_name)
+
+
+def trim_toolUseResult(tur, aggr, agg_lim, gen_lim):
+    if not isinstance(tur, dict):
+        return
+    bl = lambda k: blended_limit(k, aggr, agg_lim, gen_lim)
+    trim_string(tur, "originalFile", bl("tur.originalFile"), "tur.originalFile")
+    if isinstance(tur.get("stdout"), str):
+        tur["stdout"] = clean_bash_text(tur["stdout"])
+        trim_string(tur, "stdout", bl("tur.stdout"), "tur.stdout")
+    trim_string(tur, "content", bl("tur.content"), "tur.content")
+    trim_string(tur, "oldString", bl("tur.oldString"), "tur.oldString")
+    trim_string(tur, "newString", bl("tur.newString"), "tur.newString")
+    sp = tur.get("structuredPatch")
+    if isinstance(sp, list):
+        max_lines = int(20 + (1 - aggr) * 40)
+        for patch in sp:
+            if isinstance(patch, dict):
+                pl = patch.get("lines")
+                if isinstance(pl, list) and len(pl) > max_lines:
+                    half = max_lines // 2
+                    patch["lines"] = pl[:half] + ["[...truncated...]"] + pl[-half:]
+    file_val = tur.get("file")
+    fl = bl("tur.file")
+    if isinstance(file_val, dict):
+        trim_string(file_val, "content", fl, "tur.file.content")
+    elif isinstance(file_val, str) and len(file_val) > fl:
+        tur["file"] = truncate(file_val, fl, "tur.file")
+    if isinstance(tur.get("content"), str) and "prompt" in tur:
+        trim_string(tur, "content", bl("Agent"), "tur.agent.content")
+        trim_string(tur, "prompt", bl("tool_input.Agent"), "tur.agent.prompt")
+
+
+# --- Orchestrator ---
+
+
+@dataclass
+class ReductionResult:
+    kept_lines: list[str]  # serialized JSON lines (newline-terminated)
+    stats: dict[str, int] = field(default_factory=dict)
+    orig_count: int = 0
+    orig_size: int = 0
+    new_count: int = 0
+    new_size: int = 0
+    orig_budget: TokenBudget | None = None
+    reduced_budget: TokenBudget | None = None
+    api_tokens: int | None = None
+
+
+def reduce_session(
+    path: str,
+    profile: str = "standard",
+    cut: int = 50,
+    fade: int = 75,
+    chars_per_token: float = CHARS_PER_TOKEN,
+    estimate_tokens: bool = False,
+) -> ReductionResult:
+    """Run the full reduction pipeline on a session JSONL file.
+
+    Reads the file, applies all reduction passes, and returns a ReductionResult.
+    This function has no side effects (does not write files or print output).
+    """
+    prof = PROFILES[profile]
+    agg_lim = prof["aggressive"]
+    gen_lim = prof["gentle"]
+    aggr_fn = make_aggressiveness_fn(cut, fade)
+
+    with open(path) as f:
+        lines = f.readlines()
+
+    # Extract API token count before we strip usage fields (for calibration)
+    api_tokens = extract_last_usage(lines) if estimate_tokens else None
+    budget = TokenBudget(chars_per_token, api_tokens) if estimate_tokens else None
+
+    orig_size = sum(len(l) for l in lines)
+    orig_count = len(lines)
+    stats = {}
+
+    def count(reason):
+        stats[reason] = stats.get(reason, 0) + 1
+
+    # -- Pass 1: Build maps --
+    tool_id_map = {}
+    for line in lines:
+        obj = json.loads(line)
+        if obj.get("type") == "assistant":
+            for block in get_content_blocks(obj):
+                if block.get("type") == "tool_use":
+                    tool_id_map[block.get("id", "")] = block.get("name", "unknown")
+
+    # -- Pass 2: Drop noise, reparent --
+    dropped_uuids = {}
+    kept_objs = []
+    seen_system = set()
+
+    parsed = [json.loads(line) for line in lines]
+
+    # Populate budget from original objects (before any trimming)
+    if budget:
+        for obj in parsed:
+            budget.add_obj(obj)
+
+    for obj in parsed:
+        drop = False
+        reason = is_droppable_line(obj)
+        if reason:
+            count(reason)
+            drop = True
+        elif get_msg_type(obj) == "system":
+            c = obj.get("message", {}).get("content", "")
+            h = hash(c) if isinstance(c, str) else hash(str(c))
+            if h in seen_system:
+                count("dup_system")
+                drop = True
+            else:
+                seen_system.add(h)
+        if drop:
+            uuid = obj.get("uuid")
+            if uuid:
+                dropped_uuids[uuid] = obj.get("parentUuid")
+        else:
+            kept_objs.append(json.loads(json.dumps(obj)))
+
+    reparented = 0
+    for obj in kept_objs:
+        parent = obj.get("parentUuid")
+        if parent and parent in dropped_uuids:
+            visited = set()
+            while parent in dropped_uuids and parent not in visited:
+                visited.add(parent)
+                parent = dropped_uuids[parent]
+            obj["parentUuid"] = parent
+            reparented += 1
+    if reparented:
+        stats["reparented"] = reparented
+
+    # -- Pass 3: Cross-message intelligence --
+    stale_read_ids = detect_stale_reads(kept_objs)
+    if stale_read_ids:
+        stats["stale_reads_detected"] = len(stale_read_ids)
+    duplicate_blocks = detect_duplicate_blocks(kept_objs)
+    if duplicate_blocks:
+        stats["duplicate_blocks_detected"] = len(duplicate_blocks)
+    error_retry_drops = detect_error_retries(kept_objs)
+    if error_retry_drops:
+        stats["error_retries_collapsed"] = len(error_retry_drops)
+    constant_fields = detect_constant_envelope_fields(kept_objs)
+
+    if error_retry_drops:
+        for i in sorted(error_retry_drops):
+            obj = kept_objs[i]
+            uuid = obj.get("uuid")
+            if uuid:
+                dropped_uuids[uuid] = obj.get("parentUuid")
+        new_kept = []
+        for i, obj in enumerate(kept_objs):
+            if i in error_retry_drops:
+                continue
+            parent = obj.get("parentUuid")
+            if parent and parent in dropped_uuids:
+                visited = set()
+                while parent in dropped_uuids and parent not in visited:
+                    visited.add(parent)
+                    parent = dropped_uuids[parent]
+                obj["parentUuid"] = parent
+            new_kept.append(obj)
+        kept_objs = new_kept
+
+    total = len(kept_objs)
+
+    # -- Pass 4: Position-aware trimming --
+    bl = lambda key, aggr: blended_limit(key, aggr, agg_lim, gen_lim)
+
+    for pos, obj in enumerate(kept_objs):
+        position = pos / max(total - 1, 1)
+        aggr = aggr_fn(position)
+        t = get_msg_type(obj)
+
+        # Envelope stripping (old zone only)
+        if pos > 0 and aggr > 0.3:
+            for f in constant_fields:
+                if f in obj:
+                    del obj[f]
+
+        # -- User messages --
+        if t == "user":
+            msg = obj.get("message", {})
+            content = msg.get("content")
+
+            if isinstance(content, str):
+                user_limit = bl("user_text", aggr)
+                if len(content) > user_limit:
+                    msg["content"] = truncate(content, user_limit, "user_prompt")
+                    count("user_prompt_trimmed")
+
+            if isinstance(content, list):
+                user_limit = bl("user_text", aggr)
+                for bi, block in enumerate(content):
+                    if not isinstance(block, dict):
+                        continue
+                    bt = block.get("type")
+
+                    if bt == "text":
+                        text = block.get("text", "")
+                        if isinstance(text, str) and len(text) > user_limit:
+                            block["text"] = truncate(text, user_limit, "user_text")
+                            count("user_prompt_trimmed")
+
+                    elif bt == "tool_result":
+                        tool_id = block.get("tool_use_id", "")
+                        tool_name = tool_id_map.get(tool_id, "unknown")
+
+                        if tool_id in stale_read_ids and aggr > 0.5:
+                            inner = block.get("content")
+                            if isinstance(inner, str) and len(inner) > 200:
+                                block["content"] = "[stale: file was later edited]"
+                                count("stale_reads_trimmed")
+                                continue
+                            elif isinstance(inner, list):
+                                for item in inner:
+                                    if (
+                                        isinstance(item, dict)
+                                        and item.get("type") == "text"
+                                    ):
+                                        if len(item.get("text", "")) > 200:
+                                            item["text"] = (
+                                                "[stale: file was later edited]"
+                                            )
+                                            count("stale_reads_trimmed")
+                                continue
+
+                        trim_tool_result(block, tool_name, aggr, agg_lim, gen_lim)
+
+                    if (pos, bi) in duplicate_blocks:
+                        text = text_of(block)
+                        preview = text[:60].replace("\n", " ")
+                        if bt == "text":
+                            block["text"] = (
+                                f"[duplicate content, first seen earlier: {preview}...]"
+                            )
+                        elif bt == "tool_result" and isinstance(
+                            block.get("content"), str
+                        ):
+                            block["content"] = f"[duplicate content: {preview}...]"
+                        count("duplicate_blocks_deduped")
+
+        # -- Assistant messages --
+        elif t == "assistant":
+            msg = obj.get("message", {})
+            if "usage" in msg:
+                del msg["usage"]
+            for mf in ("stop_reason", "stop_sequence"):
+                if mf in msg:
+                    del msg[mf]
+            for ef in ("costUSD", "duration", "apiDuration"):
+                if ef in obj:
+                    del obj[ef]
+
+            content = msg.get("content")
+            if isinstance(content, list):
+                new_content = []
+                for bi, block in enumerate(content):
+                    if not isinstance(block, dict):
+                        new_content.append(block)
+                        continue
+                    bt = block.get("type")
+
+                    if bt == "thinking":
+                        think_limit = bl("thinking", aggr)
+                        thinking = block.get("thinking", "")
+                        if think_limit == 0:
+                            count("thinking_removed")
+                            continue
+                        block = dict(block)
+                        if len(thinking) > think_limit:
+                            block["thinking"] = truncate(
+                                thinking, think_limit, "thinking"
+                            )
+                            count("thinking_truncated")
+                        new_content.append(block)
+                        continue
+
+                    if bt == "tool_use":
+                        inp = block.get("input", {})
+                        name = block.get("name", "")
+                        if isinstance(inp, dict):
+                            if name == "Write":
+                                trim_string(
+                                    inp,
+                                    "content",
+                                    bl("tool_input.Write", aggr),
+                                    "Write.content",
+                                )
+                            elif name == "Edit":
+                                lim = bl("tool_input.Edit", aggr)
+                                trim_string(inp, "old_string", lim, "Edit.old_string")
+                                trim_string(inp, "new_string", lim, "Edit.new_string")
+                            elif name == "Agent":
+                                trim_string(
+                                    inp,
+                                    "prompt",
+                                    bl("tool_input.Agent", aggr),
+                                    "Agent.prompt",
+                                )
+
+                    if (pos, bi) in duplicate_blocks:
+                        text = text_of(block)
+                        preview = text[:60].replace("\n", " ")
+                        if bt == "text":
+                            block = dict(block)
+                            block["text"] = f"[duplicate content: {preview}...]"
+                        count("duplicate_blocks_deduped")
+
+                    new_content.append(block)
+                msg["content"] = new_content
+
+        # System-reminder dedup
+        if t in ("user", "assistant"):
+            for block in get_content_blocks(obj):
+                if isinstance(block, dict):
+                    if block.get("type") == "text" and isinstance(
+                        block.get("text"), str
+                    ):
+                        block["text"] = dedup_system_reminders(block["text"])
+                    elif block.get("type") == "tool_result" and isinstance(
+                        block.get("content"), str
+                    ):
+                        block["content"] = dedup_system_reminders(block["content"])
+
+        # toolUseResult
+        tur = obj.get("toolUseResult")
+        if tur:
+            trim_toolUseResult(tur, aggr, agg_lim, gen_lim)
+
+    # -- Pass 5: Orphan repair --
+    kept_objs, orphan_count = fix_orphaned_tool_results(kept_objs)
+    if orphan_count:
+        stats["orphaned_tool_results_fixed"] = orphan_count
+
+    # -- Token budget (reduced) --
+    reduced_budget = None
+    if estimate_tokens:
+        reduced_budget = TokenBudget(chars_per_token)
+        for obj in kept_objs:
+            reduced_budget.add_obj(obj)
+
+    # -- Serialize to JSON lines --
+    kept_lines = [json.dumps(obj, separators=(",", ":")) + "\n" for obj in kept_objs]
+    new_size = sum(len(l) for l in kept_lines)
+
+    return ReductionResult(
+        kept_lines=kept_lines,
+        stats=stats,
+        orig_count=orig_count,
+        orig_size=orig_size,
+        new_count=len(kept_lines),
+        new_size=new_size,
+        orig_budget=budget,
+        reduced_budget=reduced_budget,
+        api_tokens=api_tokens,
+    )
