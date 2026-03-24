@@ -266,6 +266,47 @@ def test_git_snapshot_creates_tag(tmp_path):
     assert sha is not None
     tags = get_reduction_tags(str(tmp_path))
     assert "test/tag" in tags
+
+
+def test_do_apply_creates_backup_and_tags(tmp_path):
+    ensure_git_repo(str(tmp_path))
+    original = tmp_path / "session.jsonl"
+    original.write_text('{"type":"user","message":{"content":"hello"}}\n' * 100)
+    reduced = tmp_path / "session.jsonl.reduced"
+    reduced.write_text('{"type":"user","message":{"content":"hello"}}\n' * 50)
+    do_apply(str(original), str(reduced), "standard", 50, 75)
+    # Original should now be the reduced content
+    assert original.stat().st_size < 100 * 50  # smaller than original
+    # Git tags should exist
+    tags = get_reduction_tags(str(tmp_path), "session.")  # won't match UUID pattern
+    # At minimum, .bak should exist
+    bak_files = list(tmp_path.glob("*.bak"))
+    assert len(bak_files) >= 1
+
+
+def test_do_apply_refuses_stale(tmp_path):
+    """If source changed after .reduced was generated, do_apply should raise."""
+    ensure_git_repo(str(tmp_path))
+    original = tmp_path / "session.jsonl"
+    original.write_text('{"type":"user"}\n')
+    reduced = tmp_path / "session.jsonl.reduced"
+    reduced.write_text('{"type":"user"}\n')
+    # Make original newer than reduced
+    import time
+    time.sleep(0.1)
+    original.write_text('{"type":"user","message":{"content":"new"}}\n')
+    import pytest
+    with pytest.raises(RuntimeError, match="modified"):
+        do_apply(str(original), str(reduced), "standard", 50, 75)
+
+
+def test_do_restore_from_bak(tmp_path):
+    original = tmp_path / "session.jsonl"
+    original.write_text("reduced content\n")
+    bak = tmp_path / "session.jsonl.20260323_120000.bak"
+    bak.write_text("original content\n")
+    do_restore(str(original))
+    assert original.read_text() == "original content\n"
 ```
 
 - [ ] **Step 2: Run tests — expect failure**
@@ -278,7 +319,9 @@ uv run pytest tests/test_git_ops.py -v
 
 Extract: `GITIGNORE_CONTENT` (line 166), `_run_git` (190), `ensure_git_repo` (205), `_write_gitignore` (228), `_update_gitignore` (234), `git_snapshot` (242), `git_restore_from_tag` (257), `session_short_id` (263), `make_tag` (270), `get_reduction_tags` (277), `get_tag_file_size` (288), `do_init` (883), `find_backups` (925), `do_restore` (934), `do_apply` (976), `do_history` (1051).
 
-Note: `do_apply` imports from `reduction.py` for the staleness check. Add required imports (`os`, `sys`, `glob`, `shutil`, `subprocess`, `datetime`).
+**CRITICAL**: `do_apply`, `do_restore`, `do_init`, and `do_history` currently call `sys.exit(1)` and `print()` for error handling. When extracting to `git_ops.py`, replace ALL `sys.exit()` calls with raised exceptions (e.g., `raise RuntimeError("message")`) and replace `print()` output with return values. The TUI calls these functions — `sys.exit()` would kill the entire TUI process.
+
+Note: `do_apply` imports from `reduction.py` for the staleness check. Add required imports (`os`, `glob`, `shutil`, `subprocess`, `datetime`).
 
 - [ ] **Step 4: Run tests — expect pass**
 
@@ -1090,7 +1133,10 @@ class SessionBrowserApp(App):
         Binding("q", "quit", "Quit"),
         Binding("r", "reduce", "Reduce", show=True),
         Binding("d", "dry_run", "Dry Run", show=True),
+        Binding("h", "history", "History", show=True),
         Binding("shift+r", "refresh", "Refresh", show=True, key_display="R"),
+        Binding("j", "cursor_down", show=False),
+        Binding("k", "cursor_up", show=False),
     ]
 
     def __init__(self, projects_dir: Path | None = None):
@@ -1160,30 +1206,45 @@ class SessionBrowserApp(App):
         self.query_one("#info-bar", InfoBar).update_session(session)
         self.query_one("#conversation-log", ConversationPreview).update_session(session)
 
+    def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
+        """Enter on a session leaf opens the reduce modal."""
+        session = self._node_to_session.get(id(event.node))
+        if session:
+            self.action_reduce()
+        # Project nodes: Tree handles expand/collapse automatically
+
     def action_reduce(self) -> None:
         if self.selected_session:
-            self.push_screen(
-                "reduce_modal",
-                ReduceModal(self.selected_session, read_only=False),
-            )
+            # Placeholder: correct push_screen call is in Task 7
+            pass
 
     def action_dry_run(self) -> None:
         if self.selected_session:
-            self.push_screen(
-                "reduce_modal",
-                ReduceModal(self.selected_session, read_only=True),
-            )
+            pass
+
+    def action_history(self) -> None:
+        """v1: print history to notification bar. v2: modal."""
+        if self.selected_session:
+            from .git_ops import get_reduction_tags
+            project_dir = str(self.selected_session.path.parent)
+            tags = get_reduction_tags(project_dir, self.selected_session.short_id)
+            if tags:
+                self.notify(f"{len(tags)} reduction(s) for {self.selected_session.short_id}")
+            else:
+                self.notify("No reduction history")
+
+    def action_cursor_down(self) -> None:
+        """j key — forward to tree's cursor down."""
+        tree = self.query_one("#session-tree", Tree)
+        tree.action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        """k key — forward to tree's cursor up."""
+        tree = self.query_one("#session-tree", Tree)
+        tree.action_cursor_up()
 
     def action_refresh(self) -> None:
         self._load_sessions()
-
-
-# Import here to avoid circular — ReduceModal is defined in widgets.py
-# but needs to be registered. We'll use lazy import in action_reduce/dry_run.
-# For now, placeholder:
-class ReduceModal:
-    """Placeholder — implemented in Task 7."""
-    pass
 ```
 
 - [ ] **Step 2: Update cli.py to launch TUI when no args**
@@ -1320,15 +1381,12 @@ class ReduceModal(ModalScreen):
             pass
 
         self.source_mtime = os.path.getmtime(str(self.session.path))
+        # CRITICAL: thread=True — reduce_session() is CPU-bound synchronous I/O.
+        # Without thread=True, the event loop blocks and the spinner freezes.
+        path = str(self.session.path)
         self._current_worker = self.run_worker(
-            self._do_reduce(profile), exclusive=True
-        )
-
-    async def _do_reduce(self, profile: str) -> ReductionResult:
-        return reduce_session(
-            str(self.session.path),
-            profile=profile,
-            estimate_tokens=True,
+            lambda: reduce_session(path, profile=profile, estimate_tokens=True),
+            thread=True, exclusive=True,
         )
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
