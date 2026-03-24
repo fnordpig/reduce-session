@@ -1,0 +1,13 @@
+[project]
+name = "reduce-session"
+version = "0.1.0"
+description = "Reduce Claude Code session JSONL files while preserving conversation quality"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+reduce-session = "reduce_session.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
