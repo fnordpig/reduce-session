@@ -146,6 +146,20 @@ def get_tag_file_size(project_dir, tag, session_basename):
     return None
 
 
+def get_file_tail_at_tag(project_dir, tag, session_basename, tail_bytes=50 * 1024):
+    """Get the last tail_bytes of a session file at a given git tag.
+
+    Returns the raw string content, or None if not available.
+    """
+    r = _run_git(project_dir, "show", f"{tag}:{session_basename}", check=False)
+    if r and r.returncode == 0:
+        content = r.stdout
+        if len(content) > tail_bytes:
+            return content[-tail_bytes:]
+        return content
+    return None
+
+
 def find_backups(path):
     """Find all .bak files for a session, newest first."""
     patterns = [f"{path}.bak", f"{path}.*.bak", f"{path}*.bak"]

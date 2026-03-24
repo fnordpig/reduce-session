@@ -16,7 +16,14 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, LoadingIndicator, Static
 from textual.worker import Worker, WorkerState
 
-from .git_ops import do_apply
+from .git_ops import (
+    do_apply,
+    do_history,
+    get_file_tail_at_tag,
+    git_restore_from_tag,
+    HistoryResult,
+    ReductionEntry,
+)
 from .reduction import ReductionResult, reduce_session
 from .session import Exchange, SessionInfo
 
@@ -467,4 +474,248 @@ class ReduceModal(ModalScreen[bool]):
 
     def action_cancel(self) -> None:
         """Close the modal without applying."""
+        self.dismiss(False)
+
+
+# ---------------------------------------------------------------------------
+# History Modal — Time Machine for session versions
+# ---------------------------------------------------------------------------
+
+
+class HistoryModal(ModalScreen[bool]):
+    """Browse git history of a session file like Time Machine.
+
+    Left: version list (reduction tags + current).
+    Right: preview of conversation tail at that version.
+    Restore to any version with Enter.
+    """
+
+    BINDINGS = [
+        ("escape", "cancel", "Close"),
+        ("enter", "restore", "Restore"),
+    ]
+
+    def __init__(self, session: SessionInfo) -> None:
+        super().__init__()
+        self.session = session
+        self.history: HistoryResult | None = None
+        self._versions: list[dict] = []  # {label, tag, size, is_current}
+
+    def compose(self) -> ComposeResult:
+        from textual.widgets import OptionList
+
+        with Vertical(id="reduce-modal-container"):
+            yield Static(
+                Text.from_markup(
+                    f"[bold]History: {self.session.short_id} ({self.session.project_name})[/]"
+                ),
+                id="modal-title",
+            )
+            with Horizontal(id="history-main"):
+                yield OptionList(id="version-list")
+                with Vertical(id="history-preview"):
+                    yield Static("", id="history-info")
+                    yield Static("", id="history-conversation")
+            with Horizontal(id="modal-actions"):
+                yield Button("Restore", variant="warning", id="btn-restore")
+                yield Button("Close", variant="default", id="btn-close")
+
+    def on_mount(self) -> None:
+        self._load_history()
+
+    def _load_history(self) -> None:
+        from textual.widgets import OptionList
+        from textual.widgets.option_list import Option
+
+        project_dir = str(self.session.path.parent)
+        self.history = do_history(str(self.session.path))
+        option_list = self.query_one("#version-list", OptionList)
+
+        self._versions = []
+
+        # Current version first
+        self._versions.append(
+            {
+                "label": "current",
+                "tag": None,
+                "size": self.history.current_size,
+                "is_current": True,
+                "description": "Current file on disk",
+            }
+        )
+        option_list.add_option(
+            Option(
+                self._version_label("NOW", self.history.current_size, "current"),
+                id="current",
+            )
+        )
+
+        # Reduction entries (newest first)
+        for entry in reversed(self.history.reductions):
+            # Post-reduction version
+            if entry.post_tag:
+                vid = f"post-{entry.timestamp}"
+                self._versions.append(
+                    {
+                        "label": vid,
+                        "tag": entry.post_tag,
+                        "size": entry.post_size,
+                        "is_current": False,
+                        "description": entry.description
+                        or f"After reduction ({entry.ts_display})",
+                    }
+                )
+                size_str = _format_size(entry.post_size) if entry.post_size else "?"
+                saved = ""
+                if entry.saved_pct is not None:
+                    saved = f" (-{entry.saved_pct:.0f}%)"
+                option_list.add_option(
+                    Option(
+                        self._version_label(
+                            entry.ts_display, entry.post_size, f"post-reduce{saved}"
+                        ),
+                        id=vid,
+                    )
+                )
+
+            # Pre-reduction version
+            if entry.pre_tag:
+                vid = f"pre-{entry.timestamp}"
+                self._versions.append(
+                    {
+                        "label": vid,
+                        "tag": entry.pre_tag,
+                        "size": entry.pre_size,
+                        "is_current": False,
+                        "description": f"Before reduction ({entry.ts_display})",
+                    }
+                )
+                option_list.add_option(
+                    Option(
+                        self._version_label(
+                            entry.ts_display, entry.pre_size, "pre-reduce"
+                        ),
+                        id=vid,
+                    )
+                )
+
+        # Backups (if no git)
+        for bak_path, bak_size, bak_mtime in self.history.backups:
+            vid = f"bak-{bak_mtime.strftime('%Y%m%d_%H%M%S')}"
+            self._versions.append(
+                {
+                    "label": vid,
+                    "tag": None,
+                    "bak_path": bak_path,
+                    "size": bak_size,
+                    "is_current": False,
+                    "description": f"Backup {bak_mtime:%Y-%m-%d %H:%M}",
+                }
+            )
+            option_list.add_option(
+                Option(
+                    self._version_label(
+                        f"{bak_mtime:%Y-%m-%d %H:%M}", bak_size, ".bak"
+                    ),
+                    id=vid,
+                )
+            )
+
+        if not self._versions:
+            self.query_one("#history-info", Static).update(
+                Text("No history found", style="dim italic")
+            )
+
+        # Preview current version on mount
+        if self._versions:
+            self._preview_version(0)
+
+    def _version_label(self, date_str: str, size: int | None, kind: str) -> str:
+        size_s = _format_size(size) if size else "?"
+        return f"{date_str}  {size_s:>8}  {kind}"
+
+    def on_option_list_option_highlighted(self, event) -> None:
+        """Preview the conversation at the highlighted version."""
+        from textual.widgets import OptionList
+
+        option_list = self.query_one("#version-list", OptionList)
+        idx = option_list.highlighted
+        if idx is not None and 0 <= idx < len(self._versions):
+            self._preview_version(idx)
+
+    def _preview_version(self, idx: int) -> None:
+        """Load and display conversation preview for a version."""
+        from .session import parse_tail, parse_tail_from_content
+
+        version = self._versions[idx]
+        info_widget = self.query_one("#history-info", Static)
+        conv_widget = self.query_one("#history-conversation", Static)
+
+        size = version.get("size") or 0
+        desc = version.get("description", "")
+
+        # Build info line
+        info = Text()
+        info.append(f"{_format_size(size)}", style="bold")
+        info.append(f"  {desc}", style="dim")
+        info_widget.update(info)
+
+        # Get conversation preview
+        if version.get("is_current"):
+            # Read from the actual file
+            exchanges, _, _ = parse_tail(self.session.path)
+        elif version.get("tag"):
+            # Read from git
+            project_dir = str(self.session.path.parent)
+            basename = self.session.path.name
+            content = get_file_tail_at_tag(project_dir, version["tag"], basename)
+            if content:
+                exchanges, _, _ = parse_tail_from_content(content, size)
+            else:
+                conv_widget.update(Text("(could not read version)", style="dim"))
+                return
+        else:
+            conv_widget.update(Text("(no preview available)", style="dim"))
+            return
+
+        if exchanges:
+            # Show last 15 exchanges
+            conv_widget.update(render_exchanges(exchanges[-15:]))
+        else:
+            conv_widget.update(Text("(empty session)", style="dim"))
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-close":
+            self.action_cancel()
+        elif event.button.id == "btn-restore":
+            self.action_restore()
+
+    def action_restore(self) -> None:
+        """Restore the session to the highlighted version."""
+        from textual.widgets import OptionList
+
+        option_list = self.query_one("#version-list", OptionList)
+        idx = option_list.highlighted
+        if idx is None or idx >= len(self._versions):
+            return
+
+        version = self._versions[idx]
+        if version.get("is_current"):
+            self.app.notify("Already at current version")
+            return
+
+        tag = version.get("tag")
+        if tag:
+            project_dir = str(self.session.path.parent)
+            basename = self.session.path.name
+            try:
+                git_restore_from_tag(project_dir, tag, basename)
+                self.app.notify(f"Restored to {version.get('description', tag)}")
+                self.dismiss(True)
+            except Exception as exc:
+                self.app.notify(f"Restore failed: {exc}", severity="error")
+        else:
+            self.app.notify("Can only restore from git tags", severity="warning")
+
+    def action_cancel(self) -> None:
         self.dismiss(False)

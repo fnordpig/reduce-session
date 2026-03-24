@@ -133,3 +133,37 @@ ReduceModal {
     content-align-vertical: middle;
 }
 
+/* History Modal — Time Machine */
+HistoryModal {
+    align-horizontal: center;
+    align-vertical: middle;
+}
+
+#history-main {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#version-list {
+    width: 45%;
+    min-width: 30;
+    height: 1fr;
+    border-right: tall $primary-background-lighten-2;
+}
+
+#history-preview {
+    width: 55%;
+    height: 1fr;
+    padding: 0 1;
+}
+
+#history-info {
+    height: 2;
+    padding: 0 0 1 0;
+}
+
+#history-conversation {
+    height: 1fr;
+    overflow-y: auto;
+}
+

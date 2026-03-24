@@ -17,7 +17,13 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Header, Static, Tree
 
 from .session import SessionInfo, scan_projects
-from .widgets import ConversationPreview, InfoBar, ReduceModal, token_color
+from .widgets import (
+    ConversationPreview,
+    HistoryModal,
+    InfoBar,
+    ReduceModal,
+    token_color,
+)
 
 
 def get_projects_dir() -> Path:
@@ -200,26 +206,20 @@ class SessionBrowserApp(App):
             self._load_sessions()
 
     def action_history(self) -> None:
-        """Show reduction history summary."""
-        try:
-            from .git_ops import get_reduction_tags
+        """Open Time Machine history browser for the selected session."""
+        session = self.selected_session
+        if not session:
+            self.notify("Select a session first", severity="warning")
+            return
+        self.push_screen(
+            HistoryModal(session),
+            callback=self._on_history_dismiss,
+        )
 
-            # Count tags across all project dirs that have git
-            total_tags = 0
-            seen_dirs: set[str] = set()
-            for session in self._sessions:
-                proj_dir = str(session.path.parent)
-                if proj_dir in seen_dirs:
-                    continue
-                seen_dirs.add(proj_dir)
-                tags = get_reduction_tags(proj_dir)
-                total_tags += len(tags)
-
-            self.notify(
-                f"{total_tags} reduction tag(s) across {len(seen_dirs)} project(s)"
-            )
-        except Exception as exc:
-            self.notify(f"Error reading history: {exc}", severity="error")
+    def _on_history_dismiss(self, restored: bool | None) -> None:
+        """Refresh session list if a restore was performed."""
+        if restored:
+            self._load_sessions()
 
     def action_cursor_down(self) -> None:
         """Move tree cursor down (vim j)."""

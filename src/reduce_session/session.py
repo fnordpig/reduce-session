@@ -208,6 +208,27 @@ def parse_tail(
     if seeked and raw_lines:
         raw_lines = raw_lines[1:]
 
+    return _parse_raw_lines(raw_lines, file_size)
+
+
+def parse_tail_from_content(
+    content: str, file_size: int = 0
+) -> tuple[list[Exchange], int, datetime | None]:
+    """Parse exchanges from raw string content (e.g., from git show).
+
+    Same logic as parse_tail but takes content directly instead of reading a file.
+    file_size is used for heuristic token estimate fallback if no usage data found.
+    """
+    if not content:
+        return [], 0, None
+    raw_lines = content.split("\n")
+    return _parse_raw_lines(raw_lines, file_size)
+
+
+def _parse_raw_lines(
+    raw_lines: list[str], fallback_file_size: int = 0
+) -> tuple[list[Exchange], int, datetime | None]:
+    """Core parsing logic for session JSONL lines."""
     exchanges: list[Exchange] = []
     token_estimate = 0
     last_timestamp: datetime | None = None
@@ -277,8 +298,8 @@ def parse_tail(
             exchanges.append(Exchange(role=role, text=content.strip()))
 
     # Fallback token estimate
-    if not found_usage:
-        token_estimate = file_size // 14
+    if not found_usage and fallback_file_size > 0:
+        token_estimate = fallback_file_size // 14
 
     return exchanges, token_estimate, last_timestamp
 
