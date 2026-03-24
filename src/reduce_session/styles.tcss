@@ -1,0 +1,123 @@
+/* Main layout: left panel 40%, right panel 60% */
+#main-container {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#session-list {
+    width: 40%;
+    min-width: 30;
+    border-right: tall $primary-background-lighten-2;
+}
+
+#preview-panel {
+    width: 60%;
+    min-width: 40;
+}
+
+#session-tree {
+    height: 1fr;
+    scrollbar-gutter: stable;
+}
+
+#aggregate-stats {
+    height: 1;
+    dock: bottom;
+    background: $primary-background-lighten-1;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+/* Preview pane */
+#empty-state {
+    height: 1fr;
+    content-align: center middle;
+    color: $text-muted;
+}
+
+#info-bar {
+    height: 3;
+    padding: 0 1;
+    background: $primary-background-lighten-1;
+}
+
+#conversation-log {
+    height: 1fr;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+/* Token gauge colors */
+.token-green { color: #00d4aa; }
+.token-yellow { color: #ffd700; }
+.token-orange { color: #ff8c00; }
+.token-red { color: #ff4444; }
+
+/* Conversation roles */
+.role-user { color: #6ec1e4; }
+.role-assistant { color: #e88a6a; }
+.role-tool { color: $text-muted; }
+.role-tool-error { color: #ff4444; }
+
+/* Reduce Modal */
+ReduceModal {
+    align: center middle;
+}
+
+#reduce-modal-container {
+    width: 80;
+    max-width: 90%;
+    height: auto;
+    max-height: 85%;
+    border: thick $accent;
+    background: $surface;
+    padding: 1 2;
+    overflow-y: auto;
+}
+
+#modal-title {
+    text-style: bold;
+    width: 100%;
+    content-align: center middle;
+    padding-bottom: 1;
+}
+
+.modal-section-header {
+    color: $accent;
+    text-style: bold;
+    padding-top: 1;
+}
+
+#profile-bar {
+    layout: horizontal;
+    height: 1;
+    padding: 0 0 1 0;
+}
+
+.profile-btn {
+    width: auto;
+    min-width: 12;
+    margin: 0 1 0 0;
+}
+
+.profile-btn.-active {
+    background: $accent;
+    color: $text;
+    text-style: bold;
+}
+
+#modal-actions {
+    layout: horizontal;
+    height: 3;
+    align: right middle;
+    padding-top: 1;
+}
+
+#modal-actions Button {
+    margin: 0 0 0 1;
+}
+
+#spinner-container {
+    height: 3;
+    content-align: center middle;
+}
