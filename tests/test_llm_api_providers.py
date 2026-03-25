@@ -151,7 +151,7 @@ def test_anthropic_missing_api_key():
 async def test_openai_classify():
     mock_client = MagicMock()
     mock_response = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content='["FINDING"]'))]
+        choices=[SimpleNamespace(message=SimpleNamespace(content='["DEBUGGING"]'))]
     )
     mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
 
@@ -166,7 +166,7 @@ async def test_openai_classify():
 
     exchanges = [{"role": "user", "text": "Found the bug", "tool_name": None}]
     result = await provider.classify(exchanges)
-    assert result == [Category.FINDING]
+    assert result == [Category.DEBUGGING]
 
 
 @pytest.mark.asyncio
@@ -211,7 +211,7 @@ def test_openai_missing_api_key():
 @pytest.mark.asyncio
 async def test_gemini_classify():
     mock_client = MagicMock()
-    mock_response = SimpleNamespace(text='["ROUTINE"]')
+    mock_response = SimpleNamespace(text='["SCAFFOLDING"]')
     mock_client.models.generate_content = AsyncMock(return_value=mock_response)
 
     fake_google, fake_genai = _make_fake_genai(mock_client)
@@ -225,7 +225,7 @@ async def test_gemini_classify():
 
     exchanges = [{"role": "user", "text": "ok", "tool_name": None}]
     result = await provider.classify(exchanges)
-    assert result == [Category.ROUTINE]
+    assert result == [Category.SCAFFOLDING]
 
 
 @pytest.mark.asyncio

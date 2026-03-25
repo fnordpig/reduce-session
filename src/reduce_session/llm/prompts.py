@@ -12,20 +12,30 @@ You are a conversation classifier for coding assistant sessions.
 
 Classify each exchange into exactly ONE of these categories:
 
-- DECISION: User or assistant makes a choice that affects future work
-- PREFERENCE: User states a preference, style, or constraint to remember
-- CORRECTION: User corrects the assistant or rejects an approach
-- FINDING: Discovery of a bug, root cause, unexpected behavior, or key fact
-- REASONING: Analysis, tradeoff discussion, or explanation of why
-- IMPLEMENTATION: Code changes, file edits, commands that modify state
-- DIAGNOSTIC: Debugging steps, error investigation, log analysis
-- AGENT_TRANSCRIPT: Tool calls and their outputs (Bash, Read, Write, etc.)
-- EXPLORATION: Reading files, searching code, gathering context without changes
-- SCAFFOLDING: Filler language, acknowledgments, "Let me", "I'll now", transitions
-- ROUTINE: Confirmation, short yes/no, status checks, trivial exchanges
+- INSTRUCTION — user directing an action or giving orders
+- CLARIFICATION — user refining requirements or correcting scope
+- CONFIRMATION — user approving or acknowledging
+- INQUIRY — user asking a question
+- DECISION — user choosing between options
+- FEEDBACK — user evaluating results or quality
+- EXPLANATION — assistant explaining concepts or approach
+- IMPLEMENTATION — code changes, edits, file operations
+- REASONING — assistant analyzing, discussing tradeoffs
+- DEBUGGING — error investigation, diagnosis, fixing
+- METRICS — performance data, benchmarks, profiling results
+- COMPILATION — build output, dependency resolution
+- PLANNING — strategy discussion, roadmap, next steps
+- TESTING — test runs, pass/fail results
+- GIT_OPERATION — commits, pushes, branch operations
+- ANALYSIS — deep technical analysis of code or data
+- STATUS_UPDATE — task status, progress notifications
+- NOTIFICATION — file operation confirmations, tool results
+- LOG_OUTPUT — build logs, command output, file listings
+- SCAFFOLDING — boilerplate, setup, repetitive patterns
+- ERROR_OUTPUT — error messages, stack traces, panics
 
 Respond with ONLY a JSON array of category strings, one per exchange. \
-Example: ["DECISION", "SCAFFOLDING", "IMPLEMENTATION"]\
+Example: ["INSTRUCTION", "SCAFFOLDING", "IMPLEMENTATION"]\
 """
 
 DISTILL_SUMMARIZE_SYSTEM = """\
@@ -42,6 +52,54 @@ Remove "Let me", "I'll now", transitions, preamble, hedging. \
 Preserve every fact, decision, error message, code reference, constraint, number. \
 Respond with ONLY the stripped text.\
 """
+
+DISTILL_TYPE_PROMPTS: dict[str, str] = {
+    "EXPLANATION": (
+        "Compress this explanation to its conclusion. Keep: the key fact or insight. "
+        "Remove: the reasoning chain, preamble, hedging. One concise paragraph."
+    ),
+    "IMPLEMENTATION": (
+        "Summarize this code change. Keep: what files changed, what was the intent, "
+        "key design decisions. Remove: edit-by-edit narrative, full code blocks. "
+        "One paragraph."
+    ),
+    "REASONING": (
+        "Extract the key insight from this analysis. Keep: the conclusion reached, "
+        "tradeoffs identified, recommendation. Remove: deliberation, restating "
+        "context. One paragraph."
+    ),
+    "DEBUGGING": (
+        "Extract the root cause and fix. Keep: what was wrong, why, what fixed it, "
+        "any constraints discovered. Remove: investigation steps, hypothesis testing. "
+        "One paragraph."
+    ),
+    "METRICS": (
+        "Extract the key numbers and findings. Keep: all performance numbers, "
+        "comparisons, bottlenecks identified. Remove: narrative around the data. "
+        "Concise bullet points."
+    ),
+    "COMPILATION": (
+        "Extract build result. Keep: success/failure, errors if any, timing. "
+        "Remove: all 'Compiling foo' lines, download progress. One line."
+    ),
+    "PLANNING": (
+        "Extract decisions and next steps. Keep: what was decided, action items, "
+        "priorities. Remove: brainstorming, deliberation, rejected options. "
+        "Concise list."
+    ),
+    "TESTING": (
+        "Extract test results. Keep: pass/fail counts, failures with error messages, "
+        "performance numbers. Remove: individual test output. One paragraph."
+    ),
+    "GIT_OPERATION": (
+        "Extract git summary. Keep: branch, commit message, files changed. "
+        "Remove: git command output. One line."
+    ),
+    "ANALYSIS": (
+        "Extract conclusions. Keep: findings, recommendations, key data points. "
+        "Remove: methodology description, verbose analysis. One paragraph."
+    ),
+}
 
 _MAX_TEXT_LEN = 500
 
@@ -74,8 +132,8 @@ def format_classify_prompt(exchanges: list[dict]) -> str:
 def parse_classify_response(response: str, expected_count: int) -> list[Category]:
     """Parse LLM JSON array response into a list of Category values.
 
-    Handles: valid JSON, markdown fences, wrong count (pad with ROUTINE),
-    invalid JSON (all ROUTINE), unknown categories (mapped to ROUTINE).
+    Handles: valid JSON, markdown fences, wrong count (pad with SCAFFOLDING),
+    invalid JSON (all SCAFFOLDING), unknown categories (mapped to SCAFFOLDING).
     """
     # Strip markdown fences if present
     stripped = response.strip()
@@ -86,34 +144,39 @@ def parse_classify_response(response: str, expected_count: int) -> list[Category
     try:
         parsed = json.loads(stripped)
     except (json.JSONDecodeError, ValueError):
-        return [Category.ROUTINE] * expected_count
+        return [Category.SCAFFOLDING] * expected_count
 
     if not isinstance(parsed, list):
-        return [Category.ROUTINE] * expected_count
+        return [Category.SCAFFOLDING] * expected_count
 
-    # Map strings to Category, unknown -> ROUTINE
+    # Map strings to Category, unknown -> SCAFFOLDING
     result: list[Category] = []
     for item in parsed:
         try:
             result.append(Category(item))
         except (ValueError, KeyError):
-            result.append(Category.ROUTINE)
+            result.append(Category.SCAFFOLDING)
 
     # Pad or truncate to expected_count
     if len(result) < expected_count:
-        result.extend([Category.ROUTINE] * (expected_count - len(result)))
+        result.extend([Category.SCAFFOLDING] * (expected_count - len(result)))
     elif len(result) > expected_count:
         result = result[:expected_count]
 
     return result
 
 
-def format_distill_prompt(text: str, mode: str) -> str:
+def format_distill_prompt(text: str, mode: str, category: str | None = None) -> str:
     """Wrap text for distillation with the appropriate instruction context.
 
     mode is one of: "summarize", "strip_scaffold".
+    When mode is "summarize" and category is provided and has a type-specific
+    prompt in DISTILL_TYPE_PROMPTS, that prompt is used instead of the generic
+    instruction.
     """
-    if mode == "summarize":
+    if mode == "summarize" and category and category in DISTILL_TYPE_PROMPTS:
+        instruction = DISTILL_TYPE_PROMPTS[category]
+    elif mode == "summarize":
         instruction = "Compress the following exchange:"
     elif mode == "strip_scaffold":
         instruction = "Strip filler from the following exchange:"

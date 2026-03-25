@@ -32,7 +32,7 @@ class MockProvider:
                     matched = True
                     break
             if not matched:
-                result.append(Category.ROUTINE)
+                result.append(Category.SCAFFOLDING)
         return result
 
     async def distill(self, text, mode="summarize"):

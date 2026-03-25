@@ -511,21 +511,30 @@ class ReduceModal(ModalScreen[bool]):
 
     # Category colors for classification sparkline blending
     _CAT_COLORS = {
-        "KEEP": (0, 212, 170),  # green
-        "DISTILL": (255, 140, 0),  # orange
-        "HEURISTIC": (255, 215, 0),  # yellow
-        # Map all categories to their route color
-        "DECISION": (0, 212, 170),
-        "PREFERENCE": (0, 212, 170),
-        "CORRECTION": (0, 212, 170),
-        "FINDING": (0, 212, 170),
-        "REASONING": (255, 140, 0),
+        # KEEP types — green spectrum
+        "INSTRUCTION": (0, 212, 170),
+        "CLARIFICATION": (0, 180, 216),
+        "CONFIRMATION": (0, 200, 150),
+        "INQUIRY": (100, 200, 220),
+        "DECISION": (0, 230, 180),
+        "FEEDBACK": (80, 210, 190),
+        # DISTILL types — warm spectrum
+        "EXPLANATION": (153, 153, 153),
         "IMPLEMENTATION": (255, 140, 0),
-        "DIAGNOSTIC": (255, 140, 0),
-        "AGENT_TRANSCRIPT": (255, 140, 0),
-        "EXPLORATION": (255, 215, 0),
-        "SCAFFOLDING": (255, 215, 0),
-        "ROUTINE": (255, 215, 0),
+        "REASONING": (200, 160, 100),
+        "DEBUGGING": (255, 102, 68),
+        "METRICS": (180, 200, 50),
+        "COMPILATION": (255, 215, 0),
+        "PLANNING": (68, 136, 255),
+        "TESTING": (136, 204, 0),
+        "GIT_OPERATION": (0, 204, 255),
+        "ANALYSIS": (136, 170, 255),
+        # HEURISTIC types — dim spectrum
+        "STATUS_UPDATE": (100, 100, 100),
+        "NOTIFICATION": (80, 80, 80),
+        "LOG_OUTPUT": (90, 90, 90),
+        "SCAFFOLDING": (102, 102, 102),
+        "ERROR_OUTPUT": (170, 60, 60),
     }
 
     def _blend_colors(self, items: list[tuple]) -> str:
