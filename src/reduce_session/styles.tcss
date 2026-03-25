@@ -36,7 +36,8 @@
 }
 
 #info-bar {
-    height: 5;
+    height: auto;
+    max-height: 7;
     padding: 0 1;
     background: $primary-background-lighten-1;
 }

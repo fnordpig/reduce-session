@@ -412,22 +412,36 @@ def _reset_structural_stats():
     }
 
 
+# Profile-dependent thresholds for structural compression.
+# Gentle = higher thresholds (less compression), aggressive = lower (more compression).
+STRUCTURAL_THRESHOLDS = {
+    "aggressive": {"paths": 0.15, "linenum": 0.3, "indent": 0.5},
+    "standard": {"paths": 0.3, "linenum": 0.5, "indent": 0.7},
+    "gentle": {"paths": 0.5, "linenum": 0.7, "indent": 0.9},
+}
+
+# Module-level profile name, set by reduce_session() before trimming pass
+_structural_profile: str = "standard"
+
+
 def structural_compress(text: str, aggr: float) -> str:
     """Apply structural compression techniques to text based on aggressiveness.
 
-    1. Path shortening (aggr > 0.3): ~/src/mine/<project>/ -> ~/<project>/
-    2. Line number prefix stripping (aggr > 0.5): strip Read tool line prefixes
-    3. Indentation collapse (aggr > 0.7): 4-space -> 2-space
-    4. Blank line collapse (always): 3+ consecutive newlines -> 2
+    Thresholds vary by profile (set via _structural_profile):
+    - aggressive: kicks in earlier (lower aggr values)
+    - gentle: kicks in later (higher aggr values)
     """
     global _structural_stats
     if not isinstance(text, str) or not text:
         return text
 
+    thresholds = STRUCTURAL_THRESHOLDS.get(
+        _structural_profile, STRUCTURAL_THRESHOLDS["standard"]
+    )
     orig_len = len(text)
 
     # 1. Path shortening
-    if aggr > 0.3:
+    if aggr > thresholds["paths"]:
         pat = _get_home_prefix_re()
         new_text = pat.sub(r"~/\1/", text)
         if new_text != text:
@@ -435,14 +449,14 @@ def structural_compress(text: str, aggr: float) -> str:
             text = new_text
 
     # 2. Line number prefix stripping (patterns like "    42→" or "   123│")
-    if aggr > 0.5:
+    if aggr > thresholds["linenum"]:
         new_text = re.sub(r"^ *\d+[→│]\s?", "", text, flags=re.MULTILINE)
         if new_text != text:
             _structural_stats["line_numbers_stripped"] += len(text) - len(new_text)
             text = new_text
 
     # 3. Indentation collapse: 4-space -> 2-space
-    if aggr > 0.7:
+    if aggr > thresholds["indent"]:
         lines = text.split("\n")
         collapsed = []
         changed = False
@@ -892,7 +906,9 @@ def reduce_session(
     Reads the file, applies all reduction passes, and returns a ReductionResult.
     This function has no side effects (does not write files or print output).
     """
+    global _structural_profile
     _reset_structural_stats()
+    _structural_profile = profile
 
     prof = PROFILES[profile]
     agg_lim = prof["aggressive"]
