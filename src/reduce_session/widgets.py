@@ -223,8 +223,48 @@ def render_exchanges(exchanges: list[Exchange]) -> Text:
     return text
 
 
+def render_ucurve_mini(width: int = 30) -> Text:
+    """Render a mini U-curve showing the compression profile.
+
+    Shows the aggressiveness shape: gentle→aggressive→gentle
+    with labels for the zones.
+    """
+    from .reduction import make_aggressiveness_fn
+
+    fn = make_aggressiveness_fn()  # use defaults (cut=10, fade=75)
+    text = Text()
+    text.append("U-curve ", style="dim")
+
+    # Render the curve shape
+    curve_chars = "▁▂▃▄▅▆▇█"
+    for i in range(width):
+        pos = i / max(width - 1, 1)
+        aggr = fn(pos)
+        idx = min(int(aggr * (len(curve_chars) - 1)), len(curve_chars) - 1)
+        char = curve_chars[idx]
+        # Color: green for gentle (low aggr), red for aggressive (high aggr)
+        if aggr < 0.3:
+            color = "#00d4aa"
+        elif aggr < 0.6:
+            color = "#ffd700"
+        elif aggr < 0.8:
+            color = "#ff8c00"
+        else:
+            color = "#ff4444"
+        text.append(char, style=Style(color=color))
+
+    text.append(" ", style="dim")
+    text.append("keep", style="#00d4aa dim")
+    text.append("|", style="dim")
+    text.append("compress", style="#ff4444 dim")
+    text.append("|", style="dim")
+    text.append("keep", style="#00d4aa dim")
+
+    return text
+
+
 class InfoBar(Static):
-    """Session metadata and token gauge bar."""
+    """Session metadata, token gauge, density heatmap, and compression profile."""
 
     def update_session(self, session: SessionInfo | None) -> None:
         """Update the info bar with session metadata, or clear it."""
@@ -257,6 +297,11 @@ class InfoBar(Static):
             heatmap = render_density_heatmap(session.density_profile)
             combined.append("\n")
             combined.append_text(heatmap)
+
+        # Line 4: U-curve compression profile
+        ucurve = render_ucurve_mini()
+        combined.append("\n")
+        combined.append_text(ucurve)
 
         self.update(combined)
 
