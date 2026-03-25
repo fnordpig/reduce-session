@@ -348,7 +348,8 @@ class ReduceModal(ModalScreen[bool]):
         self.source_mtime: float | None = None
         self._current_worker: Worker | None = None
         self._llm_worker: Worker | None = None
-        self._llm_savings_history: list[int] = []  # chars_saved at each progress tick
+        self._classify_results: list[tuple] = []  # (category_str, text_size)
+        self._savings_history: list[int] = []  # chars_saved per distill/scaffold tick
 
     def compose(self) -> ComposeResult:
         title_suffix = " (dry-run)" if self.read_only else ""
@@ -461,7 +462,8 @@ class ReduceModal(ModalScreen[bool]):
 
     def _run_llm_pass(self) -> None:
         """Run LLM compression on already-reduced content, with live progress."""
-        self._llm_savings_history = []  # reset sparkline history
+        self._classify_results = []
+        self._savings_history = []
         path = str(self.session.path)
 
         def progress_fn(data):
@@ -507,76 +509,154 @@ class ReduceModal(ModalScreen[bool]):
         self.query_one("#llm-progress", Static).update("Starting LLM compression...")
         self._llm_worker = self.run_worker(do_llm_work, thread=True)
 
+    # Category colors for classification sparkline blending
+    _CAT_COLORS = {
+        "KEEP": (0, 212, 170),  # green
+        "DISTILL": (255, 140, 0),  # orange
+        "HEURISTIC": (255, 215, 0),  # yellow
+        # Map all categories to their route color
+        "DECISION": (0, 212, 170),
+        "PREFERENCE": (0, 212, 170),
+        "CORRECTION": (0, 212, 170),
+        "FINDING": (0, 212, 170),
+        "REASONING": (255, 140, 0),
+        "IMPLEMENTATION": (255, 140, 0),
+        "DIAGNOSTIC": (255, 140, 0),
+        "AGENT_TRANSCRIPT": (255, 140, 0),
+        "EXPLORATION": (255, 215, 0),
+        "SCAFFOLDING": (255, 215, 0),
+        "ROUTINE": (255, 215, 0),
+    }
+
+    def _blend_colors(self, items: list[tuple]) -> str:
+        """Blend category colors weighted by text size. Returns hex color."""
+        if not items:
+            return "#555555"
+        total_size = sum(size for _, size in items)
+        if total_size == 0:
+            return "#555555"
+        r = g = b = 0.0
+        for cat, size in items:
+            w = size / total_size
+            cr, cg, cb = self._CAT_COLORS.get(cat, (128, 128, 128))
+            r += cr * w
+            g += cg * w
+            b += cb * w
+        return f"#{int(r):02x}{int(g):02x}{int(b):02x}"
+
     def _update_llm_progress(self, data: dict) -> None:
-        """Update the LLM progress display with a live savings sparkline."""
+        """Update LLM progress with two-phase sparkline.
+
+        Phase 1 (classify): fills a sparkline where height = text size,
+        color = blended category colors for that segment.
+        Phase 2 (distill/scaffold): accumulation sparkline showing
+        savings growing over time, colored by compression weight.
+        """
         phase = data.get("phase", "")
         current = data.get("current", 0)
         total = data.get("total", 1)
         chars_saved = data.get("chars_saved", 0)
-
-        # Track savings over time for sparkline
-        self._llm_savings_history.append(chars_saved)
-
         pct = current * 100 // max(total, 1)
-        phase_labels = {
-            "classify": "Classifying",
-            "distill": "Distilling",
-            "scaffold": "De-scaffolding",
-        }
-        label = phase_labels.get(phase, phase)
 
+        spark_width = 35
+        spark_chars = " \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
         text = Text()
 
-        # Line 1: phase + progress fraction
-        text.append(f"{label} ", style="bold")
-        text.append(f"{current}/{total} ({pct}%)\n")
+        if phase == "classify":
+            # Update stored classifications
+            self._classify_results = data.get("classifications", [])
+            results = self._classify_results
+            total_exchanges = data.get("total", len(results))
 
-        # Line 2: savings sparkline — fills in left-to-right as LLM works
-        spark_width = 35
-        history = self._llm_savings_history
-        max_saved = max(history) if history else 1
+            text.append(f"Classifying ", style="bold")
+            text.append(f"{current}/{total} ({pct}%)\n")
 
-        spark_chars = " \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
-        # Resample history to spark_width buckets
-        if len(history) <= spark_width:
-            values = history + [0] * (spark_width - len(history))
+            # Render classification sparkline: bucket results into spark_width
+            # Each bucket's height = total text size, color = blended categories
+            if results:
+                bucket_size = max(total_exchanges / spark_width, 1)
+                for bi in range(spark_width):
+                    start = int(bi * bucket_size)
+                    end = int((bi + 1) * bucket_size)
+                    # Items in this bucket from classified results
+                    bucket_items = results[start : min(end, len(results))]
+                    if not bucket_items or start >= len(results):
+                        text.append("\u2591", style="dim")
+                    else:
+                        total_size = sum(s for _, s in bucket_items)
+                        max_size = max(
+                            (
+                                sum(
+                                    s
+                                    for _, s in results[
+                                        int(i * bucket_size) : int(
+                                            (i + 1) * bucket_size
+                                        )
+                                    ]
+                                )
+                                for i in range(min(spark_width, len(results)))
+                            ),
+                            default=1,
+                        )
+                        idx = min(
+                            int(total_size / max(max_size, 1) * (len(spark_chars) - 1)),
+                            len(spark_chars) - 1,
+                        )
+                        color = self._blend_colors(bucket_items)
+                        text.append(spark_chars[idx], style=Style(color=color))
+                text.append("\n")
+
+            # Legend
+            text.append("  ", style="dim")
+            text.append("\u2588 KEEP ", style=Style(color="#00d4aa"))
+            text.append("\u2588 DISTILL ", style=Style(color="#ff8c00"))
+            text.append("\u2588 HEURISTIC", style=Style(color="#ffd700"))
+
         else:
-            # Downsample: take evenly spaced samples
-            step = len(history) / spark_width
-            values = [
-                history[min(int(i * step), len(history) - 1)]
-                for i in range(spark_width)
-            ]
+            # Phase 2: distill/scaffold — accumulation sparkline
+            self._savings_history.append(chars_saved)
+            history = self._savings_history
+            max_saved = max(history) if history else 1
 
-        for i, v in enumerate(values):
-            if i >= len(history):
-                # Future: not yet processed
-                text.append("\u2591", style="dim")
+            phase_label = "Distilling" if phase == "distill" else "De-scaffolding"
+            text.append(f"{phase_label} ", style="bold")
+            text.append(f"{current}/{total} ({pct}%)\n")
+
+            # Render savings sparkline
+            if len(history) <= spark_width:
+                values = history + [0] * (spark_width - len(history))
             else:
-                idx = min(
-                    int(v / max(max_saved, 1) * (len(spark_chars) - 1)),
-                    len(spark_chars) - 1,
-                )
-                char = spark_chars[idx]
-                # Color by savings intensity
-                frac = v / max(max_saved, 1)
-                if frac < 0.25:
-                    color = "#555555"
-                elif frac < 0.5:
-                    color = "#ffd700"
-                elif frac < 0.75:
-                    color = "#ff8c00"
-                else:
-                    color = "#00d4aa"
-                text.append(char, style=Style(color=color))
-        text.append("\n")
+                step = len(history) / spark_width
+                values = [
+                    history[min(int(i * step), len(history) - 1)]
+                    for i in range(spark_width)
+                ]
 
-        # Line 3: saved chars + ratio
-        if chars_saved:
-            ratio = data.get("ratio", 0)
-            text.append(f"saved: {chars_saved:,} chars", style="#00d4aa bold")
-            if ratio:
-                text.append(f" ({ratio}%)", style="dim")
+            for i, v in enumerate(values):
+                if i >= len(history):
+                    text.append("\u2591", style="dim")
+                else:
+                    idx = min(
+                        int(v / max(max_saved, 1) * (len(spark_chars) - 1)),
+                        len(spark_chars) - 1,
+                    )
+                    frac = v / max(max_saved, 1)
+                    if frac < 0.25:
+                        color = "#555555"
+                    elif frac < 0.5:
+                        color = "#ffd700"
+                    elif frac < 0.75:
+                        color = "#ff8c00"
+                    else:
+                        color = "#00d4aa"
+                    text.append(spark_chars[idx], style=Style(color=color))
+            text.append("\n")
+
+            if chars_saved:
+                ratio = data.get("ratio", 0)
+                text.append(f"saved: {chars_saved:,} chars", style="#00d4aa bold")
+                if ratio:
+                    text.append(f" ({ratio}%)", style="dim")
 
         self.query_one("#llm-progress", Static).update(text)
 

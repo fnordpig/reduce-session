@@ -1439,16 +1439,28 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
     batches = list(_batched(middle, 20))
     total_batches = len(batches)
 
+    # Pre-compute exchange text sizes for sparkline rendering
+    exchange_sizes = []
+    for pos, obj, aggr in middle:
+        text = _extract_assistant_text(obj)
+        exchange_sizes.append(len(text) if text else 0)
+
     async def classify_worker():
         classified_so_far = 0
+        # Running list of (category, text_size) for sparkline
+        classify_results = []
         for batch_num, batch in enumerate(batches, 1):
             exchange_texts = [_extract_exchange_text(obj) for _, obj, _ in batch]
             categories = await provider.classify(exchange_texts)
-            for (pos, obj, aggr), cat in zip(batch, categories):
+            for i, ((pos, obj, aggr), cat) in enumerate(zip(batch, categories)):
                 classifications[pos] = cat
                 route = ROUTING_MAP.get(cat, Route.HEURISTIC)
                 if route == Route.DISTILL:
                     await distill_queue.put((pos, obj))
+                # Find this exchange's index in the middle list
+                mid_idx = classified_so_far + i
+                size = exchange_sizes[mid_idx] if mid_idx < len(exchange_sizes) else 0
+                classify_results.append((cat.value, size))
             classified_so_far += len(batch)
             if progress_callback:
                 progress_callback(
@@ -1458,6 +1470,7 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
                         "total": len(middle),
                         "batch": batch_num,
                         "total_batches": total_batches,
+                        "classifications": list(classify_results),
                     }
                 )
         await distill_queue.put(None)  # sentinel
