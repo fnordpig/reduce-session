@@ -134,24 +134,50 @@ ReduceModal {
     content-align-vertical: middle;
 }
 
-#llm-toggle-bar {
+/* Split panel: heuristic (left) + LLM (right) */
+#modal-split {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#heuristic-panel {
+    width: 55%;
+    height: 1fr;
+    padding: 0 1 0 0;
+    border-right: tall $primary-background-lighten-2;
+    overflow-y: auto;
+}
+
+#llm-panel {
+    width: 45%;
+    height: 1fr;
+    padding: 0 0 0 1;
+    overflow-y: auto;
+}
+
+.panel-title {
+    text-style: bold;
+    padding-bottom: 1;
+    color: $accent;
+}
+
+#btn-run-llm {
     height: 3;
-    padding: 1 0;
+    margin-bottom: 1;
 }
 
-#llm-switch {
-    width: auto;
-}
-
-#llm-label {
+#llm-description {
     color: $text-muted;
-    padding-left: 1;
+    padding-bottom: 1;
 }
 
 #llm-progress {
     height: auto;
-    max-height: 3;
-    padding: 0 1;
+    padding: 0 0 1 0;
+}
+
+#llm-results {
+    height: auto;
 }
 
 /* History Modal — Time Machine */

@@ -14,7 +14,7 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, LoadingIndicator, Static, Switch
+from textual.widgets import Button, LoadingIndicator, Static
 from textual.worker import Worker, WorkerState
 
 from .git_ops import (
@@ -363,19 +363,50 @@ class ReduceModal(ModalScreen[bool]):
                     "Aggressive (a)", id="btn-aggressive", classes="profile-btn"
                 )
                 yield Static("", id="cut-fade-display")
-            if self.llm_spec:
-                with Horizontal(id="llm-toggle-bar"):
-                    yield Switch(value=False, id="llm-switch")
+
+            # Split panel: heuristic (left) + LLM (right)
+            with Horizontal(id="modal-split"):
+                # Left: heuristic compression (instant)
+                with Vertical(id="heuristic-panel"):
                     yield Static(
-                        " LLM Compression (may take 2-3 min)",
-                        id="llm-label",
+                        "Heuristic Compression",
+                        id="heuristic-title",
+                        classes="panel-title",
                     )
-                yield Static("", id="llm-progress")
-            yield Static("", id="dry-run-stats")
-            yield Static("", id="token-viz")
-            yield Static("", id="strategies-grid")
-            yield Static("", id="safety-checks")
-            yield LoadingIndicator(id="spinner")
+                    yield Static("", id="dry-run-stats")
+                    yield Static("", id="token-viz")
+                    yield Static("", id="strategies-grid")
+                    yield Static("", id="safety-checks")
+                    yield LoadingIndicator(id="spinner")
+
+                # Right: LLM compression (opt-in, live progress)
+                with Vertical(id="llm-panel"):
+                    llm_label = (
+                        f"LLM Compression ({self.llm_spec})"
+                        if self.llm_spec
+                        else "LLM Compression"
+                    )
+                    yield Static(llm_label, id="llm-title", classes="panel-title")
+                    if self.llm_spec:
+                        yield Button(
+                            "Run LLM Compression",
+                            variant="warning",
+                            id="btn-run-llm",
+                        )
+                        yield Static(
+                            "Classifies exchanges, distills verbose content,\n"
+                            "and strips scaffolding language. May take 2-3 min.",
+                            id="llm-description",
+                        )
+                    else:
+                        yield Static(
+                            "No LLM configured.\n"
+                            "Set REDUCE_SESSION_LLM or use --llm flag.",
+                            id="llm-description",
+                        )
+                    yield Static("", id="llm-progress")
+                    yield Static("", id="llm-results")
+
             with Horizontal(id="modal-actions"):
                 if not self.read_only:
                     yield Button("Apply", variant="success", id="btn-apply")
@@ -426,11 +457,6 @@ class ReduceModal(ModalScreen[bool]):
             thread=True,
             exclusive=True,
         )
-
-    def on_switch_changed(self, event: Switch.Changed) -> None:
-        """Handle LLM switch toggle."""
-        if event.value and self.result:
-            self._run_llm_pass()
 
     def _run_llm_pass(self) -> None:
         """Run LLM compression on already-reduced content, with live progress."""
@@ -510,19 +536,53 @@ class ReduceModal(ModalScreen[bool]):
         self.query_one("#llm-progress", Static).update(text)
 
     def _render_llm_complete(self, llm_stats: dict) -> None:
-        """Show LLM completion summary."""
-        text = Text()
-        text.append("  + LLM compression complete", style="bold #00d4aa")
-        chars = llm_stats.get("llm_chars_saved", 0)
+        """Show LLM completion results in the right panel."""
+        self.query_one("#llm-progress", Static).update(
+            Text("Complete", style="bold #00d4aa")
+        )
+
         classified = llm_stats.get("llm_classified", 0)
+        keep_n = llm_stats.get("llm_classified_keep", 0)
+        distill_n = llm_stats.get("llm_classified_distill", 0)
+        heur_n = llm_stats.get("llm_classified_heuristic", 0)
         distilled = llm_stats.get("llm_distilled", 0)
         stripped = llm_stats.get("llm_scaffold_stripped", 0)
-        text.append(
-            f"  -- {classified} classified, {distilled} distilled, {stripped} stripped"
-        )
+        chars = llm_stats.get("llm_chars_saved", 0)
+
+        text = Text()
+        text.append("Classification:\n", style="bold")
+        if classified:
+            text.append(f"  {classified} exchanges analyzed\n")
+            text.append(
+                f"  KEEP       {keep_n:>5} ({keep_n * 100 // max(classified, 1)}%)\n",
+                style="#00d4aa",
+            )
+            text.append(
+                f"  DISTILL    {distill_n:>5} ({distill_n * 100 // max(classified, 1)}%)\n",
+                style="#ff8c00",
+            )
+            text.append(
+                f"  HEURISTIC  {heur_n:>5} ({heur_n * 100 // max(classified, 1)}%)\n",
+                style="#ffd700",
+            )
+
+        text.append("\nDistillation:\n", style="bold")
+        text.append(f"  {distilled} exchanges summarized\n")
+        text.append(f"  {stripped} text blocks de-scaffolded\n")
+
         if chars:
-            text.append(f", {chars:,} chars saved", style="#00d4aa")
-        self.query_one("#llm-progress", Static).update(text)
+            text.append(f"\nChars saved: ", style="bold")
+            text.append(f"{chars:,}\n", style="#00d4aa bold")
+
+        # Re-enable button
+        try:
+            btn = self.query_one("#btn-run-llm", Button)
+            btn.label = "Run Again"
+            btn.disabled = False
+        except Exception:
+            pass
+
+        self.query_one("#llm-results", Static).update(text)
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         """Handle worker completion or failure."""
@@ -799,6 +859,10 @@ class ReduceModal(ModalScreen[bool]):
             self._run_reduction("standard")
         elif btn_id == "btn-aggressive":
             self._run_reduction("aggressive")
+        elif btn_id == "btn-run-llm" and self.result:
+            event.button.disabled = True
+            event.button.label = "Running..."
+            self._run_llm_pass()
 
     def action_profile_gentle(self) -> None:
         self._run_reduction("gentle")
