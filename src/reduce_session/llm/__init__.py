@@ -1,3 +1,5 @@
+import os
+
 from .base import (
     Category,
     Route,
@@ -7,6 +9,35 @@ from .base import (
     HEURISTIC_CATEGORIES,
     LLMProvider,
 )
+
+# Preferred Ollama models for classification/distillation, in priority order
+_OLLAMA_PREFERRED = [
+    "qwen3:4b",
+    "gemma3:4b",
+    "mistral-small3.1:latest",
+    "qwen2.5:32b-instruct-q4_K_M",
+]
+
+
+def _detect_ollama_model() -> str:
+    """Auto-detect best available Ollama model for classification."""
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+    try:
+        import httpx
+
+        resp = httpx.get(f"{host}/api/tags", timeout=5.0)
+        resp.raise_for_status()
+        available = {m["name"] for m in resp.json().get("models", [])}
+        for preferred in _OLLAMA_PREFERRED:
+            if preferred in available:
+                return preferred
+        # Fall back to first available instruct/chat model
+        for name in sorted(available):
+            if "embed" not in name:
+                return name
+    except Exception:
+        pass
+    return "qwen3:4b"  # fallback default
 
 
 def create_provider(llm_spec: str) -> LLMProvider:
@@ -18,7 +49,9 @@ def create_provider(llm_spec: str) -> LLMProvider:
     elif provider_name == "ollama":
         from .ollama import OllamaProvider
 
-        return OllamaProvider(model_spec or "qwen3:4b")
+        if not model_spec:
+            model_spec = _detect_ollama_model()
+        return OllamaProvider(model_spec)
     elif provider_name == "anthropic":
         from .anthropic_provider import AnthropicProvider
 
