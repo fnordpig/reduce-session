@@ -133,6 +133,26 @@ ReduceModal {
     content-align-vertical: middle;
 }
 
+#llm-toggle-bar {
+    height: 1;
+    padding: 0 0 1 0;
+}
+
+#llm-switch {
+    width: auto;
+}
+
+#llm-label {
+    color: $text-muted;
+    padding-left: 1;
+}
+
+#llm-progress {
+    height: auto;
+    max-height: 3;
+    padding: 0 1;
+}
+
 /* History Modal — Time Machine */
 HistoryModal {
     align-horizontal: center;

@@ -14,7 +14,7 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, LoadingIndicator, Static
+from textual.widgets import Button, LoadingIndicator, Static, Switch
 from textual.worker import Worker, WorkerState
 
 from .git_ops import (
@@ -347,6 +347,7 @@ class ReduceModal(ModalScreen[bool]):
         self.result: ReductionResult | None = None
         self.source_mtime: float | None = None
         self._current_worker: Worker | None = None
+        self._llm_worker: Worker | None = None
 
     def compose(self) -> ComposeResult:
         title_suffix = " (dry-run)" if self.read_only else ""
@@ -362,6 +363,14 @@ class ReduceModal(ModalScreen[bool]):
                     "Aggressive (a)", id="btn-aggressive", classes="profile-btn"
                 )
                 yield Static("", id="cut-fade-display")
+            if self.llm_spec:
+                with Horizontal(id="llm-toggle-bar"):
+                    yield Switch(value=False, id="llm-switch")
+                    yield Static(
+                        " LLM Compression (may take 2-3 min)",
+                        id="llm-label",
+                    )
+                yield Static("", id="llm-progress")
             yield Static("", id="dry-run-stats")
             yield Static("", id="token-viz")
             yield Static("", id="strategies-grid")
@@ -407,27 +416,137 @@ class ReduceModal(ModalScreen[bool]):
         except OSError:
             self.source_mtime = None
 
-        # Create LLM provider if spec given
-        llm_provider = None
-        if self.llm_spec:
-            try:
-                from reduce_session.llm import create_provider
-
-                llm_provider = create_provider(self.llm_spec)
-            except Exception:
-                pass  # graceful degradation
-
-        # Run reduction in a thread (CPU-bound work)
+        # Always run without LLM provider (heuristic only)
         self._current_worker = self.run_worker(
             lambda: reduce_session(
-                path, profile=profile, estimate_tokens=True, llm_provider=llm_provider
+                path,
+                profile=profile,
+                estimate_tokens=True,
             ),
             thread=True,
             exclusive=True,
         )
 
+    def on_switch_changed(self, event: Switch.Changed) -> None:
+        """Handle LLM switch toggle."""
+        if event.value and self.result:
+            self._run_llm_pass()
+
+    def _run_llm_pass(self) -> None:
+        """Run LLM compression on already-reduced content, with live progress."""
+        path = str(self.session.path)
+
+        def progress_fn(data):
+            """Called from worker thread -- post message to main thread."""
+            self.call_from_thread(self._update_llm_progress, data)
+
+        def do_llm_work():
+            import asyncio
+            import json
+
+            from reduce_session.llm import create_provider
+            from reduce_session.reduction import (
+                _llm_compression_pass,
+                make_aggressiveness_fn,
+            )
+
+            provider = create_provider(self.llm_spec)
+
+            # Re-read the current (heuristic-reduced) result
+            kept_objs = [json.loads(line) for line in self.result.kept_lines]
+
+            cut_fade = {
+                "gentle": (60, 85),
+                "standard": (50, 75),
+                "aggressive": (40, 65),
+            }
+            cut, fade = cut_fade.get(self.current_profile, (50, 75))
+            aggr_fn = make_aggressiveness_fn(cut, fade)
+
+            llm_stats = asyncio.run(
+                _llm_compression_pass(
+                    kept_objs, aggr_fn, provider, progress_callback=progress_fn
+                )
+            )
+
+            # Re-serialize
+            new_lines = [
+                json.dumps(obj, separators=(",", ":")) + "\n" for obj in kept_objs
+            ]
+
+            return llm_stats, new_lines
+
+        self.query_one("#llm-progress", Static).update("Starting LLM compression...")
+        self._llm_worker = self.run_worker(do_llm_work, thread=True)
+
+    def _update_llm_progress(self, data: dict) -> None:
+        """Update the LLM progress display (called from main thread via call_from_thread)."""
+        phase = data.get("phase", "")
+        current = data.get("current", 0)
+        total = data.get("total", 1)
+        chars_saved = data.get("chars_saved", 0)
+
+        pct = current * 100 // max(total, 1)
+
+        # Build progress bar
+        bar_width = 30
+        filled = bar_width * current // max(total, 1)
+        bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
+
+        phase_labels = {
+            "classify": "Classifying exchanges",
+            "distill": "Distilling",
+            "scaffold": "Stripping scaffolding",
+        }
+        label = phase_labels.get(phase, phase)
+
+        text = Text()
+        text.append(f"  {label}: ", style="bold")
+        text.append(bar, style="#00d4aa" if pct > 50 else "#ffd700")
+        text.append(f" {current}/{total} ({pct}%)")
+        if chars_saved:
+            text.append(f"  saved: {chars_saved:,} chars", style="#00d4aa")
+
+        self.query_one("#llm-progress", Static).update(text)
+
+    def _render_llm_complete(self, llm_stats: dict) -> None:
+        """Show LLM completion summary."""
+        text = Text()
+        text.append("  + LLM compression complete", style="bold #00d4aa")
+        chars = llm_stats.get("llm_chars_saved", 0)
+        classified = llm_stats.get("llm_classified", 0)
+        distilled = llm_stats.get("llm_distilled", 0)
+        stripped = llm_stats.get("llm_scaffold_stripped", 0)
+        text.append(
+            f"  -- {classified} classified, {distilled} distilled, {stripped} stripped"
+        )
+        if chars:
+            text.append(f", {chars:,} chars saved", style="#00d4aa")
+        self.query_one("#llm-progress", Static).update(text)
+
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         """Handle worker completion or failure."""
+        # LLM worker
+        if event.worker is self._llm_worker:
+            if event.state == WorkerState.SUCCESS:
+                llm_stats, new_lines = event.worker.result
+                # Update the result with LLM stats
+                self.result.stats.update(llm_stats)
+                self.result.kept_lines = new_lines
+                self.result.new_size = sum(len(l) for l in new_lines)
+                self.result.new_count = len(new_lines)
+                self._render_results()  # re-render with LLM stats
+                self._render_llm_complete(llm_stats)
+            elif event.state == WorkerState.ERROR:
+                self.query_one("#llm-progress", Static).update(
+                    Text(
+                        "LLM compression failed -- heuristic results preserved",
+                        style="red",
+                    )
+                )
+            return
+
+        # Heuristic worker
         if event.state == WorkerState.SUCCESS:
             self.result = event.worker.result
             self._render_results()

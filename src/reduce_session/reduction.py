@@ -1413,7 +1413,7 @@ def _batched(iterable, n):
         yield batch
 
 
-async def _llm_compression_pass(kept_objs, aggr_fn, provider):
+async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=None):
     """Pass 3.6 + 3.7: LLM classification, distillation, and scaffold stripping."""
     import asyncio
     from collections import Counter
@@ -1436,9 +1436,12 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider):
     # Phase 1: Batched classification with async distillation overlap
     classifications = {}  # pos -> Category
     distill_queue = asyncio.Queue()
+    batches = list(_batched(middle, 20))
+    total_batches = len(batches)
 
     async def classify_worker():
-        for batch in _batched(middle, 20):
+        classified_so_far = 0
+        for batch_num, batch in enumerate(batches, 1):
             exchange_texts = [_extract_exchange_text(obj) for _, obj, _ in batch]
             categories = await provider.classify(exchange_texts)
             for (pos, obj, aggr), cat in zip(batch, categories):
@@ -1446,15 +1449,28 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider):
                 route = ROUTING_MAP.get(cat, Route.HEURISTIC)
                 if route == Route.DISTILL:
                     await distill_queue.put((pos, obj))
+            classified_so_far += len(batch)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "classify",
+                        "current": classified_so_far,
+                        "total": len(middle),
+                        "batch": batch_num,
+                        "total_batches": total_batches,
+                    }
+                )
         await distill_queue.put(None)  # sentinel
 
     async def distill_worker():
         distill_count = 0
         chars_saved = 0
+        total_to_distill = 0  # updated as we discover them
         while True:
             item = await distill_queue.get()
             if item is None:
                 break
+            total_to_distill += 1
             pos, obj = item
             text = _extract_assistant_text(obj)
             if text and len(text) > 50:
@@ -1464,6 +1480,15 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider):
                     _replace_assistant_text(kept_objs[pos], summary)
                     distill_count += 1
                     chars_saved += original_len - len(summary)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "distill",
+                        "current": distill_count,
+                        "total": total_to_distill,
+                        "chars_saved": chars_saved,
+                    }
+                )
         return distill_count, chars_saved
 
     # Run classification and distillation concurrently
@@ -1474,7 +1499,8 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider):
     # Phase 2: Scaffolding strip on ALL assistant text in middle zone
     strip_count = 0
     strip_chars_saved = 0
-    for pos, obj, aggr in middle:
+    total_to_strip = len(middle)
+    for idx, (pos, obj, aggr) in enumerate(middle, 1):
         text = _extract_assistant_text(obj)
         if text and len(text) > 50:
             original_len = len(text)
@@ -1483,6 +1509,15 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider):
                 _replace_assistant_text(kept_objs[pos], stripped)
                 strip_count += 1
                 strip_chars_saved += original_len - len(stripped)
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "scaffold",
+                    "current": idx,
+                    "total": total_to_strip,
+                    "chars_saved": distill_chars + strip_chars_saved,
+                }
+            )
 
     # Build stats
     route_counts = Counter(
@@ -1508,6 +1543,7 @@ def reduce_session(
     chars_per_token: float = CHARS_PER_TOKEN,
     estimate_tokens: bool = False,
     llm_provider: object | None = None,
+    progress_callback: object | None = None,
 ) -> ReductionResult:
     """Run the full reduction pipeline on a session JSONL file.
 
@@ -1699,7 +1735,9 @@ def reduce_session(
     if llm_provider is not None:
         import asyncio
 
-        llm_stats = asyncio.run(_llm_compression_pass(kept_objs, aggr_fn, llm_provider))
+        llm_stats = asyncio.run(
+            _llm_compression_pass(kept_objs, aggr_fn, llm_provider, progress_callback)
+        )
         stats.update(llm_stats)
 
     total = len(kept_objs)
