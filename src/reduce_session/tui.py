@@ -53,10 +53,11 @@ class SessionBrowserApp(App):
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
+        Binding("escape", "quit", "Quit", show=False),
         Binding("r", "reduce", "Reduce", show=True),
-        Binding("d", "dry_run", "Dry Run", show=True),
         Binding("h", "history", "History", show=True),
-        Binding("shift+r", "refresh", "Refresh", show=True, key_display="R"),
+        Binding("ctrl+l", "refresh", "Refresh", show=True, key_display="^L"),
+        Binding("shift+r", "refresh", "Refresh", show=False),
         Binding("j", "cursor_down", show=False),
         Binding("k", "cursor_up", show=False),
     ]
@@ -183,17 +184,6 @@ class SessionBrowserApp(App):
             self.push_screen(
                 ReduceModal(self.selected_session, read_only=False),
                 callback=self._on_modal_dismiss,
-            )
-        else:
-            self.notify(
-                "Select a session first (not a project folder)", severity="warning"
-            )
-
-    def action_dry_run(self) -> None:
-        """Run dry-run analysis for the highlighted session."""
-        if self.selected_session:
-            self.push_screen(
-                ReduceModal(self.selected_session, read_only=True),
             )
         else:
             self.notify(

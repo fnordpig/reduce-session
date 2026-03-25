@@ -243,12 +243,12 @@ async def test_reduce_on_no_session(empty_projects_dir):
 
 
 @pytest.mark.asyncio
-async def test_dry_run_on_no_session(empty_projects_dir):
-    """Pressing 'd' with no sessions should show a warning, not crash."""
+async def test_escape_quits(empty_projects_dir):
+    """Pressing Escape should quit the app."""
     app = SessionBrowserApp(projects_dir=empty_projects_dir)
     async with app.run_test() as pilot:
-        await pilot.press("d")
-        # Should not crash -- warning notification shown
+        await pilot.press("escape")
+        # Should not crash -- app quits
 
 
 # --- Session label edge cases ---
