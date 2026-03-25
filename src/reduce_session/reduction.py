@@ -1497,25 +1497,34 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
     )
 
     # Phase 2: Scaffolding strip on ALL assistant text in middle zone
-    strip_count = 0
-    strip_chars_saved = 0
-    total_to_strip = len(middle)
-    for idx, (pos, obj, aggr) in enumerate(middle, 1):
+    # Pre-filter to only exchanges with substantial assistant text
+    strip_candidates = []
+    total_strip_chars = 0
+    for pos, obj, aggr in middle:
         text = _extract_assistant_text(obj)
         if text and len(text) > 50:
-            original_len = len(text)
-            stripped = await provider.distill(text, mode="strip_scaffold")
-            if stripped and len(stripped) < original_len:
-                _replace_assistant_text(kept_objs[pos], stripped)
-                strip_count += 1
-                strip_chars_saved += original_len - len(stripped)
+            strip_candidates.append((pos, obj, text))
+            total_strip_chars += len(text)
+
+    strip_count = 0
+    strip_chars_saved = 0
+    for idx, (pos, obj, text) in enumerate(strip_candidates, 1):
+        original_len = len(text)
+        stripped = await provider.distill(text, mode="strip_scaffold")
+        if stripped and len(stripped) < original_len:
+            _replace_assistant_text(kept_objs[pos], stripped)
+            strip_count += 1
+            strip_chars_saved += original_len - len(stripped)
         if progress_callback:
+            total_saved = distill_chars + strip_chars_saved
+            ratio = total_saved * 100 // max(total_strip_chars, 1)
             progress_callback(
                 {
                     "phase": "scaffold",
                     "current": idx,
-                    "total": total_to_strip,
-                    "chars_saved": distill_chars + strip_chars_saved,
+                    "total": len(strip_candidates),
+                    "chars_saved": total_saved,
+                    "ratio": ratio,
                 }
             )
 

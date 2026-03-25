@@ -527,11 +527,14 @@ class ReduceModal(ModalScreen[bool]):
         label = phase_labels.get(phase, phase)
 
         text = Text()
-        text.append(f"  {label}: ", style="bold")
+        text.append(f"{label}:\n", style="bold")
         text.append(bar, style="#00d4aa" if pct > 50 else "#ffd700")
-        text.append(f" {current}/{total} ({pct}%)")
+        text.append(f" {current}/{total} ({pct}%)\n")
         if chars_saved:
-            text.append(f"  saved: {chars_saved:,} chars", style="#00d4aa")
+            ratio = data.get("ratio", 0)
+            text.append(f"saved: {chars_saved:,} chars", style="#00d4aa")
+            if ratio:
+                text.append(f" ({ratio}% compression)", style="dim")
 
         self.query_one("#llm-progress", Static).update(text)
 
