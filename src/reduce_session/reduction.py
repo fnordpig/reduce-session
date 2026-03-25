@@ -408,6 +408,7 @@ def _reset_structural_stats():
         "paths_shortened": 0,
         "line_numbers_stripped": 0,
         "indentation_collapsed": 0,
+        "code_minified": 0,
         "blank_lines_collapsed": 0,
         "chars_dropped_stochastic": 0,
         "chars_saved_structural": 0,
@@ -417,13 +418,103 @@ def _reset_structural_stats():
 # Profile-dependent thresholds for structural compression.
 # Gentle = higher thresholds (less compression), aggressive = lower (more compression).
 STRUCTURAL_THRESHOLDS = {
-    "aggressive": {"paths": 0.15, "linenum": 0.3, "indent": 0.5, "chardrop": 0.25},
-    "standard": {"paths": 0.3, "linenum": 0.5, "indent": 0.7, "chardrop": 0.4},
-    "gentle": {"paths": 0.5, "linenum": 0.7, "indent": 0.9, "chardrop": 0.7},
+    "aggressive": {
+        "paths": 0.15,
+        "linenum": 0.3,
+        "indent": 0.5,
+        "chardrop": 0.25,
+        "minify": 0.3,
+    },
+    "standard": {
+        "paths": 0.3,
+        "linenum": 0.5,
+        "indent": 0.7,
+        "chardrop": 0.4,
+        "minify": 0.5,
+    },
+    "gentle": {
+        "paths": 0.5,
+        "linenum": 0.7,
+        "indent": 0.9,
+        "chardrop": 0.7,
+        "minify": 0.8,
+    },
 }
 
 # Module-level profile name, set by reduce_session() before trimming pass
 _structural_profile: str = "standard"
+
+# Patterns that suggest text is code (not prose)
+_CODE_INDICATORS = re.compile(
+    r"(?:fn |def |class |import |use |pub |let |const |var |func "
+    r"|return |if |for |while |match |switch |struct |enum |trait "
+    r"|async |await |module |package |from |require\(|#include)"
+)
+
+
+def minify_code(text: str) -> str:
+    """Minify code by stripping comments, collapsing whitespace, removing blank lines.
+
+    Preserves semantic structure while removing formatting that LLMs don't need.
+    Only operates on text that looks like code (has code-like keywords).
+    """
+    if not text or not _CODE_INDICATORS.search(text):
+        return text
+
+    lines = text.split("\n")
+    out = []
+    in_block_comment = False
+
+    for line in lines:
+        stripped = line.rstrip()
+
+        # Track block comments (/* ... */)
+        if in_block_comment:
+            if "*/" in stripped:
+                in_block_comment = False
+                # Keep anything after the block comment end
+                after = stripped[stripped.index("*/") + 2 :].strip()
+                if after:
+                    out.append(after)
+            continue
+
+        if "/*" in stripped and "*/" not in stripped:
+            # Block comment starts, doesn't end on this line
+            before = stripped[: stripped.index("/*")].rstrip()
+            if before:
+                out.append(before)
+            in_block_comment = True
+            continue
+
+        # Skip empty lines
+        if not stripped.strip():
+            continue
+
+        s = stripped.lstrip()
+
+        # Skip full-line comments
+        if s.startswith("//") or s.startswith("# ") or s.startswith("#!"):
+            continue
+
+        # Skip docstrings (triple-quote lines)
+        if s.startswith('"""') or s.startswith("'''"):
+            continue
+
+        # Strip inline comments (simple heuristic — skip if inside string)
+        # Only strip // comments that have a space before them (likely not URLs)
+        if " //" in s:
+            # Check it's not inside a string — rough: count quotes before //
+            idx = s.index(" //")
+            pre = s[:idx]
+            if pre.count('"') % 2 == 0 and pre.count("'") % 2 == 0:
+                s = pre.rstrip()
+
+        # Collapse indentation: map to 1-space-per-level
+        indent = len(stripped) - len(s)
+        min_indent = indent // 4
+        out.append(" " * min_indent + s)
+
+    return "\n".join(out)
 
 
 def structural_compress(text: str, aggr: float) -> str:
@@ -474,13 +565,23 @@ def structural_compress(text: str, aggr: float) -> str:
             text = "\n".join(collapsed)
             _structural_stats["indentation_collapsed"] += 1
 
-    # 4. Blank line collapse: 3+ consecutive newlines -> 2
+    # 4. Code minification: strip comments, collapse whitespace, remove blank lines
+    if aggr > thresholds["minify"]:
+        new_text = minify_code(text)
+        if new_text != text:
+            saved_minify = len(text) - len(new_text)
+            _structural_stats["code_minified"] = (
+                _structural_stats.get("code_minified", 0) + saved_minify
+            )
+            text = new_text
+
+    # 5. Blank line collapse: 3+ consecutive newlines -> 2
     new_text = re.sub(r"\n{3,}", "\n\n", text)
     if new_text != text:
         _structural_stats["blank_lines_collapsed"] += text.count("\n\n\n")
         text = new_text
 
-    # 5. Stochastic character drop (vowel-first, for high aggr in middle zone)
+    # 6. Stochastic character drop (vowel-first, for high aggr in middle zone)
     text = stochastic_char_drop(text, aggr, threshold=thresholds["chardrop"])
 
     saved = orig_len - len(text)

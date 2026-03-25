@@ -88,8 +88,10 @@ def test_structural_compress_indentation():
 
     text = '    fn main() {\n        println!("hello");\n    }'
     result = structural_compress(text, aggr=0.9)
-    assert "  fn main()" in result  # 2-space
-    assert "    fn main()" not in result  # no 4-space
+    # At high aggr, code gets minified (1-space-per-level) rather than just 4->2
+    assert len(result) < len(text)
+    assert "fn main()" in result
+    assert "println!" in result
 
 
 def test_blank_line_collapse():
@@ -149,3 +151,60 @@ def test_stochastic_char_drop_deterministic():
     r1 = stochastic_char_drop(text, aggr=0.8, seed=42)
     r2 = stochastic_char_drop(text, aggr=0.8, seed=42)
     assert r1 == r2  # same seed = same result
+
+
+def test_minify_code_strips_comments():
+    from reduce_session.reduction import minify_code
+
+    text = "fn main() {\n    // this is a comment\n    let x = 5;\n    println!(x);\n}"
+    result = minify_code(text)
+    assert "// this is a comment" not in result
+    assert "let x = 5" in result
+    assert "println!" in result
+
+
+def test_minify_code_removes_blank_lines():
+    from reduce_session.reduction import minify_code
+
+    text = "fn main() {\n\n\n    let x = 5;\n\n    let y = 10;\n}"
+    result = minify_code(text)
+    assert "\n\n" not in result
+
+
+def test_minify_code_collapses_indentation():
+    from reduce_session.reduction import minify_code
+
+    text = "fn main() {\n        let x = 5;\n            let y = 10;\n}"
+    result = minify_code(text)
+    # 8-space indent -> 2, 12-space -> 3
+    lines = result.split("\n")
+    for line in lines:
+        if line.strip():
+            indent = len(line) - len(line.lstrip())
+            assert indent <= 3, f"Indent {indent} too deep: {line!r}"
+
+
+def test_minify_code_skips_non_code():
+    from reduce_session.reduction import minify_code
+
+    text = "This is just regular prose text without any code keywords."
+    result = minify_code(text)
+    assert result == text  # unchanged
+
+
+def test_minify_code_preserves_python_comments_selectively():
+    from reduce_session.reduction import minify_code
+
+    text = "def foo():\n    # a comment\n    x = 5\n    return x"
+    result = minify_code(text)
+    assert "# a comment" not in result
+    assert "x = 5" in result
+
+
+def test_minify_code_handles_block_comments():
+    from reduce_session.reduction import minify_code
+
+    text = "fn main() {\n    /* block\n       comment */\n    let x = 5;\n}"
+    result = minify_code(text)
+    assert "block" not in result
+    assert "let x = 5" in result
