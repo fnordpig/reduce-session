@@ -951,6 +951,220 @@ def detect_constant_envelope_fields(kept_objs):
     return {f for f, vals in field_values.items() if len(vals) == 1}
 
 
+# --- Semantic elision (heuristic, no LLM) ---
+
+CONFIRMATIONS = {
+    "yes",
+    "ok",
+    "go",
+    "sure",
+    "fine",
+    "do it",
+    "agreed",
+    "correct",
+    "sounds good",
+    "lets go",
+    "proceed",
+    "continue",
+    "yeah",
+    "yep",
+    "yup",
+    "right",
+    "exactly",
+    "perfect",
+    "good",
+    "great",
+    "nice",
+    "awesome",
+    "cool",
+    "done",
+    "a",
+    "b",
+    "c",
+    "1",
+    "2",
+    "3",
+    "y",
+}
+
+_PASSED_RE = re.compile(r"(\d+)\s+passed")
+_FAILED_COUNT_RE = re.compile(r"(\d+)\s+failed", re.IGNORECASE)
+
+
+def detect_passing_builds(kept_objs):
+    """Return {position: summary} for tool_result blocks with passing build/test output."""
+    results = {}
+    for pos, obj in enumerate(kept_objs):
+        if get_msg_type(obj) != "user":
+            continue
+        content = obj.get("message", {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            text = block.get("content", "")
+            if not isinstance(text, str):
+                continue
+            # Check for error indicators first — bail if any present
+            has_error = "error" in text or "panic" in text
+            # "failed" / "FAILED" is an error unless it's "0 failed"
+            fm = _FAILED_COUNT_RE.search(text)
+            if fm and int(fm.group(1)) > 0:
+                has_error = True
+            elif "FAILED" in text and not fm:
+                has_error = True
+            elif "failed" in text and not fm:
+                has_error = True
+            if has_error:
+                continue
+            # Cargo build success
+            if "Finished" in text and ("release" in text or "dev" in text):
+                results[pos] = "[cargo build: ok]"
+                break
+            # Test results
+            m = _PASSED_RE.search(text)
+            if m:
+                results[pos] = f"[{m.group(0)}]"
+                break
+            # Exit code 0
+            if "exit code 0" in text or "Exit code 0" in text:
+                results[pos] = "[command: ok]"
+                break
+            # Build succeeded/complete
+            if "Build succeeded" in text or "Build complete" in text:
+                results[pos] = "[build: ok]"
+                break
+    return results
+
+
+def detect_confirmations(kept_objs):
+    """Return set of positions for user messages that are just confirmations."""
+    positions = set()
+    for pos, obj in enumerate(kept_objs):
+        if get_msg_type(obj) != "user":
+            continue
+        content = obj.get("message", {}).get("content")
+        if not isinstance(content, str):
+            continue
+        stripped = content.strip().lower().rstrip(".,!?;:")
+        if stripped in CONFIRMATIONS:
+            positions.add(pos)
+        elif len(content.strip()) < 20:
+            # Match if text starts with a confirmation phrase
+            for phrase in CONFIRMATIONS:
+                if stripped.startswith(phrase):
+                    positions.add(pos)
+                    break
+    return positions
+
+
+def detect_stale_read_results(kept_objs):
+    """Return {position: summary} for Read tool_results where file was never later modified."""
+    # Build map: tool_use_id -> (file_path, tool_use_pos)
+    read_tool_uses = {}
+    edited_files = set()
+    for pos, obj in enumerate(kept_objs):
+        for block in get_content_blocks(obj):
+            if block.get("type") == "tool_use":
+                name = block.get("name", "")
+                inp = block.get("input", {})
+                if not isinstance(inp, dict):
+                    continue
+                fp = inp.get("file_path", "")
+                if not fp:
+                    continue
+                if name in ("Read", "read"):
+                    tool_id = block.get("id", "")
+                    if tool_id:
+                        read_tool_uses[tool_id] = (fp, pos)
+                elif name in ("Edit", "edit", "Write", "write"):
+                    edited_files.add(fp)
+
+    # Find which reads are stale (file never edited later)
+    # We need to check ordering: read must come BEFORE any edit
+    # Re-scan with position awareness
+    file_events = {}
+    for pos, obj in enumerate(kept_objs):
+        for block in get_content_blocks(obj):
+            if block.get("type") == "tool_use":
+                name = block.get("name", "")
+                inp = block.get("input", {})
+                if not isinstance(inp, dict):
+                    continue
+                fp = inp.get("file_path", "")
+                if not fp:
+                    continue
+                if name in ("Read", "read"):
+                    file_events.setdefault(fp, []).append(
+                        (pos, "read", block.get("id", ""))
+                    )
+                elif name in ("Edit", "edit", "Write", "write"):
+                    file_events.setdefault(fp, []).append((pos, "edit", ""))
+
+    # Identify stale read tool_use_ids (reads with NO subsequent edit of that file)
+    stale_read_info = {}  # tool_use_id -> file_path
+    for fp, events in file_events.items():
+        events.sort(key=lambda x: x[0])
+        for i, (pos, etype, tool_id) in enumerate(events):
+            if etype == "read" and tool_id:
+                has_later_edit = any(
+                    events[j][1] == "edit" for j in range(i + 1, len(events))
+                )
+                if not has_later_edit:
+                    stale_read_info[tool_id] = fp
+
+    # Now find tool_result blocks matching stale read tool_use_ids
+    results = {}
+    for pos, obj in enumerate(kept_objs):
+        if get_msg_type(obj) != "user":
+            continue
+        content = obj.get("message", {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_id = block.get("tool_use_id", "")
+            if tool_id in stale_read_info:
+                fp = stale_read_info[tool_id]
+                text = block.get("content", "")
+                if isinstance(text, str):
+                    line_count = text.count("\n") + (
+                        1 if text and not text.endswith("\n") else 0
+                    )
+                else:
+                    line_count = 0
+                results[pos] = f"[Read: {fp} - {line_count} lines, not modified]"
+    return results
+
+
+def detect_superseded_edits(kept_objs):
+    """Return {position: summary} for Edit/Write tool_use blocks superseded by later edits."""
+    # Track (file_path, position) for every Edit/Write tool_use
+    file_edit_positions = {}  # file_path -> [(position, block_index)]
+    for pos, obj in enumerate(kept_objs):
+        for bi, block in enumerate(get_content_blocks(obj)):
+            if block.get("type") == "tool_use":
+                name = block.get("name", "")
+                if name in ("Edit", "edit", "Write", "write"):
+                    inp = block.get("input", {})
+                    if isinstance(inp, dict):
+                        fp = inp.get("file_path", "")
+                        if fp:
+                            file_edit_positions.setdefault(fp, []).append((pos, bi))
+
+    # For each file, all but the LAST edit position are superseded
+    results = {}
+    for fp, edits in file_edit_positions.items():
+        if len(edits) < 2:
+            continue
+        edits.sort(key=lambda x: x[0])
+        for pos, bi in edits[:-1]:
+            results[pos] = f"[Edit: {fp} - superseded by later edit]"
+    return results
+
+
 def fix_orphaned_tool_results(kept_objs):
     use_ids = set()
     for obj in kept_objs:
@@ -1248,6 +1462,77 @@ def reduce_session(
                 obj["parentUuid"] = parent
             new_kept.append(obj)
         kept_objs = new_kept
+
+    # -- Pass 3.5: Semantic elision (safe heuristics) --
+    passing_builds = detect_passing_builds(kept_objs)
+    confirmations = detect_confirmations(kept_objs)
+    stale_read_results = detect_stale_read_results(kept_objs)
+    superseded_edits = detect_superseded_edits(kept_objs)
+
+    total = len(kept_objs)
+    sem_passing = 0
+    sem_confirmations = 0
+    sem_stale_reads = 0
+    sem_superseded = 0
+
+    for pos, obj in enumerate(kept_objs):
+        position = pos / max(total - 1, 1)
+        aggr = aggr_fn(position)
+
+        # Passing builds: elide when aggr > 0.3
+        if pos in passing_builds and aggr > 0.3:
+            msg = obj.get("message", {})
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        block["content"] = passing_builds[pos]
+                        sem_passing += 1
+                        break
+
+        # Confirmations: elide when aggr > 0.2
+        if pos in confirmations and aggr > 0.2:
+            msg = obj.get("message", {})
+            msg["content"] = "[confirmed]"
+            sem_confirmations += 1
+
+        # Stale read results: elide when aggr > 0.5
+        if pos in stale_read_results and aggr > 0.5:
+            msg = obj.get("message", {})
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        tid = block.get("tool_use_id", "")
+                        # Only replace the matching tool_result
+                        if pos in stale_read_results:
+                            block["content"] = stale_read_results[pos]
+                            sem_stale_reads += 1
+                            break
+
+        # Superseded edits: elide when aggr > 0.5
+        if pos in superseded_edits and aggr > 0.5:
+            for block in get_content_blocks(obj):
+                if block.get("type") == "tool_use":
+                    name = block.get("name", "")
+                    if name in ("Edit", "edit", "Write", "write"):
+                        inp = block.get("input", {})
+                        if isinstance(inp, dict):
+                            summary = superseded_edits[pos]
+                            inp.pop("old_string", None)
+                            inp.pop("new_string", None)
+                            inp["_elided"] = summary
+                            sem_superseded += 1
+                            break
+
+    if sem_passing:
+        stats["passing_builds_collapsed"] = sem_passing
+    if sem_confirmations:
+        stats["confirmations_removed"] = sem_confirmations
+    if sem_stale_reads:
+        stats["stale_reads_promoted"] = sem_stale_reads
+    if sem_superseded:
+        stats["superseded_edits_summarized"] = sem_superseded
 
     total = len(kept_objs)
 

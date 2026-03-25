@@ -515,14 +515,32 @@ class ReduceModal(ModalScreen[bool]):
                 "chars_dropped_stochastic",
                 "chars_saved_structural",
             }
-            msg_stats = {k: v for k, v in r.stats.items() if k not in structural_keys}
+            semantic_keys = {
+                "passing_builds_collapsed",
+                "confirmations_removed",
+                "stale_reads_promoted",
+                "superseded_edits_summarized",
+            }
+            excluded = structural_keys | semantic_keys
+            msg_stats = {k: v for k, v in r.stats.items() if k not in excluded}
             struct_stats = {
                 k: v for k, v in r.stats.items() if k in structural_keys and v > 0
+            }
+            sem_stats = {
+                k: v for k, v in r.stats.items() if k in semantic_keys and v > 0
             }
 
             if msg_stats:
                 strat_text.append("\n  Message reduction:\n", style="bold dim")
                 for name, count in sorted(msg_stats.items(), key=lambda x: -x[1]):
+                    label = name.replace("_", " ")
+                    strat_text.append(f"    {label:<33s} {count:>6,}\n")
+
+            if sem_stats:
+                strat_text.append(
+                    "\n  Semantic elision (exchange-level):\n", style="bold dim"
+                )
+                for name, count in sorted(sem_stats.items(), key=lambda x: -x[1]):
                     label = name.replace("_", " ")
                     strat_text.append(f"    {label:<33s} {count:>6,}\n")
 
