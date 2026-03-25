@@ -1,12 +1,21 @@
 [project]
 name = "reduce-session"
-version = "0.2.0"
+version = "0.3.0"
 description = "Reduce Claude Code session JSONL files while preserving conversation quality"
 requires-python = ">=3.10"
-dependencies = ["textual>=1.0"]
+dependencies = ["textual>=1.0", "huggingface-hub>=0.20"]
 
 [project.scripts]
 reduce-session = "reduce_session.cli:main"
+
+[project.optional-dependencies]
+local-macos = ["mlx-lm>=0.10"]
+local = ["llama-cpp-python>=0.2"]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.0"]
+google = ["google-genai>=1.0"]
+all-local = ["mlx-lm>=0.10", "llama-cpp-python>=0.2"]
+all-api = ["anthropic>=0.40", "openai>=1.0", "google-genai>=1.0"]
 
 [build-system]
 requires = ["hatchling"]

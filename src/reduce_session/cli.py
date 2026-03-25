@@ -91,6 +91,14 @@ def parse_args():
         default=CHARS_PER_TOKEN,
         help=f"Chars/token ratio for estimates (default: {CHARS_PER_TOKEN})",
     )
+    p.add_argument(
+        "--llm",
+        type=str,
+        default=None,
+        help="LLM provider for semantic compression. "
+        "Examples: local, ollama:qwen3:4b, anthropic:haiku, openai:gpt-4o-mini, gemini:flash. "
+        "Env: REDUCE_SESSION_LLM",
+    )
     return p.parse_args()
 
 
@@ -189,13 +197,25 @@ def _print_history(result):
 def main():
     args = parse_args()
 
+    # Resolve LLM provider (optional)
+    llm_spec = args.llm or os.environ.get("REDUCE_SESSION_LLM")
+    llm_provider = None
+    if llm_spec:
+        try:
+            from reduce_session.llm import create_provider
+
+            llm_provider = create_provider(llm_spec)
+        except Exception as e:
+            print(f"Warning: LLM provider failed: {e}", file=sys.stderr)
+            print("Falling back to heuristic-only mode.", file=sys.stderr)
+
     # Launch TUI if --browse or no positional arg (and no action flags)
     if args.browse or (
         args.input is None and not any([args.restore, args.history, args.init])
     ):
         from .tui import SessionBrowserApp
 
-        app = SessionBrowserApp()
+        app = SessionBrowserApp(llm_spec=llm_spec)
         app.run()
         return
 
@@ -239,6 +259,7 @@ def main():
         fade=args.fade,
         chars_per_token=args.chars_per_token,
         estimate_tokens=args.tokens,
+        llm_provider=llm_provider,
     )
 
     if not args.dry_run:

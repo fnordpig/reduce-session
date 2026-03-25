@@ -62,9 +62,12 @@ class SessionBrowserApp(App):
         Binding("k", "cursor_up", show=False),
     ]
 
-    def __init__(self, projects_dir: Path | None = None) -> None:
+    def __init__(
+        self, projects_dir: Path | None = None, llm_spec: str | None = None
+    ) -> None:
         super().__init__()
         self.projects_dir = projects_dir or get_projects_dir()
+        self.llm_spec = llm_spec
         self._node_to_session: dict[int, SessionInfo] = {}
         self._sessions: list[SessionInfo] = []
 
@@ -182,7 +185,9 @@ class SessionBrowserApp(App):
         """Open reduce modal for the highlighted session."""
         if self.selected_session:
             self.push_screen(
-                ReduceModal(self.selected_session, read_only=False),
+                ReduceModal(
+                    self.selected_session, read_only=False, llm_spec=self.llm_spec
+                ),
                 callback=self._on_modal_dismiss,
             )
         else:

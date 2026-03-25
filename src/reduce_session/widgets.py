@@ -336,10 +336,13 @@ class ReduceModal(ModalScreen[bool]):
         ("enter", "apply", "Apply"),
     ]
 
-    def __init__(self, session: SessionInfo, read_only: bool = False) -> None:
+    def __init__(
+        self, session: SessionInfo, read_only: bool = False, llm_spec: str | None = None
+    ) -> None:
         super().__init__()
         self.session = session
         self.read_only = read_only
+        self.llm_spec = llm_spec
         self.current_profile = "standard"
         self.result: ReductionResult | None = None
         self.source_mtime: float | None = None
@@ -404,9 +407,21 @@ class ReduceModal(ModalScreen[bool]):
         except OSError:
             self.source_mtime = None
 
+        # Create LLM provider if spec given
+        llm_provider = None
+        if self.llm_spec:
+            try:
+                from reduce_session.llm import create_provider
+
+                llm_provider = create_provider(self.llm_spec)
+            except Exception:
+                pass  # graceful degradation
+
         # Run reduction in a thread (CPU-bound work)
         self._current_worker = self.run_worker(
-            lambda: reduce_session(path, profile=profile, estimate_tokens=True),
+            lambda: reduce_session(
+                path, profile=profile, estimate_tokens=True, llm_provider=llm_provider
+            ),
             thread=True,
             exclusive=True,
         )
@@ -521,7 +536,16 @@ class ReduceModal(ModalScreen[bool]):
                 "stale_reads_promoted",
                 "superseded_edits_summarized",
             }
-            excluded = structural_keys | semantic_keys
+            llm_keys = {
+                "llm_classified",
+                "llm_classified_keep",
+                "llm_classified_distill",
+                "llm_classified_heuristic",
+                "llm_distilled",
+                "llm_scaffold_stripped",
+                "llm_chars_saved",
+            }
+            excluded = structural_keys | semantic_keys | llm_keys
             msg_stats = {k: v for k, v in r.stats.items() if k not in excluded}
             struct_stats = {
                 k: v for k, v in r.stats.items() if k in structural_keys and v > 0
@@ -543,6 +567,40 @@ class ReduceModal(ModalScreen[bool]):
                 for name, count in sorted(sem_stats.items(), key=lambda x: -x[1]):
                     label = name.replace("_", " ")
                     strat_text.append(f"    {label:<33s} {count:>6,}\n")
+
+            llm_stats = {k: v for k, v in r.stats.items() if k in llm_keys and v}
+            if llm_stats:
+                classified = llm_stats.get("llm_classified", 0)
+                keep_n = llm_stats.get("llm_classified_keep", 0)
+                distill_n = llm_stats.get("llm_classified_distill", 0)
+                heur_n = llm_stats.get("llm_classified_heuristic", 0)
+
+                strat_text.append("\n  LLM Compression:\n", style="bold dim")
+                if classified:
+                    strat_text.append(f"    classified {classified:>14,} exchanges\n")
+                    strat_text.append(
+                        f"      → KEEP       {keep_n:>10,} ({keep_n * 100 // max(classified, 1)}%)\n",
+                        style="#00d4aa",
+                    )
+                    strat_text.append(
+                        f"      → DISTILL    {distill_n:>10,} ({distill_n * 100 // max(classified, 1)}%)\n",
+                        style="#ff8c00",
+                    )
+                    strat_text.append(
+                        f"      → HEURISTIC  {heur_n:>10,} ({heur_n * 100 // max(classified, 1)}%)\n",
+                        style="#ffd700",
+                    )
+
+                distilled = llm_stats.get("llm_distilled", 0)
+                stripped = llm_stats.get("llm_scaffold_stripped", 0)
+                llm_chars_saved = llm_stats.get("llm_chars_saved", 0)
+                if distilled:
+                    strat_text.append(f"    distilled          {distilled:>6,}\n")
+                if stripped:
+                    strat_text.append(f"    scaffold stripped   {stripped:>6,}\n")
+                if llm_chars_saved:
+                    strat_text.append(f"    chars saved      ", style="dim")
+                    strat_text.append(f"{llm_chars_saved:>8,}\n", style="#00d4aa bold")
 
             if struct_stats:
                 strat_text.append(
