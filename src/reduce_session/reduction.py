@@ -1340,6 +1340,166 @@ def _density_from_objs(objs: list, buckets: int = 40) -> list[int]:
     return profile
 
 
+# --- LLM compression helpers ---
+
+
+def _extract_exchange_text(obj):
+    """Extract {"role", "text", "tool_name"} dict from a JSONL message object."""
+    msg = obj.get("message", {})
+    role = msg.get("role", obj.get("type", "unknown"))
+    content = msg.get("content", "")
+    tool_name = None
+    text_parts = []
+
+    if isinstance(content, str):
+        text_parts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type", "")
+            if bt == "text":
+                text_parts.append(block.get("text", ""))
+            elif bt == "tool_use":
+                tool_name = block.get("name")
+                text_parts.append(f"[{block.get('name', 'tool')}]")
+            elif bt == "tool_result":
+                inner = block.get("content", "")
+                if isinstance(inner, str):
+                    text_parts.append(inner[:200])
+
+    return {"role": role, "text": "\n".join(text_parts), "tool_name": tool_name}
+
+
+def _extract_assistant_text(obj):
+    """Extract concatenated text from assistant message blocks."""
+    if get_msg_type(obj) != "assistant":
+        return ""
+    blocks = get_content_blocks(obj)
+    parts = []
+    for b in blocks:
+        if b.get("type") == "text":
+            parts.append(b.get("text", ""))
+    return "\n".join(parts)
+
+
+def _replace_assistant_text(obj, new_text):
+    """Replace all text blocks in an assistant message with new_text."""
+    msg = obj.get("message", {})
+    content = msg.get("content")
+    if isinstance(content, list):
+        replaced = False
+        new_content = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                if not replaced:
+                    block["text"] = new_text
+                    new_content.append(block)
+                    replaced = True
+            else:
+                new_content.append(block)
+        msg["content"] = new_content
+
+
+def _batched(iterable, n):
+    """Yield successive n-sized chunks."""
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) == n:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+async def _llm_compression_pass(kept_objs, aggr_fn, provider):
+    """Pass 3.6 + 3.7: LLM classification, distillation, and scaffold stripping."""
+    import asyncio
+    from collections import Counter
+    from reduce_session.llm.base import ROUTING_MAP, Route
+
+    stats = {}
+    total = len(kept_objs)
+
+    # Identify middle-zone exchanges (aggr > 0.2)
+    middle = []
+    for pos, obj in enumerate(kept_objs):
+        position = pos / max(total - 1, 1)
+        aggr = aggr_fn(position)
+        if aggr > 0.2:
+            middle.append((pos, obj, aggr))
+
+    if not middle:
+        return stats
+
+    # Phase 1: Batched classification with async distillation overlap
+    classifications = {}  # pos -> Category
+    distill_queue = asyncio.Queue()
+
+    async def classify_worker():
+        for batch in _batched(middle, 20):
+            exchange_texts = [_extract_exchange_text(obj) for _, obj, _ in batch]
+            categories = await provider.classify(exchange_texts)
+            for (pos, obj, aggr), cat in zip(batch, categories):
+                classifications[pos] = cat
+                route = ROUTING_MAP.get(cat, Route.HEURISTIC)
+                if route == Route.DISTILL:
+                    await distill_queue.put((pos, obj))
+        await distill_queue.put(None)  # sentinel
+
+    async def distill_worker():
+        distill_count = 0
+        chars_saved = 0
+        while True:
+            item = await distill_queue.get()
+            if item is None:
+                break
+            pos, obj = item
+            text = _extract_assistant_text(obj)
+            if text and len(text) > 50:
+                original_len = len(text)
+                summary = await provider.distill(text, mode="summarize")
+                if summary and len(summary) < original_len:
+                    _replace_assistant_text(kept_objs[pos], summary)
+                    distill_count += 1
+                    chars_saved += original_len - len(summary)
+        return distill_count, chars_saved
+
+    # Run classification and distillation concurrently
+    _, (distill_count, distill_chars) = await asyncio.gather(
+        classify_worker(), distill_worker()
+    )
+
+    # Phase 2: Scaffolding strip on ALL assistant text in middle zone
+    strip_count = 0
+    strip_chars_saved = 0
+    for pos, obj, aggr in middle:
+        text = _extract_assistant_text(obj)
+        if text and len(text) > 50:
+            original_len = len(text)
+            stripped = await provider.distill(text, mode="strip_scaffold")
+            if stripped and len(stripped) < original_len:
+                _replace_assistant_text(kept_objs[pos], stripped)
+                strip_count += 1
+                strip_chars_saved += original_len - len(stripped)
+
+    # Build stats
+    route_counts = Counter(
+        ROUTING_MAP.get(c, Route.HEURISTIC) for c in classifications.values()
+    )
+
+    stats["llm_classified"] = len(classifications)
+    stats["llm_classified_keep"] = route_counts.get(Route.KEEP, 0)
+    stats["llm_classified_distill"] = route_counts.get(Route.DISTILL, 0)
+    stats["llm_classified_heuristic"] = route_counts.get(Route.HEURISTIC, 0)
+    stats["llm_distilled"] = distill_count
+    stats["llm_scaffold_stripped"] = strip_count
+    stats["llm_chars_saved"] = distill_chars + strip_chars_saved
+
+    return stats
+
+
 def reduce_session(
     path: str,
     profile: str = "standard",
@@ -1347,6 +1507,7 @@ def reduce_session(
     fade: int = 75,
     chars_per_token: float = CHARS_PER_TOKEN,
     estimate_tokens: bool = False,
+    llm_provider: object | None = None,
 ) -> ReductionResult:
     """Run the full reduction pipeline on a session JSONL file.
 
@@ -1533,6 +1694,13 @@ def reduce_session(
         stats["stale_reads_promoted"] = sem_stale_reads
     if sem_superseded:
         stats["superseded_edits_summarized"] = sem_superseded
+
+    # -- Pass 3.6 + 3.7: LLM compression (optional) --
+    if llm_provider is not None:
+        import asyncio
+
+        llm_stats = asyncio.run(_llm_compression_pass(kept_objs, aggr_fn, llm_provider))
+        stats.update(llm_stats)
 
     total = len(kept_objs)
 
