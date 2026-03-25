@@ -335,10 +335,10 @@ def _count_lines(path: Path) -> int:
 def compute_density_profile(
     path: Path, buckets: int = 40, tail_bytes: int = 200 * 1024
 ) -> list[int]:
-    """Compute content chars per positional bucket from session tail.
+    """Compute content chars per positional bucket from session file.
 
-    Returns a list of `buckets` integers, each representing chars in that
-    fraction of the file. Used for heatmap sparklines.
+    Adaptively expands the read window (like parse_tail) to find content
+    through progress noise. Returns a list of `buckets` integers.
     """
     profile = [0] * buckets
 
@@ -350,19 +350,35 @@ def compute_density_profile(
     if file_size == 0:
         return profile
 
-    seeked = False
-    try:
-        with open(path, "r", errors="replace") as f:
-            if file_size > tail_bytes:
-                f.seek(file_size - tail_bytes)
-                seeked = True
-            raw_lines = f.readlines()
-    except (OSError, PermissionError):
-        return profile
+    # Adaptive: expand window until we find content lines
+    raw_lines = []
+    for try_bytes in [tail_bytes, 500 * 1024, file_size]:
+        read_bytes = min(try_bytes, file_size)
+        seeked = False
+        try:
+            with open(path, "r", errors="replace") as f:
+                if file_size > read_bytes:
+                    f.seek(file_size - read_bytes)
+                    seeked = True
+                raw_lines = f.readlines()
+        except (OSError, PermissionError):
+            return profile
 
-    # Skip truncated first line if we seeked into the middle
-    if seeked and raw_lines:
-        raw_lines = raw_lines[1:]
+        if seeked and raw_lines:
+            raw_lines = raw_lines[1:]
+
+        # Check if we found any content (not just noise)
+        has_content = False
+        for raw in raw_lines:
+            try:
+                record = json.loads(raw.strip())
+                if record.get("type") in ("user", "assistant"):
+                    has_content = True
+                    break
+            except (json.JSONDecodeError, ValueError):
+                continue
+        if has_content or read_bytes >= file_size:
+            break
 
     # Filter out noise lines and collect content chars per line
     content_lines: list[int] = []
