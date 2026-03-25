@@ -348,6 +348,7 @@ class ReduceModal(ModalScreen[bool]):
         self.source_mtime: float | None = None
         self._current_worker: Worker | None = None
         self._llm_worker: Worker | None = None
+        self._llm_savings_history: list[int] = []  # chars_saved at each progress tick
 
     def compose(self) -> ComposeResult:
         title_suffix = " (dry-run)" if self.read_only else ""
@@ -460,6 +461,7 @@ class ReduceModal(ModalScreen[bool]):
 
     def _run_llm_pass(self) -> None:
         """Run LLM compression on already-reduced content, with live progress."""
+        self._llm_savings_history = []  # reset sparkline history
         path = str(self.session.path)
 
         def progress_fn(data):
@@ -506,35 +508,75 @@ class ReduceModal(ModalScreen[bool]):
         self._llm_worker = self.run_worker(do_llm_work, thread=True)
 
     def _update_llm_progress(self, data: dict) -> None:
-        """Update the LLM progress display (called from main thread via call_from_thread)."""
+        """Update the LLM progress display with a live savings sparkline."""
         phase = data.get("phase", "")
         current = data.get("current", 0)
         total = data.get("total", 1)
         chars_saved = data.get("chars_saved", 0)
 
+        # Track savings over time for sparkline
+        self._llm_savings_history.append(chars_saved)
+
         pct = current * 100 // max(total, 1)
-
-        # Build progress bar
-        bar_width = 30
-        filled = bar_width * current // max(total, 1)
-        bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
-
         phase_labels = {
-            "classify": "Classifying exchanges",
+            "classify": "Classifying",
             "distill": "Distilling",
-            "scaffold": "Stripping scaffolding",
+            "scaffold": "De-scaffolding",
         }
         label = phase_labels.get(phase, phase)
 
         text = Text()
-        text.append(f"{label}:\n", style="bold")
-        text.append(bar, style="#00d4aa" if pct > 50 else "#ffd700")
-        text.append(f" {current}/{total} ({pct}%)\n")
+
+        # Line 1: phase + progress fraction
+        text.append(f"{label} ", style="bold")
+        text.append(f"{current}/{total} ({pct}%)\n")
+
+        # Line 2: savings sparkline — fills in left-to-right as LLM works
+        spark_width = 35
+        history = self._llm_savings_history
+        max_saved = max(history) if history else 1
+
+        spark_chars = " \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+        # Resample history to spark_width buckets
+        if len(history) <= spark_width:
+            values = history + [0] * (spark_width - len(history))
+        else:
+            # Downsample: take evenly spaced samples
+            step = len(history) / spark_width
+            values = [
+                history[min(int(i * step), len(history) - 1)]
+                for i in range(spark_width)
+            ]
+
+        for i, v in enumerate(values):
+            if i >= len(history):
+                # Future: not yet processed
+                text.append("\u2591", style="dim")
+            else:
+                idx = min(
+                    int(v / max(max_saved, 1) * (len(spark_chars) - 1)),
+                    len(spark_chars) - 1,
+                )
+                char = spark_chars[idx]
+                # Color by savings intensity
+                frac = v / max(max_saved, 1)
+                if frac < 0.25:
+                    color = "#555555"
+                elif frac < 0.5:
+                    color = "#ffd700"
+                elif frac < 0.75:
+                    color = "#ff8c00"
+                else:
+                    color = "#00d4aa"
+                text.append(char, style=Style(color=color))
+        text.append("\n")
+
+        # Line 3: saved chars + ratio
         if chars_saved:
             ratio = data.get("ratio", 0)
-            text.append(f"saved: {chars_saved:,} chars", style="#00d4aa")
+            text.append(f"saved: {chars_saved:,} chars", style="#00d4aa bold")
             if ratio:
-                text.append(f" ({ratio}% compression)", style="dim")
+                text.append(f" ({ratio}%)", style="dim")
 
         self.query_one("#llm-progress", Static).update(text)
 
