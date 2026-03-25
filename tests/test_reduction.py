@@ -208,3 +208,35 @@ def test_minify_code_handles_block_comments():
     result = minify_code(text)
     assert "block" not in result
     assert "let x = 5" in result
+
+
+def test_strip_non_ascii():
+    from reduce_session.reduction import _strip_non_ascii
+
+    text = "fn main() → Result ── Error │ path"
+    result = _strip_non_ascii(text)
+    assert "→" not in result
+    assert "->" in result
+    assert "──" not in result
+    assert "--" in result
+    assert "│" not in result
+    assert "|" in result
+    # All chars should be 7-bit
+    assert all(ord(c) < 128 for c in result)
+
+
+def test_strip_non_ascii_smart_quotes():
+    from reduce_session.reduction import _strip_non_ascii
+
+    text = "\u201cHello\u201d and \u2018world\u2019"
+    result = _strip_non_ascii(text)
+    assert '"Hello"' in result
+    assert "'world'" in result
+
+
+def test_structural_compress_strips_non_ascii():
+    from reduce_session.reduction import structural_compress
+
+    text = "error: can\u2019t find \u2192 path ── section"
+    result = structural_compress(text, aggr=0.5)
+    assert all(ord(c) < 128 for c in result)

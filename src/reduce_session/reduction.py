@@ -410,6 +410,7 @@ def _reset_structural_stats():
         "indentation_collapsed": 0,
         "code_minified": 0,
         "blank_lines_collapsed": 0,
+        "non_ascii_stripped": 0,
         "chars_dropped_stochastic": 0,
         "chars_saved_structural": 0,
     }
@@ -517,6 +518,51 @@ def minify_code(text: str) -> str:
     return "\n".join(out)
 
 
+# Unicode → ASCII replacement map for non-7bit stripping
+_UNICODE_TO_ASCII = str.maketrans(
+    {
+        "\u2192": "->",  # →
+        "\u2190": "<-",  # ←
+        "\u2194": "<->",  # ↔
+        "\u2014": "--",  # —
+        "\u2013": "-",  # –
+        "\u2018": "'",  # '
+        "\u2019": "'",  # '
+        "\u201c": '"',  # "
+        "\u201d": '"',  # "
+        "\u2026": "...",  # …
+        "\u00d7": "x",  # ×
+        "\u00b5": "u",  # µ
+        "\u2248": "~",  # ≈
+        "\u2713": "+",  # ✓
+        "\u2714": "+",  # ✔
+        "\u2705": "+",  # ✅
+        "\u274c": "x",  # ❌
+        "\u26a0": "!",  # ⚠
+        "\u21bb": "R",  # ↻
+        # Box drawing → ASCII
+        "\u2500": "-",  # ─
+        "\u2501": "=",  # ━
+        "\u2502": "|",  # │
+        "\u251c": "|-",  # ├
+        "\u2514": "+-",  # └
+        "\u2588": "#",  # █
+        "\u2591": ".",  # ░
+        "\u2593": "#",  # ▓
+        "\u2587": "#",  # ▇
+        "\u2585": "#",  # ▅
+    }
+)
+
+
+def _strip_non_ascii(text: str) -> str:
+    """Replace non-7bit characters with ASCII equivalents, drop the rest."""
+    # First pass: known replacements
+    text = text.translate(_UNICODE_TO_ASCII)
+    # Second pass: drop any remaining non-ASCII chars
+    return text.encode("ascii", errors="ignore").decode("ascii")
+
+
 def structural_compress(text: str, aggr: float) -> str:
     """Apply structural compression techniques to text based on aggressiveness.
 
@@ -581,7 +627,19 @@ def structural_compress(text: str, aggr: float) -> str:
         _structural_stats["blank_lines_collapsed"] += text.count("\n\n\n")
         text = new_text
 
-    # 6. Stochastic character drop (vowel-first, for high aggr in middle zone)
+    # 6. Strip non-7bit characters to ASCII equivalents
+    if aggr > 0.3:
+        new_text = _strip_non_ascii(text)
+        if new_text != text:
+            # Count non-ASCII chars replaced (not delta, since replacements
+            # may be longer: → becomes ->)
+            non_ascii_count = sum(1 for c in text if ord(c) > 127)
+            _structural_stats["non_ascii_stripped"] = (
+                _structural_stats.get("non_ascii_stripped", 0) + non_ascii_count
+            )
+            text = new_text
+
+    # 7. Stochastic character drop (vowel-first, for high aggr in middle zone)
     text = stochastic_char_drop(text, aggr, threshold=thresholds["chardrop"])
 
     saved = orig_len - len(text)

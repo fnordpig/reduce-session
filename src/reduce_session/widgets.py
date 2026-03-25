@@ -511,6 +511,7 @@ class ReduceModal(ModalScreen[bool]):
                 "indentation_collapsed",
                 "code_minified",
                 "blank_lines_collapsed",
+                "non_ascii_stripped",
                 "chars_dropped_stochastic",
                 "chars_saved_structural",
             }
