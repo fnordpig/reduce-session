@@ -5,17 +5,16 @@ Usage: reduce-session [options] <path-to-session.jsonl>
 
 Options:
   --tokens           Print context-window token estimate by category
-  --cut PCT          End of fully-aggressive zone (default: 50)
-  --fade PCT         Start of fully-gentle zone (default: 75)
+  --cut PCT          Start of gentle-to-aggressive ramp (default: 10)
+  --fade PCT         Start of aggressive-to-gentle ramp (default: 75)
   --profile NAME     Preset: gentle, standard (default), aggressive
   --dry-run          Analyze only, don't write output
   --apply            Replace original with reduced (backs up to .bak first)
   --restore          Restore from most recent .bak file
   --chars-per-token  Override chars/token ratio (default: 3.7)
 
-The gradient applies aggressive reduction to messages in [0, cut%],
-tapers linearly from aggressive to gentle in [cut%, fade%],
-and applies gentle/no reduction in [fade%, 100%].
+Uses a U-curve gradient matching the "Lost in the Middle" LLM attention pattern:
+gentle at start and end (high recall zones), aggressive in the middle.
 """
 
 import argparse
@@ -48,8 +47,8 @@ def parse_args():
     p.add_argument(
         "--cut",
         type=int,
-        default=50,
-        help="End of fully-aggressive zone, as %% of conversation (default: 50)",
+        default=10,
+        help="Start of gentle-to-aggressive ramp, as %% of conversation (default: 10)",
     )
     p.add_argument(
         "--fade",

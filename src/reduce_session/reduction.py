@@ -7,7 +7,9 @@ which reads a file and returns a ReductionResult with no side effects.
 
 import hashlib
 import json
+import os
 import re
+import zlib
 from dataclasses import dataclass, field
 
 # --- Limit profiles ---
@@ -148,19 +150,42 @@ CHARS_PER_TOKEN = 3.7
 # --- Gradient functions ---
 
 
-def make_aggressiveness_fn(cut_pct, fade_pct):
-    """Return a function mapping position [0,1] to aggressiveness [0,1]."""
-    cut = cut_pct / 100.0
-    fade = fade_pct / 100.0
-    span = fade - cut if fade > cut else 0.01
+def make_aggressiveness_fn(cut_pct=10, fade_pct=75):
+    """Return a function mapping position [0,1] to aggressiveness [0,1].
+
+    Uses a U-curve: gentle at start and end (high LLM recall zones),
+    aggressive in the middle (low recall zone).
+
+    Zones with default cut=10, fade=75:
+      [0.00, 0.10]  gentle (0.2)       — start of conversation, high recall
+      [0.10, 0.325] ramp up 0.2 → 1.0  — transition to dead zone
+      [0.325, 0.425] plateau (1.0)      — middle dead zone, compress hard
+      [0.425, 0.75] ramp down 1.0 → 0.2 — transition to recent context
+      [0.75, 1.00]  gentle (0.2)        — recent context, high recall
+    """
+    cut = cut_pct / 100.0  # end of start gentle zone
+    fade = fade_pct / 100.0  # start of end gentle zone
+    mid = (cut + fade) / 2.0  # midpoint of compressible zone
+    # Plateau spans the middle third of [cut, fade]
+    span = fade - cut
+    ramp_up_end = cut + span / 3.0
+    ramp_down_start = fade - span / 3.0
 
     def fn(position):
         if position < cut:
-            return 1.0
+            return 0.2  # preserve start
+        elif position < ramp_up_end:
+            # Ramp from 0.2 to 1.0
+            t = (position - cut) / (ramp_up_end - cut)
+            return 0.2 + 0.8 * t
+        elif position < ramp_down_start:
+            return 1.0  # middle dead zone
         elif position < fade:
-            return 1.0 - (position - cut) / span
+            # Ramp from 1.0 to 0.2
+            t = (position - ramp_down_start) / (fade - ramp_down_start)
+            return 1.0 - 0.8 * t
         else:
-            return 0.0
+            return 0.2  # preserve end
 
     return fn
 
@@ -354,6 +379,77 @@ def trim_string(obj, key, limit, label):
     val = obj.get(key)
     if isinstance(val, str) and len(val) > limit:
         obj[key] = truncate(val, limit, label)
+
+
+# --- Structural compression ---
+
+_HOME_PREFIX_RE = None
+
+
+def _get_home_prefix_re():
+    """Build and cache a regex to match home-dir project paths."""
+    global _HOME_PREFIX_RE
+    if _HOME_PREFIX_RE is None:
+        home = os.path.expanduser("~")
+        # Match /Users/<user>/src/mine/<project>/ -> ~/<project>/
+        escaped = re.escape(home + "/src/mine/")
+        _HOME_PREFIX_RE = re.compile(escaped + r"([^/]+)/")
+    return _HOME_PREFIX_RE
+
+
+def structural_compress(text: str, aggr: float) -> str:
+    """Apply structural compression techniques to text based on aggressiveness.
+
+    1. Path shortening (aggr > 0.3): ~/src/mine/<project>/ -> ~/<project>/
+    2. Line number prefix stripping (aggr > 0.5): strip Read tool line prefixes
+    3. Indentation collapse (aggr > 0.7): 4-space -> 2-space
+    4. Blank line collapse (always): 3+ consecutive newlines -> 2
+    """
+    if not isinstance(text, str) or not text:
+        return text
+
+    # 1. Path shortening
+    if aggr > 0.3:
+        pat = _get_home_prefix_re()
+        text = pat.sub(r"~/\1/", text)
+
+    # 2. Line number prefix stripping (patterns like "    42→" or "   123│")
+    if aggr > 0.5:
+        text = re.sub(r"^ *\d+[→│]\s?", "", text, flags=re.MULTILINE)
+
+    # 3. Indentation collapse: 4-space -> 2-space
+    if aggr > 0.7:
+        lines = text.split("\n")
+        collapsed = []
+        for line in lines:
+            # Count leading spaces
+            stripped = line.lstrip(" ")
+            n_spaces = len(line) - len(stripped)
+            if n_spaces >= 4:
+                # Convert 4-space units to 2-space units
+                new_spaces = (n_spaces // 4) * 2 + (n_spaces % 4)
+                line = " " * new_spaces + stripped
+            collapsed.append(line)
+        text = "\n".join(collapsed)
+
+    # 4. Blank line collapse: 3+ consecutive newlines -> 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text
+
+
+def entropy_ratio(text: str) -> float:
+    """Compute redundancy ratio as a proxy for repetitiveness.
+
+    Returns 1.0 - (compressed_size / original_size).
+    High ratio = repetitive content (compresses well, low info).
+    Low ratio = unique content (doesn't compress, high info).
+    """
+    if not text:
+        return 0.0
+    encoded = text.encode("utf-8")
+    compressed = zlib.compress(encoded)
+    return 1.0 - len(compressed) / len(encoded)
 
 
 def strip_shell_banners(text):
@@ -619,6 +715,18 @@ def fix_orphaned_tool_results(kept_objs):
 # --- Position-aware trimming ---
 
 
+def _entropy_modulated_limit(text: str, limit: int) -> int:
+    """Adjust truncation limit based on text entropy (information density)."""
+    if not text or len(text) < 200:
+        return limit
+    ratio = entropy_ratio(text)
+    if ratio < 0.3:
+        return int(limit * 1.5)  # high info: more generous
+    elif ratio > 0.5:
+        return int(limit * 0.5)  # repetitive: more aggressive
+    return limit
+
+
 def trim_tool_result(block, tool_name, aggr, agg_lim, gen_lim):
     inner = block.get("content")
     key = (
@@ -631,6 +739,8 @@ def trim_tool_result(block, tool_name, aggr, agg_lim, gen_lim):
         if tool_name == "Bash":
             inner = clean_bash_text(inner)
         inner = dedup_system_reminders(inner)
+        inner = structural_compress(inner, aggr)
+        limit = _entropy_modulated_limit(inner, limit)
         block["content"] = truncate(inner, limit, tool_name)
     elif isinstance(inner, list):
         for item in inner:
@@ -639,7 +749,9 @@ def trim_tool_result(block, tool_name, aggr, agg_lim, gen_lim):
                 if tool_name == "Bash":
                     text = clean_bash_text(text)
                 text = dedup_system_reminders(text)
-                item["text"] = truncate(text, limit, tool_name)
+                text = structural_compress(text, aggr)
+                item_limit = _entropy_modulated_limit(text, limit)
+                item["text"] = truncate(text, item_limit, tool_name)
 
 
 def trim_toolUseResult(tur, aggr, agg_lim, gen_lim):
@@ -649,7 +761,10 @@ def trim_toolUseResult(tur, aggr, agg_lim, gen_lim):
     trim_string(tur, "originalFile", bl("tur.originalFile"), "tur.originalFile")
     if isinstance(tur.get("stdout"), str):
         tur["stdout"] = clean_bash_text(tur["stdout"])
+        tur["stdout"] = structural_compress(tur["stdout"], aggr)
         trim_string(tur, "stdout", bl("tur.stdout"), "tur.stdout")
+    if isinstance(tur.get("content"), str):
+        tur["content"] = structural_compress(tur["content"], aggr)
     trim_string(tur, "content", bl("tur.content"), "tur.content")
     trim_string(tur, "oldString", bl("tur.oldString"), "tur.oldString")
     trim_string(tur, "newString", bl("tur.newString"), "tur.newString")
@@ -692,7 +807,7 @@ class ReductionResult:
 def reduce_session(
     path: str,
     profile: str = "standard",
-    cut: int = 50,
+    cut: int = 10,
     fade: int = 75,
     chars_per_token: float = CHARS_PER_TOKEN,
     estimate_tokens: bool = False,
@@ -830,10 +945,14 @@ def reduce_session(
             content = msg.get("content")
 
             if isinstance(content, str):
+                content = structural_compress(content, aggr)
                 user_limit = bl("user_text", aggr)
+                user_limit = _entropy_modulated_limit(content, user_limit)
                 if len(content) > user_limit:
                     msg["content"] = truncate(content, user_limit, "user_prompt")
                     count("user_prompt_trimmed")
+                else:
+                    msg["content"] = content
 
             if isinstance(content, list):
                 user_limit = bl("user_text", aggr)
@@ -844,9 +963,14 @@ def reduce_session(
 
                     if bt == "text":
                         text = block.get("text", "")
-                        if isinstance(text, str) and len(text) > user_limit:
-                            block["text"] = truncate(text, user_limit, "user_text")
-                            count("user_prompt_trimmed")
+                        if isinstance(text, str):
+                            text = structural_compress(text, aggr)
+                            ul = _entropy_modulated_limit(text, user_limit)
+                            if len(text) > ul:
+                                block["text"] = truncate(text, ul, "user_text")
+                                count("user_prompt_trimmed")
+                            else:
+                                block["text"] = text
 
                     elif bt == "tool_result":
                         tool_id = block.get("tool_use_id", "")
@@ -926,6 +1050,10 @@ def reduce_session(
                         inp = block.get("input", {})
                         name = block.get("name", "")
                         if isinstance(inp, dict):
+                            # Apply structural compression to string inputs
+                            for inp_key, inp_val in inp.items():
+                                if isinstance(inp_val, str):
+                                    inp[inp_key] = structural_compress(inp_val, aggr)
                             if name == "Write":
                                 trim_string(
                                     inp,

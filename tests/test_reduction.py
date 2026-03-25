@@ -48,3 +48,61 @@ def test_reduce_session_profiles(sample_session):
     gentle = reduce_session(str(sample_session), profile="gentle")
     aggressive = reduce_session(str(sample_session), profile="aggressive")
     assert aggressive.new_size <= gentle.new_size
+
+
+def test_ucurve_gradient():
+    from reduce_session.reduction import make_aggressiveness_fn
+
+    fn = make_aggressiveness_fn(10, 75)
+    # Start: gentle
+    assert fn(0.05) < 0.3
+    # Middle: aggressive
+    assert fn(0.5) > 0.8
+    # End: gentle
+    assert fn(0.9) < 0.3
+    # Symmetry-ish: start and end both gentle
+    assert abs(fn(0.05) - fn(0.95)) < 0.2
+
+
+def test_structural_compress_paths():
+    from reduce_session.reduction import structural_compress
+    import os
+
+    home = os.path.expanduser("~")
+    text = f"{home}/src/mine/ripvec/src/main.rs"
+    result = structural_compress(text, aggr=0.5)
+    assert "~/ripvec/" in result
+    assert home not in result
+
+
+def test_structural_compress_line_numbers():
+    from reduce_session.reduction import structural_compress
+
+    text = '     1\u2192fn main() {\n     2\u2192    println!("hello");\n     3\u2192}'
+    result = structural_compress(text, aggr=0.8)
+    assert "\u2192" not in result
+
+
+def test_structural_compress_indentation():
+    from reduce_session.reduction import structural_compress
+
+    text = '    fn main() {\n        println!("hello");\n    }'
+    result = structural_compress(text, aggr=0.9)
+    assert "  fn main()" in result  # 2-space
+    assert "    fn main()" not in result  # no 4-space
+
+
+def test_blank_line_collapse():
+    from reduce_session.reduction import structural_compress
+
+    text = "line1\n\n\n\nline2"
+    result = structural_compress(text, aggr=0.1)  # even gentle
+    assert result.count("\n") <= 3  # at most 2 newlines between
+
+
+def test_entropy_ratio():
+    from reduce_session.reduction import entropy_ratio
+
+    repetitive = "hello world " * 100
+    unique = "".join(chr(i % 128) for i in range(1000))
+    assert entropy_ratio(repetitive) > entropy_ratio(unique)
