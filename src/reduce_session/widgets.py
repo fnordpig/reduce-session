@@ -510,6 +510,7 @@ class ReduceModal(ModalScreen[bool]):
                 "line_numbers_stripped",
                 "indentation_collapsed",
                 "blank_lines_collapsed",
+                "chars_dropped_stochastic",
                 "chars_saved_structural",
             }
             msg_stats = {k: v for k, v in r.stats.items() if k not in structural_keys}

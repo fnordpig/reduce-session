@@ -106,3 +106,46 @@ def test_entropy_ratio():
     repetitive = "hello world " * 100
     unique = "".join(chr(i % 128) for i in range(1000))
     assert entropy_ratio(repetitive) > entropy_ratio(unique)
+
+
+def test_stochastic_char_drop_preserves_short_words():
+    from reduce_session.reduction import stochastic_char_drop
+
+    text = "the cat sat on a mat"
+    result = stochastic_char_drop(text, aggr=1.0)
+    assert result == text  # all words < 5 chars, no changes
+
+
+def test_stochastic_char_drop_preserves_first_last():
+    from reduce_session.reduction import stochastic_char_drop
+
+    text = "performance optimization implementation"
+    result = stochastic_char_drop(text, aggr=1.0)
+    for orig, dropped in zip(text.split(), result.split()):
+        assert dropped[0] == orig[0], f"{dropped} lost first char of {orig}"
+        assert dropped[-1] == orig[-1], f"{dropped} lost last char of {orig}"
+
+
+def test_stochastic_char_drop_no_effect_low_aggr():
+    from reduce_session.reduction import stochastic_char_drop
+
+    text = "performance optimization"
+    result = stochastic_char_drop(text, aggr=0.2)
+    assert result == text  # below 0.4 threshold
+
+
+def test_stochastic_char_drop_saves_chars():
+    from reduce_session.reduction import stochastic_char_drop
+
+    text = "The implementation of performance optimization strategies for the reduction pipeline."
+    result = stochastic_char_drop(text, aggr=1.0)
+    assert len(result) < len(text)
+
+
+def test_stochastic_char_drop_deterministic():
+    from reduce_session.reduction import stochastic_char_drop
+
+    text = "performance optimization implementation"
+    r1 = stochastic_char_drop(text, aggr=0.8, seed=42)
+    r2 = stochastic_char_drop(text, aggr=0.8, seed=42)
+    assert r1 == r2  # same seed = same result

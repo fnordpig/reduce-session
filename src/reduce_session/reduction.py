@@ -8,6 +8,7 @@ which reads a file and returns a ReductionResult with no side effects.
 import hashlib
 import json
 import os
+import random
 import re
 import zlib
 from dataclasses import dataclass, field
@@ -408,6 +409,7 @@ def _reset_structural_stats():
         "line_numbers_stripped": 0,
         "indentation_collapsed": 0,
         "blank_lines_collapsed": 0,
+        "chars_dropped_stochastic": 0,
         "chars_saved_structural": 0,
     }
 
@@ -415,9 +417,9 @@ def _reset_structural_stats():
 # Profile-dependent thresholds for structural compression.
 # Gentle = higher thresholds (less compression), aggressive = lower (more compression).
 STRUCTURAL_THRESHOLDS = {
-    "aggressive": {"paths": 0.15, "linenum": 0.3, "indent": 0.5},
-    "standard": {"paths": 0.3, "linenum": 0.5, "indent": 0.7},
-    "gentle": {"paths": 0.5, "linenum": 0.7, "indent": 0.9},
+    "aggressive": {"paths": 0.15, "linenum": 0.3, "indent": 0.5, "chardrop": 0.25},
+    "standard": {"paths": 0.3, "linenum": 0.5, "indent": 0.7, "chardrop": 0.4},
+    "gentle": {"paths": 0.5, "linenum": 0.7, "indent": 0.9, "chardrop": 0.7},
 }
 
 # Module-level profile name, set by reduce_session() before trimming pass
@@ -478,11 +480,83 @@ def structural_compress(text: str, aggr: float) -> str:
         _structural_stats["blank_lines_collapsed"] += text.count("\n\n\n")
         text = new_text
 
+    # 5. Stochastic character drop (vowel-first, for high aggr in middle zone)
+    text = stochastic_char_drop(text, aggr, threshold=thresholds["chardrop"])
+
     saved = orig_len - len(text)
     if saved > 0:
         _structural_stats["chars_saved_structural"] += saved
 
     return text
+
+
+_VOWELS = set("aeiouAEIOU")
+
+
+def stochastic_char_drop(
+    text: str,
+    aggr: float,
+    seed: int = 42,
+    min_word_len: int = 5,
+    threshold: float = 0.4,
+) -> str:
+    """Drop characters from words to save space, preferring vowels.
+
+    Exploits natural language redundancy — LLMs reconstruct meaning from
+    degraded text the way humans read "prfrmance" as "performance".
+
+    Rules:
+    - Words shorter than min_word_len: never touched
+    - First and last character always kept (recognition anchors)
+    - Vowels dropped before consonants (less information content)
+    - Drop rate scales with word length (longer words = more redundancy)
+    - aggr must exceed threshold to activate (profile-dependent)
+    """
+    if aggr < threshold or not text:
+        return text
+
+    rng = random.Random(seed)
+    changed = False
+
+    def _process_word(word):
+        nonlocal changed
+        if len(word) < min_word_len or not any(c.isalpha() for c in word):
+            return word
+        interior = list(word[1:-1])
+        if not interior:
+            return word
+        length_factor = min(len(word) / 12.0, 1.0)
+        base_rate = aggr * 0.3 * length_factor
+        n_to_drop = max(0, int(len(interior) * base_rate))
+        if n_to_drop == 0:
+            return word
+
+        vowel_pos = [i for i, c in enumerate(interior) if c in _VOWELS]
+        consonant_pos = [
+            i for i, c in enumerate(interior) if c not in _VOWELS and c.isalpha()
+        ]
+        drops: set[int] = set()
+        if vowel_pos:
+            drops.update(rng.sample(vowel_pos, min(n_to_drop, len(vowel_pos))))
+        remaining = n_to_drop - len(drops)
+        if remaining > 0 and consonant_pos:
+            drops.update(rng.sample(consonant_pos, min(remaining, len(consonant_pos))))
+        if drops:
+            changed = True
+        result = [c for i, c in enumerate(interior) if i not in drops]
+        return word[0] + "".join(result) + word[-1]
+
+    tokens = re.findall(r"(\w+|\W+)", text)
+    output = "".join(_process_word(t) if re.match(r"\w+", t) else t for t in tokens)
+
+    if changed:
+        saved = len(text) - len(output)
+        _structural_stats["chars_dropped_stochastic"] = (
+            _structural_stats.get("chars_dropped_stochastic", 0) + saved
+        )
+        _structural_stats["chars_saved_structural"] += saved
+
+    return output
 
 
 def entropy_ratio(text: str) -> float:
