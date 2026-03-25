@@ -95,7 +95,8 @@ def parse_args():
         "--llm",
         type=str,
         default=None,
-        help="LLM provider for semantic compression. "
+        help="LLM provider (default: ollama if OLLAMA_HOST set, else local). "
+        "Use 'none' to disable. "
         "Examples: local, ollama:qwen3:4b, anthropic:haiku, openai:gpt-4o-mini, gemini:flash. "
         "Env: REDUCE_SESSION_LLM",
     )
@@ -197,8 +198,18 @@ def _print_history(result):
 def main():
     args = parse_args()
 
-    # Resolve LLM provider (optional)
+    # Resolve LLM provider
+    # Default: ollama if OLLAMA_HOST is set, otherwise local.
+    # Only paid API providers (anthropic, openai, gemini) require explicit opt-in.
     llm_spec = args.llm or os.environ.get("REDUCE_SESSION_LLM")
+    if llm_spec is None:
+        if os.environ.get("OLLAMA_HOST"):
+            llm_spec = "ollama"
+        else:
+            llm_spec = "local"
+    if llm_spec == "none":
+        llm_spec = None  # explicit opt-out
+
     llm_provider = None
     if llm_spec:
         try:
@@ -206,7 +217,7 @@ def main():
 
             llm_provider = create_provider(llm_spec)
         except Exception as e:
-            print(f"Warning: LLM provider failed: {e}", file=sys.stderr)
+            print(f"Warning: LLM provider ({llm_spec}) failed: {e}", file=sys.stderr)
             print("Falling back to heuristic-only mode.", file=sys.stderr)
 
     # Launch TUI if --browse or no positional arg (and no action flags)
