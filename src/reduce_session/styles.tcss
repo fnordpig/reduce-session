@@ -66,10 +66,9 @@ ReduceModal {
 }
 
 #reduce-modal-container {
-    width: 80;
-    max-width: 90%;
-    height: auto;
-    max-height: 85%;
+    width: 75%;
+    min-width: 80;
+    height: 90%;
     border: solid;
     background: $surface;
     padding: 1 2;
