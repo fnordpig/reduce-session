@@ -464,7 +464,7 @@ class ReduceModal(ModalScreen[bool]):
 
         def progress_fn(data):
             """Called from worker thread -- post message to main thread."""
-            self.call_from_thread(self._update_llm_progress, data)
+            self.app.call_from_thread(self._update_llm_progress, data)
 
         def do_llm_work():
             import asyncio
