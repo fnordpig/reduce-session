@@ -47,17 +47,21 @@ class OllamaProvider:
 
     async def classify(self, exchanges: list[dict]) -> list[Category]:
         user_text = format_classify_prompt(exchanges)
-        # Classification batches can be large — 5min timeout
-        text = await self._chat(CLASSIFY_SYSTEM, user_text, timeout=300.0)
+        try:
+            text = await self._chat(CLASSIFY_SYSTEM, user_text, timeout=300.0)
+        except Exception:
+            return [Category.SCAFFOLDING] * len(exchanges)  # timeout → safe default
         return parse_classify_response(text, len(exchanges))
 
-    async def distill(self, text: str, mode: str) -> str:
+    async def distill(self, text: str, mode: str, category: str | None = None) -> str:
         system = (
             DISTILL_SUMMARIZE_SYSTEM if mode == "summarize" else DISTILL_STRIP_SYSTEM
         )
-        user_text = format_distill_prompt(text, mode)
-        # Individual distillation — 2min timeout
-        result = await self._chat(system, user_text, timeout=120.0)
+        user_text = format_distill_prompt(text, mode, category=category)
+        try:
+            result = await self._chat(system, user_text, timeout=300.0)
+        except Exception:
+            return text  # timeout or error → keep original
         if not result or len(result) > len(text):
             return text
         return result

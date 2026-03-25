@@ -1456,7 +1456,7 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
                 classifications[pos] = cat
                 route = ROUTING_MAP.get(cat, Route.HEURISTIC)
                 if route == Route.DISTILL:
-                    await distill_queue.put((pos, obj))
+                    await distill_queue.put((pos, obj, cat))
                 # Find this exchange's index in the middle list
                 mid_idx = classified_so_far + i
                 size = exchange_sizes[mid_idx] if mid_idx < len(exchange_sizes) else 0
@@ -1484,11 +1484,13 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
             if item is None:
                 break
             total_to_distill += 1
-            pos, obj = item
+            pos, obj, cat = item
             text = _extract_assistant_text(obj)
             if text and len(text) > 50:
                 original_len = len(text)
-                summary = await provider.distill(text, mode="summarize")
+                summary = await provider.distill(
+                    text, mode="summarize", category=cat.value
+                )
                 if summary and len(summary) < original_len:
                     _replace_assistant_text(kept_objs[pos], summary)
                     distill_count += 1
