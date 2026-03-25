@@ -184,6 +184,9 @@ def parse_tail(
 ) -> tuple[list[Exchange], int, datetime | None]:
     """Read the last tail_bytes of a session file and extract metadata.
 
+    Adaptively expands the read window if the tail is all metadata noise
+    (progress messages can be 5KB+ each, filling a small tail window).
+
     Returns:
         (exchanges, token_estimate, last_timestamp)
     """
@@ -195,20 +198,35 @@ def parse_tail(
     if file_size == 0:
         return [], 0, None
 
-    seeked = False
-    try:
-        with open(path, "r", errors="replace") as f:
-            if file_size > tail_bytes:
-                f.seek(file_size - tail_bytes)
-                seeked = True
-            raw_lines = f.readlines()
-    except (OSError, PermissionError):
-        return [], 0, None
+    # Try increasing tail sizes until we find content or exhaust the file
+    for try_bytes in [tail_bytes, 200 * 1024, 500 * 1024, file_size]:
+        read_bytes = min(try_bytes, file_size)
+        seeked = False
+        try:
+            with open(path, "r", errors="replace") as f:
+                if file_size > read_bytes:
+                    f.seek(file_size - read_bytes)
+                    seeked = True
+                raw_lines = f.readlines()
+        except (OSError, PermissionError):
+            return [], 0, None
 
-    # Skip truncated first line if we seeked into the middle
-    if seeked and raw_lines:
-        raw_lines = raw_lines[1:]
+        if seeked and raw_lines:
+            raw_lines = raw_lines[1:]
 
+        # Pass 0 as fallback_file_size so heuristic doesn't trigger —
+        # we only want to stop expanding if we found real content or usage.
+        exchanges, token_est, last_ts = _parse_raw_lines(raw_lines, 0)
+        if exchanges:
+            # Found content. If we also found usage, great. If not,
+            # fall back to heuristic now.
+            if token_est == 0:
+                token_est = file_size // 14
+            return exchanges, token_est, last_ts
+        if read_bytes >= file_size:
+            break  # read the whole file, nothing more to try
+
+    # Final attempt with heuristic fallback
     return _parse_raw_lines(raw_lines, file_size)
 
 
