@@ -802,6 +802,48 @@ class ReductionResult:
     orig_budget: TokenBudget | None = None
     reduced_budget: TokenBudget | None = None
     api_tokens: int | None = None
+    orig_density: list[int] = field(default_factory=list)
+    reduced_density: list[int] = field(default_factory=list)
+
+
+def _density_from_objs(objs: list, buckets: int = 40) -> list[int]:
+    """Compute content chars per positional bucket from parsed objects."""
+    profile = [0] * buckets
+    if not objs:
+        return profile
+
+    skip_types = {"progress", "system", "file-history-snapshot", "last-prompt"}
+    content_entries: list[int] = []
+    for obj in objs:
+        rtype = obj.get("type", "")
+        if rtype in skip_types:
+            continue
+        msg = obj.get("message", {})
+        if not isinstance(msg, dict):
+            content_entries.append(0)
+            continue
+        content = msg.get("content")
+        chars = 0
+        if isinstance(content, str):
+            chars = len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    for key in ("text", "thinking", "content"):
+                        val = block.get(key, "")
+                        if isinstance(val, str):
+                            chars += len(val)
+        content_entries.append(chars)
+
+    if not content_entries:
+        return profile
+
+    total = len(content_entries)
+    for i, chars in enumerate(content_entries):
+        bucket = min(int(i / total * buckets), buckets - 1)
+        profile[bucket] += chars
+
+    return profile
 
 
 def reduce_session(
@@ -1114,6 +1156,10 @@ def reduce_session(
         for obj in kept_objs:
             reduced_budget.add_obj(obj)
 
+    # -- Density profiles --
+    orig_density = _density_from_objs(parsed)
+    reduced_density = _density_from_objs(kept_objs)
+
     # -- Serialize to JSON lines --
     kept_lines = [json.dumps(obj, separators=(",", ":")) + "\n" for obj in kept_objs]
     new_size = sum(len(l) for l in kept_lines)
@@ -1128,4 +1174,6 @@ def reduce_session(
         orig_budget=budget,
         reduced_budget=reduced_budget,
         api_tokens=api_tokens,
+        orig_density=orig_density,
+        reduced_density=reduced_density,
     )

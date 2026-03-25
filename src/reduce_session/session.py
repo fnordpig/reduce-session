@@ -42,6 +42,7 @@ class SessionInfo:
     continuation_files: list[Path] = field(default_factory=list)
     last_exchanges: list[Exchange] = field(default_factory=list)
     parse_error: bool = False
+    density_profile: list[int] = field(default_factory=list)
 
 
 def derive_project_name(slug: str) -> str:
@@ -313,6 +314,86 @@ def _count_lines(path: Path) -> int:
         return 0
 
 
+def compute_density_profile(
+    path: Path, buckets: int = 40, tail_bytes: int = 200 * 1024
+) -> list[int]:
+    """Compute content chars per positional bucket from session tail.
+
+    Returns a list of `buckets` integers, each representing chars in that
+    fraction of the file. Used for heatmap sparklines.
+    """
+    profile = [0] * buckets
+
+    try:
+        file_size = path.stat().st_size
+    except (OSError, PermissionError):
+        return profile
+
+    if file_size == 0:
+        return profile
+
+    seeked = False
+    try:
+        with open(path, "r", errors="replace") as f:
+            if file_size > tail_bytes:
+                f.seek(file_size - tail_bytes)
+                seeked = True
+            raw_lines = f.readlines()
+    except (OSError, PermissionError):
+        return profile
+
+    # Skip truncated first line if we seeked into the middle
+    if seeked and raw_lines:
+        raw_lines = raw_lines[1:]
+
+    # Filter out noise lines and collect content chars per line
+    content_lines: list[int] = []
+    for raw in raw_lines:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            record = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        if not isinstance(record, dict):
+            continue
+
+        rtype = record.get("type", "")
+        if rtype in SKIP_TYPES:
+            continue
+
+        # Sum content chars from this record
+        msg = record.get("message", {})
+        if not isinstance(msg, dict):
+            content_lines.append(0)
+            continue
+
+        content = msg.get("content")
+        chars = 0
+        if isinstance(content, str):
+            chars = len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    for key in ("text", "thinking", "content"):
+                        val = block.get(key, "")
+                        if isinstance(val, str):
+                            chars += len(val)
+        content_lines.append(chars)
+
+    if not content_lines:
+        return profile
+
+    total_lines = len(content_lines)
+    for i, chars in enumerate(content_lines):
+        bucket = min(int(i / total_lines * buckets), buckets - 1)
+        profile[bucket] += chars
+
+    return profile
+
+
 def scan_projects(projects_dir: Path) -> list[SessionInfo]:
     """Scan all subdirectories for session JSONL files.
 
@@ -390,6 +471,11 @@ def scan_projects(projects_dir: Path) -> list[SessionInfo]:
 
             age_display = format_age(last_ts) if last_ts else "?"
 
+            try:
+                density = compute_density_profile(path)
+            except Exception:
+                density = []
+
             sessions.append(
                 SessionInfo(
                     path=path,
@@ -404,6 +490,7 @@ def scan_projects(projects_dir: Path) -> list[SessionInfo]:
                     continuation_files=continuations,
                     last_exchanges=last_exchanges,
                     parse_error=parse_error,
+                    density_profile=density,
                 )
             )
 

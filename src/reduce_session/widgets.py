@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 
+from rich.style import Style
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -82,6 +83,123 @@ def render_token_gauge(
     return text
 
 
+_SPARK_CHARS = " \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"  # 9 levels
+
+
+def _spark_char(value: int, max_val: int) -> str:
+    """Map a value to a sparkline block character."""
+    if max_val <= 0:
+        return _SPARK_CHARS[0]
+    idx = min(int(value / max_val * (len(_SPARK_CHARS) - 1)), len(_SPARK_CHARS) - 1)
+    return _SPARK_CHARS[idx]
+
+
+def _density_color(value: int, max_val: int) -> str:
+    """Return heatmap color based on fraction of max."""
+    if max_val <= 0:
+        return "#00d4aa"
+    frac = value / max_val
+    if frac < 0.25:
+        return "#00d4aa"  # green
+    if frac < 0.50:
+        return "#ffd700"  # yellow
+    if frac < 0.75:
+        return "#ff8c00"  # orange
+    return "#ff4444"  # red
+
+
+def render_density_heatmap(profile: list[int], width: int = 40) -> Text:
+    """Render a density profile as a heatmap sparkline.
+
+    Each bucket maps to a block character (from space to full block).
+    Color: green (low density) -> yellow -> orange -> red (high density).
+    """
+    text = Text()
+    if not profile:
+        return text
+
+    max_val = max(profile)
+    for val in profile:
+        char = _spark_char(val, max_val)
+        color = _density_color(val, max_val)
+        text.append(char, style=Style(color=color))
+
+    return text
+
+
+def render_overlay_sparkline(
+    original_profile: list[int],
+    reduced_profile: list[int],
+    width: int = 40,
+) -> Text:
+    """Render overlaid before/after sparklines.
+
+    Three lines:
+    Line 1: Original in dim + heatmap color (the ghost)
+    Line 2: Reduced in bright + heatmap color (the result)
+    Line 3: Savings gradient bar
+    """
+    text = Text()
+    if not original_profile and not reduced_profile:
+        return text
+
+    # Pad to same length
+    length = max(len(original_profile), len(reduced_profile))
+    orig = list(original_profile) + [0] * (length - len(original_profile))
+    redu = list(reduced_profile) + [0] * (length - len(reduced_profile))
+
+    orig_max = max(orig) if orig else 0
+    redu_max = max(redu) if redu else 0
+    # Use the same max for both so they're visually comparable
+    shared_max = max(orig_max, redu_max)
+
+    # Line 1: Original (dim)
+    for val in orig:
+        char = _spark_char(val, shared_max)
+        color = _density_color(val, shared_max)
+        text.append(char, style=Style(color=color, dim=True))
+
+    text.append("\n")
+
+    # Line 2: Reduced (bright)
+    for val in redu:
+        char = _spark_char(val, shared_max)
+        color = _density_color(val, shared_max)
+        text.append(char, style=Style(color=color, bold=True))
+
+    text.append("\n")
+
+    # Line 3: Savings gradient
+    savings_chars = {
+        "low": "\u00b7",  # dot: <10% savings
+        "med": "\u2591",  # light shade: 10-30%
+        "high": "\u2592",  # medium shade: 30-50%
+        "heavy": "\u2593",  # dark shade: >50%
+    }
+    for o, r in zip(orig, redu):
+        if o > 0:
+            pct = 1.0 - r / o
+        else:
+            pct = 0.0
+
+        if pct < 0.10:
+            char = savings_chars["low"]
+            color = "#00d4aa"
+        elif pct < 0.30:
+            char = savings_chars["med"]
+            color = "#ffd700"
+        elif pct < 0.50:
+            char = savings_chars["high"]
+            color = "#ff8c00"
+        else:
+            char = savings_chars["heavy"]
+            color = "#ff4444"
+
+        text.append(char, style=Style(color=color))
+
+    return text
+
+
 def render_exchanges(exchanges: list[Exchange]) -> Text:
     """Render conversation exchanges with role coloring."""
     text = Text()
@@ -133,6 +251,12 @@ class InfoBar(Static):
         combined.append_text(line1)
         combined.append("\n")
         combined.append_text(gauge)
+
+        # Line 3: density heatmap
+        if session.density_profile:
+            heatmap = render_density_heatmap(session.density_profile)
+            combined.append("\n")
+            combined.append_text(heatmap)
 
         self.update(combined)
 
@@ -324,6 +448,14 @@ class ReduceModal(ModalScreen[bool]):
                 )
         else:
             token_text.append("(token estimation not available)", style="dim")
+
+        if r.orig_density and r.reduced_density:
+            overlay = render_overlay_sparkline(
+                r.orig_density,
+                r.reduced_density,
+            )
+            token_text.append("\n\n")
+            token_text.append_text(overlay)
 
         self.query_one("#token-viz", Static).update(token_text)
 
