@@ -298,11 +298,6 @@ class InfoBar(Static):
             combined.append("\n")
             combined.append_text(heatmap)
 
-        # Line 4: U-curve compression profile
-        ucurve = render_ucurve_mini()
-        combined.append("\n")
-        combined.append_text(ucurve)
-
         self.update(combined)
 
 
@@ -507,12 +502,39 @@ class ReduceModal(ModalScreen[bool]):
         # -- Strategies Applied --
         strat_text = Text()
         strat_text.append("── Strategies Applied ──\n", style="bold")
+
         if r.stats:
-            # Two-column layout
-            items = sorted(r.stats.items(), key=lambda x: -x[1])
-            for name, count in items:
-                label = name.replace("_", " ")
-                strat_text.append(f"  {label:<35s} {count:>5,}\n")
+            # Separate structural compression stats from message reduction stats
+            structural_keys = {
+                "paths_shortened",
+                "line_numbers_stripped",
+                "indentation_collapsed",
+                "blank_lines_collapsed",
+                "chars_saved_structural",
+            }
+            msg_stats = {k: v for k, v in r.stats.items() if k not in structural_keys}
+            struct_stats = {
+                k: v for k, v in r.stats.items() if k in structural_keys and v > 0
+            }
+
+            if msg_stats:
+                strat_text.append("\n  Message reduction:\n", style="bold dim")
+                for name, count in sorted(msg_stats.items(), key=lambda x: -x[1]):
+                    label = name.replace("_", " ")
+                    strat_text.append(f"    {label:<33s} {count:>6,}\n")
+
+            if struct_stats:
+                strat_text.append(
+                    "\n  Structural compression (middle-out):\n", style="bold dim"
+                )
+                # Show chars saved prominently
+                chars_saved = struct_stats.pop("chars_saved_structural", 0)
+                for name, count in sorted(struct_stats.items(), key=lambda x: -x[1]):
+                    label = name.replace("_", " ")
+                    strat_text.append(f"    {label:<33s} {count:>6,}\n")
+                if chars_saved:
+                    strat_text.append(f"    {'total chars saved':<33s} ", style="dim")
+                    strat_text.append(f"{chars_saved:>5,}\n", style="#00d4aa bold")
         else:
             strat_text.append("  (no reductions applied)", style="dim")
         self.query_one("#strategies-grid", Static).update(strat_text)

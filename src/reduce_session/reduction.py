@@ -397,6 +397,21 @@ def _get_home_prefix_re():
     return _HOME_PREFIX_RE
 
 
+# Global counters for structural compression stats within a reduce_session() call
+_structural_stats: dict[str, int] = {}
+
+
+def _reset_structural_stats():
+    global _structural_stats
+    _structural_stats = {
+        "paths_shortened": 0,
+        "line_numbers_stripped": 0,
+        "indentation_collapsed": 0,
+        "blank_lines_collapsed": 0,
+        "chars_saved_structural": 0,
+    }
+
+
 def structural_compress(text: str, aggr: float) -> str:
     """Apply structural compression techniques to text based on aggressiveness.
 
@@ -405,35 +420,53 @@ def structural_compress(text: str, aggr: float) -> str:
     3. Indentation collapse (aggr > 0.7): 4-space -> 2-space
     4. Blank line collapse (always): 3+ consecutive newlines -> 2
     """
+    global _structural_stats
     if not isinstance(text, str) or not text:
         return text
+
+    orig_len = len(text)
 
     # 1. Path shortening
     if aggr > 0.3:
         pat = _get_home_prefix_re()
-        text = pat.sub(r"~/\1/", text)
+        new_text = pat.sub(r"~/\1/", text)
+        if new_text != text:
+            _structural_stats["paths_shortened"] += text.count("/src/mine/")
+            text = new_text
 
     # 2. Line number prefix stripping (patterns like "    42→" or "   123│")
     if aggr > 0.5:
-        text = re.sub(r"^ *\d+[→│]\s?", "", text, flags=re.MULTILINE)
+        new_text = re.sub(r"^ *\d+[→│]\s?", "", text, flags=re.MULTILINE)
+        if new_text != text:
+            _structural_stats["line_numbers_stripped"] += len(text) - len(new_text)
+            text = new_text
 
     # 3. Indentation collapse: 4-space -> 2-space
     if aggr > 0.7:
         lines = text.split("\n")
         collapsed = []
+        changed = False
         for line in lines:
-            # Count leading spaces
             stripped = line.lstrip(" ")
             n_spaces = len(line) - len(stripped)
             if n_spaces >= 4:
-                # Convert 4-space units to 2-space units
                 new_spaces = (n_spaces // 4) * 2 + (n_spaces % 4)
                 line = " " * new_spaces + stripped
+                changed = True
             collapsed.append(line)
-        text = "\n".join(collapsed)
+        if changed:
+            text = "\n".join(collapsed)
+            _structural_stats["indentation_collapsed"] += 1
 
     # 4. Blank line collapse: 3+ consecutive newlines -> 2
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    new_text = re.sub(r"\n{3,}", "\n\n", text)
+    if new_text != text:
+        _structural_stats["blank_lines_collapsed"] += text.count("\n\n\n")
+        text = new_text
+
+    saved = orig_len - len(text)
+    if saved > 0:
+        _structural_stats["chars_saved_structural"] += saved
 
     return text
 
@@ -859,6 +892,8 @@ def reduce_session(
     Reads the file, applies all reduction passes, and returns a ReductionResult.
     This function has no side effects (does not write files or print output).
     """
+    _reset_structural_stats()
+
     prof = PROFILES[profile]
     agg_lim = prof["aggressive"]
     gen_lim = prof["gentle"]
@@ -1159,6 +1194,11 @@ def reduce_session(
     # -- Density profiles --
     orig_density = _density_from_objs(parsed)
     reduced_density = _density_from_objs(kept_objs)
+
+    # -- Merge structural compression stats --
+    for k, v in _structural_stats.items():
+        if v > 0:
+            stats[k] = stats.get(k, 0) + v
 
     # -- Serialize to JSON lines --
     kept_lines = [json.dumps(obj, separators=(",", ":")) + "\n" for obj in kept_objs]
