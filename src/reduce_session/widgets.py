@@ -705,6 +705,40 @@ class ReduceModal(ModalScreen[bool]):
                         text.append("          ")
                 text.append("\n")
 
+            # Show token breakdown by type when classification is complete (100%)
+            if pct >= 100 and results:
+                from collections import Counter
+
+                type_chars = Counter()
+                for cat_str, size in results:
+                    type_chars[cat_str] += size
+                total_chars = sum(type_chars.values()) or 1
+
+                text.append("\nContext tokens by type:\n", style="bold")
+                for cat_str, chars in sorted(type_chars.items(), key=lambda x: -x[1]):
+                    tokens = self._chars_to_tokens(chars)
+                    token_pct = chars * 100 // total_chars
+                    if token_pct < 1:
+                        continue
+                    r, g, b = self._CAT_COLORS.get(cat_str, (128, 128, 128))
+                    color = f"#{r:02x}{g:02x}{b:02x}"
+                    # Short label
+                    label = cat_str.lower().replace("_", " ")
+                    if len(label) > 14:
+                        label = label[:14]
+                    text.append("\u2588", style=Style(color=color))
+                    text.append(f" {label:<14s}", style="dim")
+                    text.append(
+                        f"~{_format_tokens(tokens):>6s}", style=Style(color=color)
+                    )
+                    text.append(f" ({token_pct}%)\n", style="dim")
+
+                total_tokens = self._chars_to_tokens(total_chars)
+                text.append(
+                    f"  total: ~{_format_tokens(total_tokens)} context tokens\n",
+                    style="bold",
+                )
+
         else:
             # Phase 2: distill/scaffold — sparkline aligned to classification positions
             reduction_ratio = data.get("reduction_ratio", 0.0)
