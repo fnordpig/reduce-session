@@ -715,7 +715,14 @@ class ReduceModal(ModalScreen[bool]):
                 total_chars = sum(type_chars.values()) or 1
 
                 text.append("\nContext tokens by type:\n", style="bold")
-                for cat_str, chars in sorted(type_chars.items(), key=lambda x: -x[1]):
+
+                def _luminance(cat):
+                    r, g, b = self._CAT_COLORS.get(cat, (128, 128, 128))
+                    return 0.299 * r + 0.587 * g + 0.114 * b
+
+                for cat_str, chars in sorted(
+                    type_chars.items(), key=lambda x: -_luminance(x[0])
+                ):
                     tokens = self._chars_to_tokens(chars)
                     token_pct = chars * 100 // total_chars
                     if token_pct < 1:
