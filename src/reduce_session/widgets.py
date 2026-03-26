@@ -350,6 +350,8 @@ class ReduceModal(ModalScreen[bool]):
         self._llm_worker: Worker | None = None
         self._classify_results: list[tuple] = []  # (category_str, text_size)
         self._savings_history: list[int] = []  # chars_saved per distill/scaffold tick
+        self._phase_start_time: float = 0.0  # monotonic time when current phase started
+        self._last_phase: str = ""  # track phase transitions for ETA reset
 
     def compose(self) -> ComposeResult:
         title_suffix = " (dry-run)" if self.read_only else ""
@@ -396,8 +398,8 @@ class ReduceModal(ModalScreen[bool]):
                             id="btn-run-llm",
                         )
                         yield Static(
-                            "Classifies exchanges, distills verbose content,\n"
-                            "and strips scaffolding language. May take 2-3 min.",
+                            "Classifies exchanges, distills verbose\n"
+                            "content, and strips scaffolding language.",
                             id="llm-description",
                         )
                     else:
@@ -571,6 +573,26 @@ class ReduceModal(ModalScreen[bool]):
         chars_saved = data.get("chars_saved", 0)
         pct = current * 100 // max(total, 1)
 
+        import time as _time
+
+        # Track phase transitions for ETA
+        if phase != self._last_phase:
+            self._phase_start_time = _time.monotonic()
+            self._last_phase = phase
+
+        # Compute ETA once we have enough data (>= 3 ticks and >= 5s elapsed)
+        elapsed = _time.monotonic() - self._phase_start_time
+        eta_str = ""
+        if current > 2 and elapsed > 5 and current < total:
+            rate = current / elapsed  # items per second
+            remaining = (total - current) / rate
+            if remaining < 60:
+                eta_str = f"  ~{int(remaining)}s left"
+            elif remaining < 3600:
+                eta_str = f"  ~{int(remaining / 60)}m {int(remaining % 60)}s left"
+            else:
+                eta_str = f"  ~{int(remaining / 3600)}h left"
+
         spark_width = 35
         spark_chars = " \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
         text = Text()
@@ -582,7 +604,10 @@ class ReduceModal(ModalScreen[bool]):
             total_exchanges = data.get("total", len(results))
 
             text.append(f"Classifying ", style="bold")
-            text.append(f"{current}/{total} ({pct}%)\n")
+            text.append(f"{current}/{total} ({pct}%)")
+            if eta_str:
+                text.append(eta_str, style="dim")
+            text.append("\n")
 
             # Render classification sparkline: bucket results into spark_width
             # Each bucket's height = total text size, color = blended categories
@@ -668,7 +693,10 @@ class ReduceModal(ModalScreen[bool]):
 
             phase_label = "Distilling" if phase == "distill" else "De-scaffolding"
             text.append(f"{phase_label} ", style="bold")
-            text.append(f"{current}/{total} ({pct}%)\n")
+            text.append(f"{current}/{total} ({pct}%)")
+            if eta_str:
+                text.append(eta_str, style="dim")
+            text.append("\n")
 
             # Render savings sparkline
             if len(history) <= spark_width:
