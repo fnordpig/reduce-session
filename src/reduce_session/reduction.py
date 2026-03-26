@@ -1493,6 +1493,7 @@ async def _llm_compression_pass(
             pos, obj, cat = item
             text = _extract_assistant_text(obj)
             # Skip short texts — LLM overhead exceeds savings
+            reduction_ratio = 0.0
             if text and len(text) > 200:
                 original_len = len(text)
                 summary = await provider.distill(
@@ -1501,7 +1502,9 @@ async def _llm_compression_pass(
                 if summary and len(summary) < original_len:
                     _replace_assistant_text(kept_objs[pos], summary)
                     distill_count += 1
-                    chars_saved += original_len - len(summary)
+                    saved = original_len - len(summary)
+                    chars_saved += saved
+                    reduction_ratio = saved / original_len
             if progress_callback:
                 progress_callback(
                     {
@@ -1509,6 +1512,7 @@ async def _llm_compression_pass(
                         "current": processed,
                         "total": total_to_distill,
                         "chars_saved": chars_saved,
+                        "reduction_ratio": reduction_ratio,
                     }
                 )
         return distill_count, chars_saved

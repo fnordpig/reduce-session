@@ -350,6 +350,7 @@ class ReduceModal(ModalScreen[bool]):
         self._llm_worker: Worker | None = None
         self._classify_results: list[tuple] = []  # (category_str, text_size)
         self._savings_history: list[int] = []  # chars_saved per distill/scaffold tick
+        self._distill_reductions: list[float] = []  # per-exchange reduction ratio (0-1)
         self._phase_start_time: float = 0.0  # monotonic time when current phase started
         self._last_phase: str = ""  # track phase transitions for ETA reset
         self._chars_per_token: float = 3.7  # calibrated from API usage when available
@@ -468,6 +469,7 @@ class ReduceModal(ModalScreen[bool]):
         """Run LLM compression on already-reduced content, with live progress."""
         self._classify_results = []
         self._savings_history = []
+        self._distill_reductions = []
         path = str(self.session.path)
 
         def progress_fn(data):
@@ -603,7 +605,8 @@ class ReduceModal(ModalScreen[bool]):
                 else:
                     eta_str = f"  ~{int(remaining / 3600)}h left"
 
-        spark_width = 35
+        classify_width = 70
+        distill_width = 70
         spark_chars = " \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
         text = Text()
 
@@ -621,35 +624,35 @@ class ReduceModal(ModalScreen[bool]):
                 text.append(eta_str, style="dim")
             text.append("\n")
 
-            # Render classification sparkline: bucket results into spark_width
-            # Each bucket's height = total text size, color = blended categories
+            # Render classification sparkline
             if results:
-                bucket_size = max(total_exchanges / spark_width, 1)
-                for bi in range(spark_width):
+                bucket_size = max(total_exchanges / classify_width, 1)
+                # Pre-compute max bucket size for scaling
+                bucket_sizes = []
+                for bi in range(classify_width):
                     start = int(bi * bucket_size)
                     end = int((bi + 1) * bucket_size)
-                    # Items in this bucket from classified results
+                    items = results[start : min(end, len(results))]
+                    bucket_sizes.append(
+                        sum(s for _, s in items)
+                        if items and start < len(results)
+                        else 0
+                    )
+                max_bsize = max(bucket_sizes) if bucket_sizes else 1
+
+                for bi in range(classify_width):
+                    start = int(bi * bucket_size)
+                    end = int((bi + 1) * bucket_size)
                     bucket_items = results[start : min(end, len(results))]
                     if not bucket_items or start >= len(results):
                         text.append("\u2591", style="dim")
                     else:
-                        total_size = sum(s for _, s in bucket_items)
-                        max_size = max(
-                            (
-                                sum(
-                                    s
-                                    for _, s in results[
-                                        int(i * bucket_size) : int(
-                                            (i + 1) * bucket_size
-                                        )
-                                    ]
-                                )
-                                for i in range(min(spark_width, len(results)))
-                            ),
-                            default=1,
-                        )
                         idx = min(
-                            int(total_size / max(max_size, 1) * (len(spark_chars) - 1)),
+                            int(
+                                bucket_sizes[bi]
+                                / max(max_bsize, 1)
+                                * (len(spark_chars) - 1)
+                            ),
                             len(spark_chars) - 1,
                         )
                         color = self._blend_colors(bucket_items)
@@ -698,10 +701,10 @@ class ReduceModal(ModalScreen[bool]):
                 text.append("\n")
 
         else:
-            # Phase 2: distill/scaffold — accumulation sparkline
+            # Phase 2: distill/scaffold — sparkline aligned to classification positions
+            reduction_ratio = data.get("reduction_ratio", 0.0)
+            self._distill_reductions.append(reduction_ratio)
             self._savings_history.append(chars_saved)
-            history = self._savings_history
-            max_saved = max(history) if history else 1
 
             phase_label = "Distilling" if phase == "distill" else "De-scaffolding"
             text.append(f"{phase_label} ", style="bold")
@@ -712,30 +715,50 @@ class ReduceModal(ModalScreen[bool]):
                 text.append(eta_str, style="dim")
             text.append("\n")
 
-            # Render savings sparkline
-            if len(history) <= spark_width:
-                values = history + [0] * (spark_width - len(history))
-            else:
-                step = len(history) / spark_width
-                values = [
-                    history[min(int(i * step), len(history) - 1)]
-                    for i in range(spark_width)
-                ]
+            # Map reductions back to classification positions
+            # Only DISTILL-classified positions get bars; rest are dim
+            results = self._classify_results
+            total_ex = len(results) if results else 1
+            reductions = self._distill_reductions
 
-            for i, v in enumerate(values):
-                if i >= len(history):
+            from reduce_session.llm.base import ROUTING_MAP, Route, Category
+
+            distill_indices = []
+            for ri, (cat_str, _) in enumerate(results):
+                try:
+                    if ROUTING_MAP.get(Category(cat_str)) == Route.DISTILL:
+                        distill_indices.append(ri)
+                except (ValueError, KeyError):
+                    pass
+
+            # Map each reduction to its classification position
+            pos_ratio = {}
+            for di, rv in enumerate(reductions):
+                if di < len(distill_indices):
+                    pos_ratio[distill_indices[di]] = rv
+
+            bucket_size = max(total_ex / distill_width, 1)
+            for bi in range(distill_width):
+                start = int(bi * bucket_size)
+                end = int((bi + 1) * bucket_size)
+                if start >= len(results):
+                    text.append("\u2591", style="dim")
+                    continue
+                bucket_ratios = [
+                    pos_ratio[j]
+                    for j in range(start, min(end, len(results)))
+                    if j in pos_ratio
+                ]
+                if not bucket_ratios:
                     text.append("\u2591", style="dim")
                 else:
-                    idx = min(
-                        int(v / max(max_saved, 1) * (len(spark_chars) - 1)),
-                        len(spark_chars) - 1,
-                    )
-                    frac = v / max(max_saved, 1)
-                    if frac < 0.25:
+                    avg = sum(bucket_ratios) / len(bucket_ratios)
+                    idx = min(int(avg * (len(spark_chars) - 1)), len(spark_chars) - 1)
+                    if avg < 0.2:
                         color = "#555555"
-                    elif frac < 0.5:
+                    elif avg < 0.4:
                         color = "#ffd700"
-                    elif frac < 0.75:
+                    elif avg < 0.6:
                         color = "#ff8c00"
                     else:
                         color = "#00d4aa"
