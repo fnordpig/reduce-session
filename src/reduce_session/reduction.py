@@ -1478,12 +1478,14 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
     async def distill_worker():
         distill_count = 0
         chars_saved = 0
-        total_to_distill = 0  # updated as we discover them
+        # Count total items in queue (classification is complete, queue is fully populated)
+        total_to_distill = distill_queue.qsize() - 1  # subtract sentinel
+        if total_to_distill < 0:
+            total_to_distill = 0
         while True:
             item = await distill_queue.get()
             if item is None:
                 break
-            total_to_distill += 1
             pos, obj, cat = item
             text = _extract_assistant_text(obj)
             if text and len(text) > 50:
