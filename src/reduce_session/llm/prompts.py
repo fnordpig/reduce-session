@@ -39,102 +39,136 @@ Example: ["INSTRUCTION", "SCAFFOLDING", "IMPLEMENTATION"]\
 """
 
 # --- Profile-dependent distillation prompts ---
-# Each profile has a summarize system prompt, a scaffold strip system prompt,
-# and type-specific prompts. The profile name matches the --profile flag.
+#
+# Conceptual framework for what matters in coding conversation context:
+#
+# NOVEL — information appearing for the first time. "Metal doesn't support FP64"
+#   is novel. "Let me check Metal" is not — it's an announcement of intent.
+#
+# SALIENT — information that changes what happens next. A constraint that blocks
+#   an approach is highly salient. A confirmation that things work is low salience.
+#
+# GROUNDING — concrete anchors: file paths, error messages, numbers, code refs.
+#   "batch_size=64 causes OOM on 16GB" is grounded. "There might be memory issues"
+#   is ungrounded.
+#
+# SCAFFOLDING — meta-actions, process narration, transitions, pleasantries.
+#   "Let me check", "I'll now", "First", "Additionally" — zero information content.
+#
+# REDUNDANT — restating what's already known. "As you mentioned...", "Like we
+#   discussed..." — the context already contains this.
+#
+# The future AI reader needs: novel facts, salient decisions, grounding details.
+# It does NOT need: scaffolding, process, redundancy, hedging, or politeness.
+
+_FRAMEWORK = (
+    "You are compressing a coding conversation for a future AI assistant that will "
+    "resume this work. The future reader needs ONLY:\n"
+    "- NOVEL facts (discovered for the first time in this exchange)\n"
+    "- SALIENT decisions (choices that change what happens next)\n"
+    "- GROUNDING details (file paths, error messages, numbers, constraints)\n"
+    "It does NOT need:\n"
+    "- Process (how a fact was discovered — only the fact itself)\n"
+    "- Scaffolding ('Let me', 'I'll now', 'Looking at', 'Based on')\n"
+    "- Redundancy (restating what the user said or what's already known)\n"
+    "- Hedging ('might', 'could', 'seems', 'I think')\n"
+    "- Meta-commentary ('Here is what I found:', 'Let me explain:')\n"
+)
 
 DISTILL_PROFILES: dict[str, dict] = {
     "gentle": {
         "summarize_system": (
-            "Condense this text while preserving its meaning and tone. "
-            "Target ~30% shorter. Keep the reasoning flow but tighten the language. "
-            "Remove obvious filler ('Let me', 'I think') but keep the author's voice. "
-            "Respond with ONLY the condensed text."
+            _FRAMEWORK
+            + "\nPreserve the narrative flow but remove scaffolding and redundancy. "
+            "Keep novel facts, salient reasoning, and grounding details. "
+            "The reader should understand both the conclusion AND the key reasoning. "
+            "Respond with ONLY the compressed text."
         ),
         "strip_system": (
-            "Lightly edit this text to remove filler phrases: "
-            "'Let me', 'I'll now', 'Looking at this', 'I notice that'. "
-            "Keep the overall structure and flow intact. "
-            "Output ONLY the edited text."
+            "Remove scaffolding phrases from this text while preserving all "
+            "novel and salient content. Delete: 'Let me', 'I'll now', "
+            "'I notice that', 'Looking at this'. Keep the logical flow intact. "
+            "Output ONLY the stripped text."
         ),
         "type_prompts": {
-            "EXPLANATION": "Tighten this explanation. Keep the reasoning but remove filler. Target ~30% shorter.",
-            "IMPLEMENTATION": "Condense this to key changes and intent. Keep code references. Target ~30% shorter.",
-            "REASONING": "Tighten the analysis. Keep tradeoffs and conclusion. Remove filler. Target ~30% shorter.",
-            "DEBUGGING": "Condense to: what was wrong, investigation highlights, fix applied. Target ~30% shorter.",
-            "METRICS": "Keep all numbers. Remove narrative around them. Present as compact text.",
-            "COMPILATION": "Keep result and any errors. Remove verbose output lines. A few sentences.",
-            "PLANNING": "Keep decisions and action items. Condense deliberation. Target ~30% shorter.",
-            "TESTING": "Keep pass/fail counts and failure details. Remove per-test output.",
-            "GIT_OPERATION": "Keep commit message and branch. Remove git output. 1-2 sentences.",
-            "ANALYSIS": "Keep findings and key data. Condense methodology. Target ~30% shorter.",
+            "EXPLANATION": "Keep the novel insight AND the key reasoning that supports it. Remove scaffolding and hedging only.",
+            "IMPLEMENTATION": "Keep: what changed, which files, why. Remove scaffolding around the edits. Preserve intent.",
+            "REASONING": "Keep the conclusion AND the salient tradeoffs. Remove scaffolding and restating of known context.",
+            "DEBUGGING": "Keep: the novel root cause, the constraint discovered, and the fix. Remove the investigation narration.",
+            "METRICS": "Keep ALL numbers — they are novel grounding facts. Remove only narrative scaffolding around them.",
+            "COMPILATION": "Keep the result and any novel errors. Remove 'Compiling' progress lines.",
+            "PLANNING": "Keep salient decisions and action items. Remove the deliberation process.",
+            "TESTING": "Keep pass/fail counts and any novel failure details.",
+            "GIT_OPERATION": "Keep commit message and branch. Remove git output scaffolding.",
+            "ANALYSIS": "Keep novel findings and grounding data points. Remove methodology scaffolding.",
         },
     },
     "standard": {
         "summarize_system": (
-            "Compress this text significantly. Target ~50% shorter. "
-            "KEEP: facts, decisions, numbers, errors, file paths, constraints. "
-            "DELETE: preamble, transitions, hedging, restatements, meta-commentary. "
+            _FRAMEWORK
+            + "\nExtract ONLY novel and salient information with grounding details. "
+            "Delete all process narration — keep conclusions, not journeys. "
+            "If the text says 'Let me check X... I see that Y', output only 'Y'. "
             "Respond with ONLY the compressed text. No commentary."
         ),
         "strip_system": (
-            "Strip filler from this text. Target ~50% shorter. "
-            "DELETE: 'Let me', 'I'll now', 'I see that', 'Looking at this', "
-            "'Based on what I see', transitions, hedging, restatements. "
-            "KEEP: every fact, number, file path, error, decision, constraint. "
+            _FRAMEWORK + "\nStrip everything that isn't novel, salient, or grounding. "
+            "The output should read like a fact sheet, not a conversation. "
             "Output ONLY the stripped text."
         ),
         "type_prompts": {
-            "EXPLANATION": "Compress to the key facts and conclusion. 2-3 sentences max. Delete the reasoning chain.",
-            "IMPLEMENTATION": "Which files changed and why. 1-2 sentences. Delete code blocks and edit narrative.",
-            "REASONING": "The conclusion and key tradeoffs only. 1-2 sentences. Delete deliberation.",
-            "DEBUGGING": "Root cause + fix. 1-2 sentences. Delete investigation steps.",
-            "METRICS": "Numbers only as a compact list. No narrative.",
-            "COMPILATION": "Result + errors if any. One line.",
-            "PLANNING": "Decided action items only. Numbered list. Delete brainstorming.",
-            "TESTING": "Pass/fail counts + failure messages. One line.",
-            "GIT_OPERATION": "Commit message + branch. One line.",
-            "ANALYSIS": "Key findings as 1-3 bullet points. Delete methodology.",
+            "EXPLANATION": "Extract the novel conclusion only. The reasoning chain is process — delete it. 1-3 sentences.",
+            "IMPLEMENTATION": "What files changed and the salient intent. Delete the edit-by-edit process. 1-2 sentences.",
+            "REASONING": "The salient conclusion and any novel constraints discovered. Delete deliberation. 1-2 sentences.",
+            "DEBUGGING": "The novel root cause + fix + any constraint discovered. Delete investigation process. 1-2 sentences.",
+            "METRICS": "Novel numbers only. No narrative. Compact list.",
+            "COMPILATION": "Novel result only: success or the error message. One line.",
+            "PLANNING": "Salient decisions only. Numbered list. Delete the brainstorming process.",
+            "TESTING": "Novel results: pass/fail counts + failure messages. One line.",
+            "GIT_OPERATION": "Salient fact: what was committed/pushed. One line.",
+            "ANALYSIS": "Novel findings as grounded bullet points. Delete analysis methodology.",
         },
     },
     "aggressive": {
         "summarize_system": (
-            "You are a ruthless text compressor. Output MUST be at least 60% shorter than input. "
-            "KEEP ONLY: bare facts, decisions, numbers, error messages, file paths, constraints. "
-            "DELETE ALL: 'Let me', 'I'll', 'I see', 'Looking at', 'Based on', transitions, "
-            "preamble, hedging, restatements, pleasantries, meta-commentary, markdown formatting. "
-            "No commentary. No 'Here\\'s the summary:'. Just the compressed content."
+            _FRAMEWORK
+            + "\nExtract ONLY the most novel, salient, grounded facts. Be RUTHLESS. "
+            "If a paragraph contains one novel fact and ten sentences of process, "
+            "output ONLY the novel fact. Every word in your output must be either "
+            "a novel fact, a salient decision, or a grounding detail. "
+            "Nothing else survives. No commentary. Just the distilled facts."
         ),
         "strip_system": (
-            "You are a ruthless text compressor. Output MUST be at least 50% shorter than input. "
-            "DELETE: every 'Let me', 'I'll now', 'I see that', 'Looking at this', "
-            "'Based on what I see', 'I notice', 'It appears', 'I think', 'I believe', "
-            "ALL transitions, ALL hedging, ALL meta-commentary, ALL restatements. "
-            "KEEP: every fact, number, file path, error message, decision, constraint. "
-            "Output ONLY the stripped text."
+            _FRAMEWORK
+            + "\nDelete EVERYTHING that is not a novel fact, salient decision, or "
+            "grounding detail. Every sentence that survives must contain information "
+            "the future reader cannot infer from surrounding context. "
+            "Output ONLY what survives."
         ),
         "type_prompts": {
             "EXPLANATION": (
-                "ONLY the conclusion. 1 sentence. Delete the entire reasoning chain. "
-                "If the conclusion is 'Metal doesn't support FP64', output exactly that."
+                "The ONLY novel fact. One sentence. If the text explains why Metal "
+                "doesn't support FP64, output 'Metal lacks FP64 support.' — not "
+                "the discovery process."
             ),
             "IMPLEMENTATION": (
-                "ONLY: which files changed and why. 1 sentence. "
-                "Example: 'Modified metal.rs: added FP16 BERT attention kernels.'"
+                "Salient change only. One sentence. "
+                "'metal.rs: added FP16 BERT attention kernels' — not the editing process."
             ),
             "REASONING": (
-                "ONLY the final conclusion. 1 sentence. Delete all deliberation. "
-                "Example: 'Use batch_size=32 due to M2 16GB memory limit.'"
+                "The single most salient conclusion. One sentence. "
+                "'batch_size=32, M2 16GB limit' — not the deliberation."
             ),
             "DEBUGGING": (
-                "ONLY: root cause + fix. 1 sentence. "
-                "Example: 'OOM at batch=64 on M2. Fixed: reduced to batch=32.'"
+                "Novel root cause + grounding fix. One sentence. "
+                "'OOM at batch=64/16GB. Fix: batch=32.' — not the investigation."
             ),
-            "METRICS": "Numbers ONLY as compact list. Example: 'BGE: 308/s, CodeRank: 105/s, ModernBERT: 118/s'",
-            "COMPILATION": "ONLY: 'build ok' or the error. One line.",
-            "PLANNING": "ONLY decided action items. Numbered list. No deliberation.",
-            "TESTING": "ONLY: pass/fail + failures. Example: '42 passed, 1 failed: test_metal_fp16'",
-            "GIT_OPERATION": "ONLY: 'committed: <msg>' or 'pushed to <branch>'. One line.",
-            "ANALYSIS": "ONLY findings. 1-3 bullet points. Delete everything else.",
+            "METRICS": "Novel numbers ONLY. 'BGE: 308/s, CodeRank: 105/s, ModernBERT: 118/s' — no narrative.",
+            "COMPILATION": "Novel result only. 'build ok' or the salient error. One line.",
+            "PLANNING": "Salient decisions ONLY as terse list. No deliberation survived.",
+            "TESTING": "Novel result. '42 passed, 1 failed: test_metal_fp16' — nothing else.",
+            "GIT_OPERATION": "'committed: <msg>' — one line, nothing else.",
+            "ANALYSIS": "Novel findings only. 1-3 terse bullet points. Nothing else survived.",
         },
     },
 }
