@@ -1687,6 +1687,79 @@ async def _llm_compression_pass(
     await classify_worker()
     distill_count, distill_chars = await distill_worker()
 
+    # Phase 1.5: Distill tool_result content and Agent prompts
+    # (only for exchanges classified as DISTILL routes)
+    tool_distill_count = 0
+    tool_distill_chars = 0
+
+    for pos, obj, aggr in middle:
+        # Only process if classified as a DISTILL category
+        cat = classifications.get(pos)
+        if not cat:
+            continue
+        route = ROUTING_MAP.get(cat, Route.HEURISTIC)
+        if route != Route.DISTILL:
+            continue
+
+        t = get_msg_type(obj)
+        msg = obj.get("message", {})
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+
+            # Distill tool_result content
+            if t == "user" and block.get("type") == "tool_result":
+                inner = block.get("content", "")
+                if isinstance(inner, str) and len(inner) > 200:
+                    original_len = len(inner)
+                    # Determine tool-specific prompt
+                    result_cat = "TOOL_RESULT_DEFAULT"
+                    summary = await provider.distill(
+                        inner, mode="summarize", category=result_cat, profile=profile
+                    )
+                    if summary and len(summary) < original_len:
+                        block["content"] = summary
+                        tool_distill_count += 1
+                        tool_distill_chars += original_len - len(summary)
+
+            # Distill Agent prompts
+            if t == "assistant" and block.get("type") == "tool_use":
+                name = block.get("name", "")
+                if name in ("Agent", "agent"):
+                    inp = block.get("input", {})
+                    if isinstance(inp, dict):
+                        prompt_text = inp.get("prompt", "")
+                        if isinstance(prompt_text, str) and len(prompt_text) > 200:
+                            original_len = len(prompt_text)
+                            summary = await provider.distill(
+                                prompt_text,
+                                mode="summarize",
+                                category="AGENT_PROMPT",
+                                profile=profile,
+                            )
+                            if summary and len(summary) < original_len:
+                                inp["prompt"] = summary
+                                tool_distill_count += 1
+                                tool_distill_chars += original_len - len(summary)
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "phase": "distill",
+                    "current": tool_distill_count,
+                    "total": tool_distill_count,  # we don't know total ahead of time
+                    "chars_saved": distill_chars + tool_distill_chars,
+                    "reduction_ratio": 0,
+                }
+            )
+
+    distill_chars += tool_distill_chars
+    distill_count += tool_distill_count
+
     # Phase 2: Scaffolding strip on non-DISTILL assistant text in middle zone
     # DISTILL exchanges already went through summarization — only strip the rest.
     # Also skip short texts (< 200 chars) where LLM overhead exceeds savings.
@@ -1741,6 +1814,8 @@ async def _llm_compression_pass(
     stats["llm_distilled"] = distill_count
     stats["llm_scaffold_stripped"] = strip_count
     stats["llm_chars_saved"] = distill_chars + strip_chars_saved
+    if tool_distill_count:
+        stats["llm_tool_results_distilled"] = tool_distill_count
 
     return stats
 

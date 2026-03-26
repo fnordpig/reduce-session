@@ -294,3 +294,16 @@ def test_nuclear_skips_gentle_zone():
     stats = nuclear_tool_replace(objs, aggr_fn, tool_id_map)
     # Position 0 has aggr 0.2, should NOT be replaced
     assert objs[0]["message"]["content"][0]["content"].startswith("original")
+
+
+def test_llm_distills_tool_results():
+    """Verify tool_result content gets LLM-distilled for DISTILL exchanges."""
+    from reduce_session.llm.prompts import DISTILL_PROFILES
+
+    for profile in ["gentle", "standard", "aggressive"]:
+        prompts = DISTILL_PROFILES[profile]["type_prompts"]
+        assert "TOOL_RESULT_BASH" in prompts
+        assert "TOOL_RESULT_READ" in prompts
+        assert "TOOL_RESULT_AGENT" in prompts
+        assert "TOOL_RESULT_DEFAULT" in prompts
+        assert "AGENT_PROMPT" in prompts
