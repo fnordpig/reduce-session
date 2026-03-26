@@ -39,65 +39,69 @@ Example: ["INSTRUCTION", "SCAFFOLDING", "IMPLEMENTATION"]\
 """
 
 DISTILL_SUMMARIZE_SYSTEM = """\
-Compress to essential information. \
-Keep decisions, facts, constraints, what changed, errors. \
-Remove preamble, transitions, restating. \
-Respond with ONLY the compressed text.\
+You are a ruthless text compressor. Your output MUST be at least 60% shorter than the input.
+KEEP ONLY: bare facts, decisions, numbers, error messages, file paths, constraints.
+DELETE ALL: "Let me", "I'll", "I see", "Looking at", "Based on", transitions, \
+preamble, hedging, restatements, pleasantries, meta-commentary, markdown formatting.
+Respond with ONLY the compressed text. No commentary. No "Here's the summary:". Just the compressed content.\
 """
 
 DISTILL_STRIP_SYSTEM = """\
-Strip filler language. \
-Keep ONLY grounded, factual content. \
-Remove "Let me", "I'll now", transitions, preamble, hedging. \
-Preserve every fact, decision, error message, code reference, constraint, number. \
-Respond with ONLY the stripped text.\
+You are a ruthless text compressor. Your output MUST be at least 50% shorter than the input.
+DELETE: every occurrence of "Let me", "I'll now", "I see that", "Looking at this", \
+"Based on what I see", "I notice", "It appears", "I think", "I believe", \
+all transitions ("First", "Next", "Then", "Also", "Additionally", "Furthermore"), \
+all hedging ("might", "could", "seems", "appears to"), \
+all meta-commentary ("Here's what I found:", "Let me explain:"), \
+all restating of what the user said.
+KEEP: every fact, number, file path, error message, decision, constraint, code reference.
+Output ONLY the stripped text. Nothing else.\
 """
 
 DISTILL_TYPE_PROMPTS: dict[str, str] = {
     "EXPLANATION": (
-        "Compress this explanation to its conclusion. Keep: the key fact or insight. "
-        "Remove: the reasoning chain, preamble, hedging. One concise paragraph."
+        "Reduce to ONLY the conclusion. Delete the entire reasoning chain. "
+        "Output must be 1-2 sentences maximum. If the conclusion is "
+        "'Metal doesn't support FP64', output exactly that — not the "
+        "journey to that conclusion."
     ),
     "IMPLEMENTATION": (
-        "Summarize this code change. Keep: what files changed, what was the intent, "
-        "key design decisions. Remove: edit-by-edit narrative, full code blocks. "
-        "One paragraph."
+        "Output ONLY: which files changed and why, in 1-2 sentences. "
+        "Delete all code blocks, edit narratives, and tool call descriptions. "
+        "Example: 'Modified metal.rs: added FP16 BERT attention kernels.'"
     ),
     "REASONING": (
-        "Extract the key insight from this analysis. Keep: the conclusion reached, "
-        "tradeoffs identified, recommendation. Remove: deliberation, restating "
-        "context. One paragraph."
+        "Output ONLY the final recommendation or conclusion, in 1 sentence. "
+        "Delete all deliberation, pros/cons lists, and 'on the other hand'. "
+        "Example: 'Use batch_size=32 due to M2 16GB memory limit.'"
     ),
     "DEBUGGING": (
-        "Extract the root cause and fix. Keep: what was wrong, why, what fixed it, "
-        "any constraints discovered. Remove: investigation steps, hypothesis testing. "
-        "One paragraph."
+        "Output ONLY: root cause + fix, in 1-2 sentences. "
+        "Delete all investigation steps, hypotheses, and 'let me check'. "
+        "Example: 'OOM at batch=64 on M2. Fixed: reduced to batch=32.'"
     ),
     "METRICS": (
-        "Extract the key numbers and findings. Keep: all performance numbers, "
-        "comparisons, bottlenecks identified. Remove: narrative around the data. "
-        "Concise bullet points."
+        "Output ONLY the numbers as a compact list. No narrative. "
+        "Example: 'BGE-small: 308/s, CodeRankEmbed: 105/s, ModernBERT: 118/s'"
     ),
     "COMPILATION": (
-        "Extract build result. Keep: success/failure, errors if any, timing. "
-        "Remove: all 'Compiling foo' lines, download progress. One line."
+        "Output ONLY: 'build ok' or the error message. One line. "
+        "Delete all 'Compiling', 'Downloading', 'Finished' lines."
     ),
     "PLANNING": (
-        "Extract decisions and next steps. Keep: what was decided, action items, "
-        "priorities. Remove: brainstorming, deliberation, rejected options. "
-        "Concise list."
+        "Output ONLY the decided action items as a numbered list. "
+        "Delete all brainstorming, rejected ideas, and deliberation."
     ),
     "TESTING": (
-        "Extract test results. Keep: pass/fail counts, failures with error messages, "
-        "performance numbers. Remove: individual test output. One paragraph."
+        "Output ONLY: pass/fail counts and any failure messages. One line. "
+        "Example: '42 passed, 1 failed: test_metal_fp16 assertion error'"
     ),
     "GIT_OPERATION": (
-        "Extract git summary. Keep: branch, commit message, files changed. "
-        "Remove: git command output. One line."
+        "Output ONLY: 'committed: <message>' or 'pushed to <branch>'. One line."
     ),
     "ANALYSIS": (
-        "Extract conclusions. Keep: findings, recommendations, key data points. "
-        "Remove: methodology description, verbose analysis. One paragraph."
+        "Output ONLY the key findings as 1-3 bullet points. "
+        "Delete methodology, verbose analysis, and caveats."
     ),
 }
 
