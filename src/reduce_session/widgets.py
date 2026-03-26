@@ -523,32 +523,33 @@ class ReduceModal(ModalScreen[bool]):
         self._llm_worker = self.run_worker(do_llm_work, thread=True)
 
     # Category colors for classification sparkline blending
-    # Three visually distinct lanes: KEEP=blue, DISTILL=green+yellow, HEURISTIC=red
+    # Three visually distinct lanes, each sorted lightest→darkest by luminance
+    # KEEP=blue, DISTILL=green+yellow, HEURISTIC=red
     _CAT_COLORS = {
-        # KEEP types — blue spectrum
-        "INSTRUCTION": (40, 120, 255),
-        "CLARIFICATION": (80, 150, 255),
-        "CONFIRMATION": (60, 100, 220),
-        "INQUIRY": (100, 170, 255),
-        "DECISION": (30, 90, 240),
-        "FEEDBACK": (70, 140, 250),
-        # DISTILL types — green + yellow spectrum
-        "EXPLANATION": (120, 200, 60),
-        "IMPLEMENTATION": (200, 220, 40),
-        "REASONING": (80, 180, 80),
-        "DEBUGGING": (160, 210, 50),
-        "METRICS": (220, 240, 30),
-        "COMPILATION": (240, 220, 0),
-        "PLANNING": (60, 190, 100),
-        "TESTING": (100, 210, 40),
-        "GIT_OPERATION": (140, 230, 60),
-        "ANALYSIS": (90, 200, 70),
-        # HEURISTIC types — red spectrum
-        "STATUS_UPDATE": (220, 80, 60),
-        "NOTIFICATION": (200, 60, 50),
-        "LOG_OUTPUT": (240, 100, 70),
-        "SCAFFOLDING": (180, 50, 40),
-        "ERROR_OUTPUT": (255, 60, 60),
+        # KEEP types — blue spectrum (lightest→darkest)
+        "INQUIRY": (130, 185, 255),  # lightest blue
+        "CLARIFICATION": (100, 160, 255),
+        "FEEDBACK": (80, 140, 250),
+        "INSTRUCTION": (50, 115, 240),
+        "CONFIRMATION": (40, 95, 220),
+        "DECISION": (25, 75, 200),  # darkest blue
+        # DISTILL types — green+yellow spectrum (lightest→darkest)
+        "METRICS": (240, 240, 50),  # brightest yellow
+        "COMPILATION": (220, 220, 30),
+        "TESTING": (180, 230, 40),
+        "IMPLEMENTATION": (160, 210, 40),
+        "GIT_OPERATION": (130, 210, 50),
+        "DEBUGGING": (100, 200, 60),
+        "EXPLANATION": (80, 190, 70),
+        "ANALYSIS": (60, 175, 80),
+        "PLANNING": (45, 160, 90),
+        "REASONING": (35, 145, 75),  # darkest green
+        # HEURISTIC types — red spectrum (lightest→darkest)
+        "LOG_OUTPUT": (255, 130, 100),  # lightest red
+        "STATUS_UPDATE": (240, 100, 70),
+        "ERROR_OUTPUT": (220, 70, 55),
+        "NOTIFICATION": (200, 55, 45),
+        "SCAFFOLDING": (170, 40, 35),  # darkest red
     }
 
     def _chars_to_tokens(self, chars: int) -> int:
@@ -664,34 +665,47 @@ class ReduceModal(ModalScreen[bool]):
                         text.append(spark_chars[idx], style=Style(color=color))
                 text.append("\n")
 
-            # Color grid legend — 3 columns by route group
+            # Color grid — 3 columns sorted lightest→darkest, % filled on completion
             _keep = [
-                ("INSTRUCTION", "instr"),
-                ("CLARIFICATION", "clarif"),
-                ("CONFIRMATION", "confm"),
                 ("INQUIRY", "inqry"),
-                ("DECISION", "decsn"),
+                ("CLARIFICATION", "clarif"),
                 ("FEEDBACK", "fdbck"),
+                ("INSTRUCTION", "instr"),
+                ("CONFIRMATION", "confm"),
+                ("DECISION", "decsn"),
             ]
             _distill = [
-                ("EXPLANATION", "expl"),
-                ("IMPLEMENTATION", "impl"),
-                ("REASONING", "reason"),
-                ("DEBUGGING", "debug"),
                 ("METRICS", "metrcs"),
                 ("COMPILATION", "compil"),
-                ("PLANNING", "plan"),
                 ("TESTING", "test"),
+                ("IMPLEMENTATION", "impl"),
                 ("GIT_OPERATION", "git"),
+                ("DEBUGGING", "debug"),
+                ("EXPLANATION", "expl"),
                 ("ANALYSIS", "analys"),
+                ("PLANNING", "plan"),
+                ("REASONING", "reason"),
             ]
             _heur = [
-                ("STATUS_UPDATE", "status"),
-                ("NOTIFICATION", "notif"),
                 ("LOG_OUTPUT", "log"),
-                ("SCAFFOLDING", "scaff"),
+                ("STATUS_UPDATE", "status"),
                 ("ERROR_OUTPUT", "error"),
+                ("NOTIFICATION", "notif"),
+                ("SCAFFOLDING", "scaff"),
             ]
+
+            # Compute percentages if classification is complete
+            type_pcts = {}
+            if pct >= 100 and results:
+                from collections import Counter
+
+                type_chars = Counter()
+                for cat_str, size in results:
+                    type_chars[cat_str] += size
+                total_chars = sum(type_chars.values()) or 1
+                for cat_str, chars in type_chars.items():
+                    type_pcts[cat_str] = chars * 100 // total_chars
+
             max_rows = max(len(_keep), len(_distill), len(_heur))
             for row in range(max_rows):
                 for col_types in [_keep, _distill, _heur]:
@@ -700,51 +714,17 @@ class ReduceModal(ModalScreen[bool]):
                         r, g, b = self._CAT_COLORS[cat_key]
                         color = f"#{r:02x}{g:02x}{b:02x}"
                         text.append("\u2588", style=Style(color=color))
-                        text.append(f"{label:<9s}", style="dim")
+                        text.append(f"{label:<7s}", style="dim")
+                        p = type_pcts.get(cat_key, 0)
+                        if p > 0:
+                            text.append(f"{p:>3d}%", style=Style(color=color))
+                        elif type_pcts:
+                            text.append("    ", style="dim")
+                        else:
+                            text.append("    ")
                     else:
-                        text.append("          ")
+                        text.append("            ")
                 text.append("\n")
-
-            # Show token breakdown by type when classification is complete (100%)
-            if pct >= 100 and results:
-                from collections import Counter
-
-                type_chars = Counter()
-                for cat_str, size in results:
-                    type_chars[cat_str] += size
-                total_chars = sum(type_chars.values()) or 1
-
-                text.append("\nContext tokens by type:\n", style="bold")
-
-                def _luminance(cat):
-                    r, g, b = self._CAT_COLORS.get(cat, (128, 128, 128))
-                    return 0.299 * r + 0.587 * g + 0.114 * b
-
-                for cat_str, chars in sorted(
-                    type_chars.items(), key=lambda x: -_luminance(x[0])
-                ):
-                    tokens = self._chars_to_tokens(chars)
-                    token_pct = chars * 100 // total_chars
-                    if token_pct < 1:
-                        continue
-                    r, g, b = self._CAT_COLORS.get(cat_str, (128, 128, 128))
-                    color = f"#{r:02x}{g:02x}{b:02x}"
-                    # Short label
-                    label = cat_str.lower().replace("_", " ")
-                    if len(label) > 14:
-                        label = label[:14]
-                    text.append("\u2588", style=Style(color=color))
-                    text.append(f" {label:<14s}", style="dim")
-                    text.append(
-                        f"~{_format_tokens(tokens):>6s}", style=Style(color=color)
-                    )
-                    text.append(f" ({token_pct}%)\n", style="dim")
-
-                total_tokens = self._chars_to_tokens(total_chars)
-                text.append(
-                    f"  total: ~{_format_tokens(total_tokens)} context tokens\n",
-                    style="bold",
-                )
 
         else:
             # Phase 2: distill/scaffold — sparkline aligned to classification positions
