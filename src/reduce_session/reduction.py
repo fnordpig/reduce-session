@@ -1482,16 +1482,21 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
         total_to_distill = distill_queue.qsize() - 1  # subtract sentinel
         if total_to_distill < 0:
             total_to_distill = 0
+        processed = 0
         while True:
             item = await distill_queue.get()
             if item is None:
                 break
+            processed += 1
             pos, obj, cat = item
             text = _extract_assistant_text(obj)
-            if text and len(text) > 50:
+            # Skip short texts — LLM overhead exceeds savings
+            if text and len(text) > 200:
                 original_len = len(text)
+                # Cap input to LLM at 2000 chars — enough for summarization
+                llm_input = text[:2000] if len(text) > 2000 else text
                 summary = await provider.distill(
-                    text, mode="summarize", category=cat.value
+                    llm_input, mode="summarize", category=cat.value
                 )
                 if summary and len(summary) < original_len:
                     _replace_assistant_text(kept_objs[pos], summary)
@@ -1501,7 +1506,7 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
                 progress_callback(
                     {
                         "phase": "distill",
-                        "current": distill_count,
+                        "current": processed,
                         "total": total_to_distill,
                         "chars_saved": chars_saved,
                     }
@@ -1514,13 +1519,23 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
     await classify_worker()
     distill_count, distill_chars = await distill_worker()
 
-    # Phase 2: Scaffolding strip on ALL assistant text in middle zone
-    # Pre-filter to only exchanges with substantial assistant text
+    # Phase 2: Scaffolding strip on non-DISTILL assistant text in middle zone
+    # DISTILL exchanges already went through summarization — only strip the rest.
+    # Also skip short texts (< 200 chars) where LLM overhead exceeds savings.
+    distilled_positions = {
+        pos
+        for pos, _, _ in middle
+        if classifications.get(pos)
+        and ROUTING_MAP.get(classifications[pos]) == Route.DISTILL
+    }
+
     strip_candidates = []
     total_strip_chars = 0
     for pos, obj, aggr in middle:
+        if pos in distilled_positions:
+            continue  # already summarized in phase 1
         text = _extract_assistant_text(obj)
-        if text and len(text) > 50:
+        if text and len(text) > 200:
             strip_candidates.append((pos, obj, text))
             total_strip_chars += len(text)
 
@@ -1528,14 +1543,15 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
     strip_chars_saved = 0
     for idx, (pos, obj, text) in enumerate(strip_candidates, 1):
         original_len = len(text)
-        stripped = await provider.distill(text, mode="strip_scaffold")
+        llm_input = text[:2000] if len(text) > 2000 else text
+        stripped = await provider.distill(llm_input, mode="strip_scaffold")
         if stripped and len(stripped) < original_len:
             _replace_assistant_text(kept_objs[pos], stripped)
             strip_count += 1
             strip_chars_saved += original_len - len(stripped)
         if progress_callback:
             total_saved = distill_chars + strip_chars_saved
-            ratio = total_saved * 100 // max(total_strip_chars, 1)
+            ratio = total_saved * 100 // max(total_strip_chars + 1, 1)
             progress_callback(
                 {
                     "phase": "scaffold",
