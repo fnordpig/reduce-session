@@ -619,11 +619,46 @@ class ReduceModal(ModalScreen[bool]):
                         text.append(spark_chars[idx], style=Style(color=color))
                 text.append("\n")
 
-            # Legend
-            text.append("  ", style="dim")
-            text.append("\u2588 KEEP ", style=Style(color="#00d4aa"))
-            text.append("\u2588 DISTILL ", style=Style(color="#ff8c00"))
-            text.append("\u2588 HEURISTIC", style=Style(color="#ffd700"))
+            # Color grid legend — 3 columns by route group
+            _keep = [
+                ("INSTRUCTION", "instr"),
+                ("CLARIFICATION", "clarif"),
+                ("CONFIRMATION", "confm"),
+                ("INQUIRY", "inqry"),
+                ("DECISION", "decsn"),
+                ("FEEDBACK", "fdbck"),
+            ]
+            _distill = [
+                ("EXPLANATION", "expl"),
+                ("IMPLEMENTATION", "impl"),
+                ("REASONING", "reason"),
+                ("DEBUGGING", "debug"),
+                ("METRICS", "metrcs"),
+                ("COMPILATION", "compil"),
+                ("PLANNING", "plan"),
+                ("TESTING", "test"),
+                ("GIT_OPERATION", "git"),
+                ("ANALYSIS", "analys"),
+            ]
+            _heur = [
+                ("STATUS_UPDATE", "status"),
+                ("NOTIFICATION", "notif"),
+                ("LOG_OUTPUT", "log"),
+                ("SCAFFOLDING", "scaff"),
+                ("ERROR_OUTPUT", "error"),
+            ]
+            max_rows = max(len(_keep), len(_distill), len(_heur))
+            for row in range(max_rows):
+                for col_types in [_keep, _distill, _heur]:
+                    if row < len(col_types):
+                        cat_key, label = col_types[row]
+                        r, g, b = self._CAT_COLORS[cat_key]
+                        color = f"#{r:02x}{g:02x}{b:02x}"
+                        text.append("\u2588", style=Style(color=color))
+                        text.append(f"{label:<9s}", style="dim")
+                    else:
+                        text.append("          ")
+                text.append("\n")
 
         else:
             # Phase 2: distill/scaffold — accumulation sparkline
