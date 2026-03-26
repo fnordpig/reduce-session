@@ -1212,6 +1212,9 @@ def trim_toolUseResult(tur, aggr, agg_lim, gen_lim):
     if not isinstance(tur, dict):
         return
     bl = lambda k: blended_limit(k, aggr, agg_lim, gen_lim)
+    # structural_compress all string fields, then truncate
+    if isinstance(tur.get("originalFile"), str):
+        tur["originalFile"] = structural_compress(tur["originalFile"], aggr)
     trim_string(tur, "originalFile", bl("tur.originalFile"), "tur.originalFile")
     if isinstance(tur.get("stdout"), str):
         tur["stdout"] = clean_bash_text(tur["stdout"])
@@ -1220,7 +1223,11 @@ def trim_toolUseResult(tur, aggr, agg_lim, gen_lim):
     if isinstance(tur.get("content"), str):
         tur["content"] = structural_compress(tur["content"], aggr)
     trim_string(tur, "content", bl("tur.content"), "tur.content")
+    if isinstance(tur.get("oldString"), str):
+        tur["oldString"] = structural_compress(tur["oldString"], aggr)
     trim_string(tur, "oldString", bl("tur.oldString"), "tur.oldString")
+    if isinstance(tur.get("newString"), str):
+        tur["newString"] = structural_compress(tur["newString"], aggr)
     trim_string(tur, "newString", bl("tur.newString"), "tur.newString")
     sp = tur.get("structuredPatch")
     if isinstance(sp, list):
@@ -1234,9 +1241,15 @@ def trim_toolUseResult(tur, aggr, agg_lim, gen_lim):
     file_val = tur.get("file")
     fl = bl("tur.file")
     if isinstance(file_val, dict):
+        if isinstance(file_val.get("content"), str):
+            file_val["content"] = structural_compress(file_val["content"], aggr)
         trim_string(file_val, "content", fl, "tur.file.content")
-    elif isinstance(file_val, str) and len(file_val) > fl:
-        tur["file"] = truncate(file_val, fl, "tur.file")
+    elif isinstance(file_val, str):
+        tur["file"] = structural_compress(file_val, aggr)
+        if len(tur["file"]) > fl:
+            tur["file"] = truncate(tur["file"], fl, "tur.file")
+    if isinstance(tur.get("prompt"), str):
+        tur["prompt"] = structural_compress(tur["prompt"], aggr)
     if isinstance(tur.get("content"), str) and "prompt" in tur:
         trim_string(tur, "content", bl("Agent"), "tur.agent.content")
         trim_string(tur, "prompt", bl("tool_input.Agent"), "tur.agent.prompt")
@@ -1835,6 +1848,13 @@ def reduce_session(
                             block["content"] = f"[duplicate content: {preview}...]"
                         count("duplicate_blocks_deduped")
 
+        # -- System messages --
+        elif t == "system":
+            msg = obj.get("message", {})
+            content = msg.get("content", "")
+            if isinstance(content, str) and content:
+                msg["content"] = structural_compress(content, aggr)
+
         # -- Assistant messages --
         elif t == "assistant":
             msg = obj.get("message", {})
@@ -1863,11 +1883,14 @@ def reduce_session(
                             count("thinking_removed")
                             continue
                         block = dict(block)
+                        thinking = structural_compress(thinking, aggr)
                         if len(thinking) > think_limit:
                             block["thinking"] = truncate(
                                 thinking, think_limit, "thinking"
                             )
                             count("thinking_truncated")
+                        else:
+                            block["thinking"] = thinking
                         new_content.append(block)
                         continue
 
