@@ -141,7 +141,7 @@ ReduceModal {
 }
 
 #heuristic-panel {
-    width: 55%;
+    width: 35%;
     height: 1fr;
     padding: 0 1 0 0;
     border-right: tall $primary-background-lighten-2;
@@ -149,7 +149,7 @@ ReduceModal {
 }
 
 #llm-panel {
-    width: 45%;
+    width: 65%;
     height: 1fr;
     padding: 0 0 0 1;
     overflow-y: auto;
