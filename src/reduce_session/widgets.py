@@ -350,7 +350,12 @@ class ReduceModal(ModalScreen[bool]):
         self._llm_worker: Worker | None = None
         self._classify_results: list[tuple] = []  # (category_str, text_size)
         self._savings_history: list[int] = []  # chars_saved per distill/scaffold tick
-        self._distill_reductions: list[float] = []  # per-exchange reduction ratio (0-1)
+        self._distill_reductions: list[
+            float
+        ] = []  # per-DISTILL-exchange reduction ratio
+        self._scaffold_reductions: list[
+            float
+        ] = []  # per-non-DISTILL-exchange reduction ratio
         self._phase_start_time: float = 0.0  # monotonic time when current phase started
         self._last_phase: str = ""  # track phase transitions for ETA reset
         self._chars_per_token: float = 3.7  # calibrated from API usage when available
@@ -470,6 +475,7 @@ class ReduceModal(ModalScreen[bool]):
         self._classify_results = []
         self._savings_history = []
         self._distill_reductions = []
+        self._scaffold_reductions = []
         path = str(self.session.path)
 
         def progress_fn(data):
@@ -729,7 +735,9 @@ class ReduceModal(ModalScreen[bool]):
         else:
             # Phase 2: distill/scaffold — sparkline aligned to classification positions
             reduction_ratio = data.get("reduction_ratio", 0.0)
-            self._distill_reductions.append(reduction_ratio)
+            if phase == "distill":
+                self._distill_reductions.append(reduction_ratio)
+            # scaffold reductions tracked separately inside the sparkline builder
             self._savings_history.append(chars_saved)
 
             phase_label = "Distilling" if phase == "distill" else "De-scaffolding"
@@ -742,26 +750,35 @@ class ReduceModal(ModalScreen[bool]):
             text.append("\n")
 
             # Map reductions back to classification positions
-            # Only DISTILL-classified positions get bars; rest are dim
+            # DISTILL positions get distill ratios, non-DISTILL get scaffold ratios
             results = self._classify_results
             total_ex = len(results) if results else 1
-            reductions = self._distill_reductions
 
             from reduce_session.llm.base import ROUTING_MAP, Route, Category
 
             distill_indices = []
+            non_distill_indices = []
             for ri, (cat_str, _) in enumerate(results):
                 try:
                     if ROUTING_MAP.get(Category(cat_str)) == Route.DISTILL:
                         distill_indices.append(ri)
+                    else:
+                        non_distill_indices.append(ri)
                 except (ValueError, KeyError):
-                    pass
+                    non_distill_indices.append(ri)
 
             # Map each reduction to its classification position
             pos_ratio = {}
-            for di, rv in enumerate(reductions):
+            for di, rv in enumerate(self._distill_reductions):
                 if di < len(distill_indices):
                     pos_ratio[distill_indices[di]] = rv
+            # Scaffold reductions fill non-DISTILL positions
+            if phase == "scaffold":
+                reduction_ratio = data.get("reduction_ratio", 0.0)
+                self._scaffold_reductions.append(reduction_ratio)
+            for si, rv in enumerate(self._scaffold_reductions):
+                if si < len(non_distill_indices):
+                    pos_ratio[non_distill_indices[si]] = rv
 
             bucket_size = max(total_ex / distill_width, 1)
             for bi in range(distill_width):

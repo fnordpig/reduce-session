@@ -1899,12 +1899,15 @@ async def _llm_compression_pass(
     strip_chars_saved = 0
     for idx, (pos, obj, text) in enumerate(strip_candidates, 1):
         original_len = len(text)
+        reduction_ratio = 0.0
         stripped = await provider.distill(text, mode="strip_scaffold", profile=profile)
         if stripped and len(stripped) < original_len:
             _replace_assistant_text(kept_objs[pos], stripped)
             stamp_reduce_tag(kept_objs[pos], scaffold_stripped=True)
             strip_count += 1
-            strip_chars_saved += original_len - len(stripped)
+            saved = original_len - len(stripped)
+            strip_chars_saved += saved
+            reduction_ratio = saved / original_len
         if progress_callback:
             total_saved = distill_chars + strip_chars_saved
             ratio = total_saved * 100 // max(total_strip_chars + 1, 1)
@@ -1915,6 +1918,7 @@ async def _llm_compression_pass(
                     "total": len(strip_candidates),
                     "chars_saved": total_saved,
                     "ratio": ratio,
+                    "reduction_ratio": reduction_ratio,
                 }
             )
 
