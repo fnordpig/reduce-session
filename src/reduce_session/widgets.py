@@ -700,17 +700,37 @@ class ReduceModal(ModalScreen[bool]):
                 ("SCAFFOLDING", "scaff"),
             ]
 
-            # Compute percentages if classification is complete
+            # Compute percentages and route totals if classification is complete
             type_pcts = {}
+            route_pcts = {}
             if pct >= 100 and results:
                 from collections import Counter
 
                 type_chars = Counter()
+                route_counts = Counter()
                 for cat_str, size in results:
                     type_chars[cat_str] += size
+                    try:
+                        from reduce_session.llm.base import ROUTING_MAP, Route, Category
+
+                        route = ROUTING_MAP.get(Category(cat_str), Route.HEURISTIC)
+                        route_counts[route.value] += 1
+                    except (ValueError, KeyError):
+                        route_counts["HEURISTIC"] += 1
                 total_chars = sum(type_chars.values()) or 1
+                total_count = sum(route_counts.values()) or 1
                 for cat_str, chars in type_chars.items():
                     type_pcts[cat_str] = chars * 100 // total_chars
+                for rv, cnt in route_counts.items():
+                    route_pcts[rv] = cnt * 100 // total_count
+
+            # Column headers with route totals
+            keep_hdr = f"KEEP {route_pcts.get('KEEP', '')}{'%' if 'KEEP' in route_pcts else ''}"
+            dist_hdr = f"DISTILL {route_pcts.get('DISTILL', '')}{'%' if 'DISTILL' in route_pcts else ''}"
+            heur_hdr = f"HEURISTIC {route_pcts.get('HEURISTIC', '')}{'%' if 'HEURISTIC' in route_pcts else ''}"
+            text.append(f"{keep_hdr:<12s}", style=Style(color="#5097e0"))
+            text.append(f"{dist_hdr:<12s}", style=Style(color="#90c830"))
+            text.append(f"{heur_hdr:<12s}\n", style=Style(color="#d85040"))
 
             max_rows = max(len(_keep), len(_distill), len(_heur))
             for row in range(max_rows):
@@ -830,34 +850,19 @@ class ReduceModal(ModalScreen[bool]):
             Text("Complete", style="bold #00d4aa")
         )
 
-        classified = llm_stats.get("llm_classified", 0)
-        keep_n = llm_stats.get("llm_classified_keep", 0)
-        distill_n = llm_stats.get("llm_classified_distill", 0)
-        heur_n = llm_stats.get("llm_classified_heuristic", 0)
         distilled = llm_stats.get("llm_distilled", 0)
         stripped = llm_stats.get("llm_scaffold_stripped", 0)
+        tool_distilled = llm_stats.get("llm_tool_results_distilled", 0)
         chars = llm_stats.get("llm_chars_saved", 0)
 
         text = Text()
-        text.append("Classification:\n", style="bold")
-        if classified:
-            text.append(f"  {classified} exchanges analyzed\n")
-            text.append(
-                f"  KEEP       {keep_n:>5} ({keep_n * 100 // max(classified, 1)}%)\n",
-                style="#00d4aa",
-            )
-            text.append(
-                f"  DISTILL    {distill_n:>5} ({distill_n * 100 // max(classified, 1)}%)\n",
-                style="#ff8c00",
-            )
-            text.append(
-                f"  HEURISTIC  {heur_n:>5} ({heur_n * 100 // max(classified, 1)}%)\n",
-                style="#ffd700",
-            )
-
-        text.append("\nDistillation:\n", style="bold")
-        text.append(f"  {distilled} exchanges summarized\n")
-        text.append(f"  {stripped} text blocks de-scaffolded\n")
+        text.append("LLM Results:\n", style="bold")
+        if distilled:
+            text.append(f"  {distilled} exchanges distilled\n")
+        if tool_distilled:
+            text.append(f"  {tool_distilled} tool results distilled\n")
+        if stripped:
+            text.append(f"  {stripped} blocks de-scaffolded\n")
 
         if chars:
             tokens = self._chars_to_tokens(chars)
