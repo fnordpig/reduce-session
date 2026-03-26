@@ -1185,6 +1185,58 @@ def detect_superseded_edits(kept_objs):
     return results
 
 
+def collapse_edit_sequences(kept_objs, aggr_fn):
+    """Collapse consecutive edits to the same file in the middle zone.
+
+    For files with 3+ edits where aggr > 0.3, keep only the last Edit's
+    full content. Replace earlier Edits' old_string/new_string with a
+    one-line summary.
+    """
+    total = len(kept_objs)
+    file_edits = {}  # file_path -> [(pos, block_index)]
+
+    for pos, obj in enumerate(kept_objs):
+        position = pos / max(total - 1, 1)
+        aggr = aggr_fn(position)
+        if aggr <= 0.3:
+            continue
+        if get_msg_type(obj) != "assistant":
+            continue
+        for bi, block in enumerate(get_content_blocks(obj)):
+            if block.get("type") == "tool_use" and block.get("name") in (
+                "Edit",
+                "edit",
+            ):
+                inp = block.get("input", {})
+                if isinstance(inp, dict):
+                    fp = inp.get("file_path", "")
+                    if fp:
+                        file_edits.setdefault(fp, []).append((pos, bi))
+
+    collapsed = 0
+    for fp, edits in file_edits.items():
+        if len(edits) < 3:
+            continue
+        edits.sort(key=lambda x: x[0])
+        # Collapse all but the last
+        for pos, bi in edits[:-1]:
+            blocks = get_content_blocks(kept_objs[pos])
+            if bi < len(blocks):
+                block = blocks[bi]
+                inp = block.get("input", {})
+                if isinstance(inp, dict):
+                    old_len = len(inp.get("old_string", ""))
+                    new_len = len(inp.get("new_string", ""))
+                    if old_len + new_len > 100:
+                        inp["old_string"] = ""
+                        inp["new_string"] = (
+                            f"[collapsed: ~{old_len + new_len} chars, see later edit]"
+                        )
+                        collapsed += 1
+
+    return {"edit_sequences_collapsed": collapsed} if collapsed else {}
+
+
 def fix_orphaned_tool_results(kept_objs):
     use_ids = set()
     for obj in kept_objs:
@@ -1813,6 +1865,10 @@ def reduce_session(
         stats["stale_reads_promoted"] = sem_stale_reads
     if sem_superseded:
         stats["superseded_edits_summarized"] = sem_superseded
+
+    # -- Pass 3.55: Collapse edit sequences --
+    edit_collapse_stats = collapse_edit_sequences(kept_objs, aggr_fn)
+    stats.update(edit_collapse_stats)
 
     # -- Pass 3.6 + 3.7: LLM compression (optional) --
     if llm_provider is not None:

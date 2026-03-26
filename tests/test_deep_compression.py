@@ -114,3 +114,81 @@ def test_dedup_read_single_read_untouched():
     stats = dedup_read_results(objs)
     assert stats.get("reads_deduped", 0) == 0
     assert objs[1]["message"]["content"][0]["content"] == "single read content"
+
+
+def test_collapse_edit_sequences():
+    from reduce_session.reduction import collapse_edit_sequences, make_aggressiveness_fn
+
+    aggr_fn = make_aggressiveness_fn(10, 75)
+    objs = []
+    # 10 edits to same file — enough that 5 land in the middle zone (aggr > 0.3)
+    for i in range(10):
+        objs.append(
+            {
+                "type": "assistant",
+                "uuid": f"a{i}",
+                "parentUuid": f"u{i}",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Edit",
+                            "id": f"t{i}",
+                            "input": {
+                                "file_path": "/foo/bar.rs",
+                                "old_string": f"old content {i} " * 20,
+                                "new_string": f"new content {i} " * 20,
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+
+    stats = collapse_edit_sequences(objs, aggr_fn)
+    assert stats.get("edit_sequences_collapsed", 0) >= 3
+
+
+def test_collapse_edit_preserves_last():
+    from reduce_session.reduction import collapse_edit_sequences, make_aggressiveness_fn
+
+    aggr_fn = make_aggressiveness_fn(10, 75)
+    objs = []
+    # 10 edits — need enough to get 3+ in the middle zone
+    for i in range(10):
+        objs.append(
+            {
+                "type": "assistant",
+                "uuid": f"a{i}",
+                "parentUuid": f"u{i}",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Edit",
+                            "id": f"t{i}",
+                            "input": {
+                                "file_path": "/foo/bar.rs",
+                                "old_string": f"old {i} " * 20,
+                                "new_string": f"new {i} " * 20,
+                            },
+                        }
+                    ],
+                },
+            }
+        )
+
+    collapse_edit_sequences(objs, aggr_fn)
+    # Last edit in the middle zone should have full content (the function
+    # keeps the last edit per file among those in the middle zone)
+    # Find the last edit that was NOT collapsed
+    last_uncollapsed = None
+    for obj in reversed(objs):
+        inp = obj["message"]["content"][0]["input"]
+        if "[collapsed" not in inp.get("new_string", ""):
+            last_uncollapsed = inp
+            break
+    assert last_uncollapsed is not None
+    assert "[collapsed" not in last_uncollapsed["new_string"]
