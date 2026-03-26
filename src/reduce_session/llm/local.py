@@ -179,16 +179,27 @@ class LocalProvider:
         response = await self._generate("classifier", CLASSIFY_SYSTEM, user_prompt)
         return parse_classify_response(response, len(exchanges))
 
-    async def distill(self, text: str, mode: str, category: str | None = None, profile: str = "standard") -> str:
+    async def distill(
+        self,
+        text: str,
+        mode: str,
+        category: str | None = None,
+        profile: str = "standard",
+    ) -> str:
         """Distill text, returning original if output is empty or longer."""
-        if mode == "summarize":
-            system = DISTILL_SUMMARIZE_SYSTEM
-        elif mode == "strip_scaffold":
-            system = DISTILL_STRIP_SYSTEM
-        else:
-            system = DISTILL_SUMMARIZE_SYSTEM
+        from reduce_session.llm.prompts import get_distill_prompts
 
-        user_prompt = format_distill_prompt(text, mode, category=category, profile=profile)
+        prompts = get_distill_prompts(profile)
+        if mode == "summarize":
+            system = prompts["summarize_system"]
+        elif mode == "strip_scaffold":
+            system = prompts["strip_system"]
+        else:
+            system = prompts["summarize_system"]
+
+        user_prompt = format_distill_prompt(
+            text, mode, category=category, profile=profile
+        )
         result = await self._generate("distiller", system, user_prompt)
 
         # Reject empty or longer-than-original output

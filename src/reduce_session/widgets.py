@@ -501,7 +501,11 @@ class ReduceModal(ModalScreen[bool]):
 
             llm_stats = asyncio.run(
                 _llm_compression_pass(
-                    kept_objs, aggr_fn, provider, progress_callback=progress_fn
+                    kept_objs,
+                    aggr_fn,
+                    provider,
+                    progress_callback=progress_fn,
+                    profile=self.current_profile,
                 )
             )
 
