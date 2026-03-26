@@ -18,24 +18,66 @@ from dataclasses import dataclass, field
 PROFILES = {
     "aggressive": {
         "aggressive": {
-            "Bash": 1000,
-            "Read": 1000,
-            "Agent": 2000,
-            "Write": 500,
+            "Bash": 400,
+            "Read": 400,
+            "Agent": 500,
+            "Write": 400,
+            "Edit": 300,
+            "mcp": 800,
+            "default": 400,
+            "tur.originalFile": 100,
+            "tur.stdout": 400,
+            "tur.content": 400,
+            "tur.oldString": 200,
+            "tur.newString": 200,
+            "tur.file": 400,
+            "tool_input.Write": 200,
+            "tool_input.Edit": 200,
+            "tool_input.Agent": 300,
+            "thinking": 0,
+            "user_text": 800,
+        },
+        "gentle": {
+            "Bash": 3000,
+            "Read": 4000,
+            "Agent": 6000,
+            "Write": 2000,
+            "Edit": 1500,
+            "mcp": 6000,
+            "default": 3000,
+            "tur.originalFile": 400,
+            "tur.stdout": 3000,
+            "tur.content": 2000,
+            "tur.oldString": 1500,
+            "tur.newString": 1500,
+            "tur.file": 2000,
+            "tool_input.Write": 2000,
+            "tool_input.Edit": 1500,
+            "tool_input.Agent": 3000,
+            "thinking": 2000,
+            "user_text": 6000,
+        },
+    },
+    "standard": {
+        "aggressive": {
+            "Bash": 800,
+            "Read": 800,
+            "Agent": 1000,
+            "Write": 600,
             "Edit": 500,
             "mcp": 2000,
-            "default": 1000,
-            "tur.originalFile": 100,
-            "tur.stdout": 1000,
-            "tur.content": 500,
+            "default": 800,
+            "tur.originalFile": 200,
+            "tur.stdout": 800,
+            "tur.content": 600,
             "tur.oldString": 500,
             "tur.newString": 500,
-            "tur.file": 500,
-            "tool_input.Write": 500,
+            "tur.file": 600,
+            "tool_input.Write": 600,
             "tool_input.Edit": 500,
-            "tool_input.Agent": 1000,
+            "tool_input.Agent": 800,
             "thinking": 0,
-            "user_text": 1000,
+            "user_text": 1500,
         },
         "gentle": {
             "Bash": 4000,
@@ -43,9 +85,9 @@ PROFILES = {
             "Agent": 8000,
             "Write": 3000,
             "Edit": 2000,
-            "mcp": 8000,
-            "default": 4000,
-            "tur.originalFile": 500,
+            "mcp": 10000,
+            "default": 6000,
+            "tur.originalFile": 800,
             "tur.stdout": 4000,
             "tur.content": 3000,
             "tur.oldString": 2000,
@@ -54,50 +96,8 @@ PROFILES = {
             "tool_input.Write": 3000,
             "tool_input.Edit": 2000,
             "tool_input.Agent": 4000,
-            "thinking": 2000,
-            "user_text": 6000,
-        },
-    },
-    "standard": {
-        "aggressive": {
-            "Bash": 1500,
-            "Read": 2000,
-            "Agent": 3000,
-            "Write": 1000,
-            "Edit": 800,
-            "mcp": 4000,
-            "default": 2000,
-            "tur.originalFile": 200,
-            "tur.stdout": 1500,
-            "tur.content": 1000,
-            "tur.oldString": 800,
-            "tur.newString": 800,
-            "tur.file": 1000,
-            "tool_input.Write": 1000,
-            "tool_input.Edit": 800,
-            "tool_input.Agent": 1500,
-            "thinking": 0,
-            "user_text": 2000,
-        },
-        "gentle": {
-            "Bash": 6000,
-            "Read": 8000,
-            "Agent": 12000,
-            "Write": 4000,
-            "Edit": 3000,
-            "mcp": 16000,
-            "default": 8000,
-            "tur.originalFile": 1000,
-            "tur.stdout": 6000,
-            "tur.content": 4000,
-            "tur.oldString": 3000,
-            "tur.newString": 3000,
-            "tur.file": 4000,
-            "tool_input.Write": 4000,
-            "tool_input.Edit": 3000,
-            "tool_input.Agent": 6000,
-            "thinking": 4000,
-            "user_text": 10000,
+            "thinking": 3000,
+            "user_text": 8000,
         },
     },
     "gentle": {
@@ -911,6 +911,64 @@ def detect_constant_envelope_fields(kept_objs):
     return {f for f, vals in field_values.items() if len(vals) == 1}
 
 
+def dedup_read_results(kept_objs):
+    """If the same file was Read multiple times, keep only the last Read's content.
+
+    Earlier Reads get replaced with [Read: path - N lines, superseded by later read].
+    """
+    # Map: tool_use_id -> (file_path, position)
+    read_uses = {}
+    for pos, obj in enumerate(kept_objs):
+        for block in get_content_blocks(obj):
+            if block.get("type") == "tool_use" and block.get("name") in (
+                "Read",
+                "read",
+            ):
+                inp = block.get("input", {})
+                if isinstance(inp, dict):
+                    fp = inp.get("file_path", "")
+                    tid = block.get("id", "")
+                    if fp and tid:
+                        read_uses[tid] = (fp, pos)
+
+    # Group by file_path
+    file_reads = {}  # fp -> [(tool_id, pos)]
+    for tid, (fp, pos) in read_uses.items():
+        file_reads.setdefault(fp, []).append((tid, pos))
+
+    # For files read multiple times, mark all but last as superseded
+    superseded_ids = set()
+    for fp, reads in file_reads.items():
+        if len(reads) < 2:
+            continue
+        reads.sort(key=lambda x: x[1])
+        for tid, pos in reads[:-1]:
+            superseded_ids.add(tid)
+
+    # Replace superseded Read results
+    deduped = 0
+    for obj in kept_objs:
+        if get_msg_type(obj) != "user":
+            continue
+        content = obj.get("message", {}).get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tid = block.get("tool_use_id", "")
+            if tid in superseded_ids:
+                fp = read_uses.get(tid, ("?", 0))[0]
+                inner = block.get("content", "")
+                line_count = inner.count("\n") + 1 if isinstance(inner, str) else 0
+                block["content"] = (
+                    f"[Read: {_strip_non_ascii(fp)} - {line_count} lines, superseded by later read]"
+                )
+                deduped += 1
+
+    return {"reads_deduped": deduped} if deduped else {}
+
+
 # --- Semantic elision (heuristic, no LLM) ---
 
 CONFIRMATIONS = {
@@ -1680,6 +1738,10 @@ def reduce_session(
                 obj["parentUuid"] = parent
             new_kept.append(obj)
         kept_objs = new_kept
+
+    # -- Read result deduplication --
+    read_dedup_stats = dedup_read_results(kept_objs)
+    stats.update(read_dedup_stats)
 
     # -- Pass 3.5: Semantic elision (safe heuristics) --
     passing_builds = detect_passing_builds(kept_objs)
