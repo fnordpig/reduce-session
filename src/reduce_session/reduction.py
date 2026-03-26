@@ -1095,7 +1095,9 @@ def detect_stale_read_results(kept_objs):
                     )
                 else:
                     line_count = 0
-                results[pos] = f"[Read: {fp} - {line_count} lines, not modified]"
+                results[pos] = (
+                    f"[Read: {_strip_non_ascii(fp)} - {line_count} lines, not modified]"
+                )
     return results
 
 
@@ -1121,7 +1123,7 @@ def detect_superseded_edits(kept_objs):
             continue
         edits.sort(key=lambda x: x[0])
         for pos, bi in edits[:-1]:
-            results[pos] = f"[Edit: {fp} - superseded by later edit]"
+            results[pos] = f"[Edit: {_strip_non_ascii(fp)} - superseded by later edit]"
     return results
 
 
@@ -1837,7 +1839,7 @@ def reduce_session(
 
                     if (pos, bi) in duplicate_blocks:
                         text = text_of(block)
-                        preview = text[:60].replace("\n", " ")
+                        preview = _strip_non_ascii(text[:60].replace("\n", " "))
                         if bt == "text":
                             block["text"] = (
                                 f"[duplicate content, first seen earlier: {preview}...]"
@@ -1928,7 +1930,7 @@ def reduce_session(
 
                     if (pos, bi) in duplicate_blocks:
                         text = text_of(block)
-                        preview = text[:60].replace("\n", " ")
+                        preview = _strip_non_ascii(text[:60].replace("\n", " "))
                         if bt == "text":
                             block = dict(block)
                             block["text"] = f"[duplicate content: {preview}...]"
