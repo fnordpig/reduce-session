@@ -147,6 +147,45 @@ PROFILES = {
 ENVELOPE_FIELDS = {"cwd", "version", "gitBranch", "slug", "userType"}
 CHARS_PER_TOKEN = 3.7
 
+# Reduction metadata tag — persisted in JSONL objects to track what
+# processing has been applied. Subsequent passes skip already-processed content.
+_REDUCE_TAG_VERSION = 1
+
+
+def get_reduce_tag(obj):
+    """Get the _reduce metadata tag from an object, or None."""
+    tag = obj.get("_reduce")
+    return tag if isinstance(tag, dict) else None
+
+
+def was_processed(obj, key, profile=None):
+    """Check if an object was already processed with the given key at the given profile level."""
+    tag = get_reduce_tag(obj)
+    if not tag:
+        return False
+    if tag.get("v") != _REDUCE_TAG_VERSION:
+        return False  # different version, reprocess
+    if not tag.get(key):
+        return False
+    # If profile is specified, check if it was at least as aggressive
+    if profile:
+        _profile_rank = {"gentle": 0, "standard": 1, "aggressive": 2}
+        prev = tag.get("profile", "")
+        if _profile_rank.get(prev, -1) >= _profile_rank.get(profile, 0):
+            return True  # already processed at same or higher aggressiveness
+        return False
+    return True
+
+
+def stamp_reduce_tag(obj, **kwargs):
+    """Add or update the _reduce metadata tag on an object."""
+    tag = obj.get("_reduce", {})
+    if not isinstance(tag, dict):
+        tag = {}
+    tag["v"] = _REDUCE_TAG_VERSION
+    tag.update(kwargs)
+    obj["_reduce"] = tag
+
 
 # --- Gradient functions ---
 
@@ -1589,7 +1628,9 @@ async def _llm_compression_pass(
     total = len(kept_objs)
 
     # Identify middle-zone exchanges (aggr > 0.2)
+    # Skip messages that were already LLM-processed at the same or higher aggressiveness
     middle = []
+    reused_classifications = 0
     for pos, obj in enumerate(kept_objs):
         position = pos / max(total - 1, 1)
         aggr = aggr_fn(position)
@@ -1600,9 +1641,31 @@ async def _llm_compression_pass(
         return stats
 
     # Phase 1: Batched classification with async distillation overlap
+    # Reuse cached classifications from _reduce tags where available
     classifications = {}  # pos -> Category
+    needs_classification = []  # (pos, obj, aggr) for items needing LLM classification
+    from reduce_session.llm.base import Category as _Cat
+
+    for pos, obj, aggr in middle:
+        tag = get_reduce_tag(obj)
+        if tag and tag.get("v") == _REDUCE_TAG_VERSION and tag.get("cls"):
+            _profile_rank = {"gentle": 0, "standard": 1, "aggressive": 2}
+            prev_profile = tag.get("profile", "")
+            if _profile_rank.get(prev_profile, -1) >= _profile_rank.get(profile, 0):
+                # Already classified at same or higher aggressiveness — reuse
+                try:
+                    classifications[pos] = _Cat(tag["cls"])
+                    reused_classifications += 1
+                    continue
+                except (ValueError, KeyError):
+                    pass  # invalid cached classification, re-classify
+        needs_classification.append((pos, obj, aggr))
+
+    if reused_classifications:
+        stats["llm_classifications_reused"] = reused_classifications
+
     distill_queue = asyncio.Queue()
-    batches = list(_batched(middle, 20))
+    batches = list(_batched(needs_classification, 20)) if needs_classification else []
     total_batches = len(batches)
 
     # Pre-compute exchange text sizes for sparkline rendering
@@ -1620,8 +1683,17 @@ async def _llm_compression_pass(
             categories = await provider.classify(exchange_texts)
             for i, ((pos, obj, aggr), cat) in enumerate(zip(batch, categories)):
                 classifications[pos] = cat
+                stamp_reduce_tag(
+                    obj,
+                    cls=cat.value,
+                    route=ROUTING_MAP.get(cat, Route.HEURISTIC).value,
+                    profile=profile,
+                )
                 route = ROUTING_MAP.get(cat, Route.HEURISTIC)
                 if route == Route.DISTILL:
+                    # Skip distillation if already distilled at same+ profile
+                    if was_processed(obj, "distilled", profile):
+                        continue
                     await distill_queue.put((pos, obj, cat))
                 # Find this exchange's index in the middle list
                 mid_idx = classified_so_far + i
@@ -1665,6 +1737,7 @@ async def _llm_compression_pass(
                 )
                 if summary and len(summary) < original_len:
                     _replace_assistant_text(kept_objs[pos], summary)
+                    stamp_reduce_tag(kept_objs[pos], distilled=True)
                     distill_count += 1
                     saved = original_len - len(summary)
                     chars_saved += saved
@@ -1775,6 +1848,8 @@ async def _llm_compression_pass(
     for pos, obj, aggr in middle:
         if pos in distilled_positions:
             continue  # already summarized in phase 1
+        if was_processed(obj, "scaffold_stripped", profile):
+            continue  # already stripped at same+ aggressiveness
         text = _extract_assistant_text(obj)
         if text and len(text) > 200:
             strip_candidates.append((pos, obj, text))
@@ -1787,6 +1862,7 @@ async def _llm_compression_pass(
         stripped = await provider.distill(text, mode="strip_scaffold", profile=profile)
         if stripped and len(stripped) < original_len:
             _replace_assistant_text(kept_objs[pos], stripped)
+            stamp_reduce_tag(kept_objs[pos], scaffold_stripped=True)
             strip_count += 1
             strip_chars_saved += original_len - len(stripped)
         if progress_callback:
@@ -2232,6 +2308,10 @@ def reduce_session(
         tur = obj.get("toolUseResult")
         if tur:
             trim_toolUseResult(tur, aggr, agg_lim, gen_lim)
+
+        # Stamp structural compression tag
+        if aggr > 0.2:
+            stamp_reduce_tag(obj, structural=True, profile=profile)
 
     # -- Pass 5: Orphan repair --
     kept_objs, orphan_count = fix_orphaned_tool_results(kept_objs)
