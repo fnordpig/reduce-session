@@ -352,6 +352,7 @@ class ReduceModal(ModalScreen[bool]):
         self._savings_history: list[int] = []  # chars_saved per distill/scaffold tick
         self._phase_start_time: float = 0.0  # monotonic time when current phase started
         self._last_phase: str = ""  # track phase transitions for ETA reset
+        self._chars_per_token: float = 3.7  # calibrated from API usage when available
 
     def compose(self) -> ComposeResult:
         title_suffix = " (dry-run)" if self.read_only else ""
@@ -542,6 +543,12 @@ class ReduceModal(ModalScreen[bool]):
         "SCAFFOLDING": (102, 102, 102),
         "ERROR_OUTPUT": (170, 60, 60),
     }
+
+    def _chars_to_tokens(self, chars: int) -> int:
+        """Convert character count to estimated token count."""
+        return (
+            int(chars / self._chars_per_token) if self._chars_per_token > 0 else chars
+        )
 
     def _blend_colors(self, items: list[tuple]) -> str:
         """Blend category colors weighted by text size. Returns hex color."""
@@ -736,8 +743,12 @@ class ReduceModal(ModalScreen[bool]):
             text.append("\n")
 
             if chars_saved:
+                tokens_saved = self._chars_to_tokens(chars_saved)
                 ratio = data.get("ratio", 0)
-                text.append(f"saved: {chars_saved:,} chars", style="#00d4aa bold")
+                text.append(
+                    f"saved: ~{_format_tokens(tokens_saved)} tokens",
+                    style="#00d4aa bold",
+                )
                 if ratio:
                     text.append(f" ({ratio}%)", style="dim")
 
@@ -783,8 +794,9 @@ class ReduceModal(ModalScreen[bool]):
         text.append(f"  {stripped} text blocks de-scaffolded\n")
 
         if chars:
-            text.append(f"\nChars saved: ", style="bold")
-            text.append(f"{chars:,}\n", style="#00d4aa bold")
+            tokens = self._chars_to_tokens(chars)
+            text.append(f"\nTokens saved: ", style="bold")
+            text.append(f"~{_format_tokens(tokens)}\n", style="#00d4aa bold")
 
         # Re-enable button
         try:
@@ -869,6 +881,7 @@ class ReduceModal(ModalScreen[bool]):
             # Calibrate if API data available
             if r.api_tokens and r.orig_budget._raw_chars > 0:
                 cpt = r.orig_budget._raw_chars / r.api_tokens
+                self._chars_per_token = cpt  # cache for LLM progress display
                 orig_tokens = int(r.orig_budget._raw_chars / cpt)
                 reduced_tokens = int(r.reduced_budget._raw_chars / cpt)
 
@@ -990,21 +1003,27 @@ class ReduceModal(ModalScreen[bool]):
                 if stripped:
                     strat_text.append(f"    scaffold stripped   {stripped:>6,}\n")
                 if llm_chars_saved:
-                    strat_text.append(f"    chars saved      ", style="dim")
-                    strat_text.append(f"{llm_chars_saved:>8,}\n", style="#00d4aa bold")
+                    llm_tokens = self._chars_to_tokens(llm_chars_saved)
+                    strat_text.append(f"    tokens saved     ", style="dim")
+                    strat_text.append(
+                        f"~{_format_tokens(llm_tokens):>7s}\n", style="#00d4aa bold"
+                    )
 
             if struct_stats:
                 strat_text.append(
                     "\n  Structural compression (middle-out):\n", style="bold dim"
                 )
-                # Show chars saved prominently
+                # Show tokens saved prominently
                 chars_saved = struct_stats.pop("chars_saved_structural", 0)
                 for name, count in sorted(struct_stats.items(), key=lambda x: -x[1]):
                     label = name.replace("_", " ")
                     strat_text.append(f"    {label:<33s} {count:>6,}\n")
                 if chars_saved:
-                    strat_text.append(f"    {'total chars saved':<33s} ", style="dim")
-                    strat_text.append(f"{chars_saved:>5,}\n", style="#00d4aa bold")
+                    tokens_saved = self._chars_to_tokens(chars_saved)
+                    strat_text.append(f"    {'tokens saved':<33s} ", style="dim")
+                    strat_text.append(
+                        f"~{_format_tokens(tokens_saved):>7s}\n", style="#00d4aa bold"
+                    )
         else:
             strat_text.append("  (no reductions applied)", style="dim")
         self.query_one("#strategies-grid", Static).update(strat_text)
