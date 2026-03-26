@@ -707,22 +707,21 @@ class ReduceModal(ModalScreen[bool]):
                 from collections import Counter
 
                 type_chars = Counter()
-                route_counts = Counter()
+                route_chars = Counter()
                 for cat_str, size in results:
                     type_chars[cat_str] += size
                     try:
                         from reduce_session.llm.base import ROUTING_MAP, Route, Category
 
                         route = ROUTING_MAP.get(Category(cat_str), Route.HEURISTIC)
-                        route_counts[route.value] += 1
+                        route_chars[route.value] += size
                     except (ValueError, KeyError):
-                        route_counts["HEURISTIC"] += 1
+                        route_chars["HEURISTIC"] += size
                 total_chars = sum(type_chars.values()) or 1
-                total_count = sum(route_counts.values()) or 1
                 for cat_str, chars in type_chars.items():
                     type_pcts[cat_str] = chars * 100 // total_chars
-                for rv, cnt in route_counts.items():
-                    route_pcts[rv] = cnt * 100 // total_count
+                for rv, chars in route_chars.items():
+                    route_pcts[rv] = chars * 100 // total_chars
 
             # Column headers with route totals
             keep_hdr = f"KEEP {route_pcts.get('KEEP', '')}{'%' if 'KEEP' in route_pcts else ''}"
