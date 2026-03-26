@@ -55,14 +55,42 @@ def create_provider(llm_spec: str) -> LLMProvider:
     elif provider_name == "anthropic":
         from .anthropic_provider import AnthropicProvider
 
-        return AnthropicProvider(model_spec or "claude-haiku-4-5-20251001")
+        # Map short aliases to full model IDs
+        _anthropic_aliases = {
+            "haiku": "claude-haiku-4-5-20251001",
+            "sonnet": "claude-sonnet-4-6-20250514",
+            "opus": "claude-opus-4-6-20250514",
+        }
+        model = (
+            _anthropic_aliases.get(model_spec, model_spec)
+            if model_spec
+            else "claude-haiku-4-5-20251001"
+        )
+        return AnthropicProvider(model)
     elif provider_name == "openai":
         from .openai_provider import OpenAIProvider
 
-        return OpenAIProvider(model_spec or "gpt-4o-mini")
+        _openai_aliases = {
+            "mini": "gpt-4o-mini",
+            "4o": "gpt-4o",
+            "o3": "o3-mini",
+        }
+        model = (
+            _openai_aliases.get(model_spec, model_spec) if model_spec else "gpt-4o-mini"
+        )
+        return OpenAIProvider(model)
     elif provider_name == "gemini":
         from .gemini_provider import GeminiProvider
 
-        return GeminiProvider(model_spec or "gemini-2.0-flash")
+        _gemini_aliases = {
+            "flash": "gemini-2.0-flash",
+            "pro": "gemini-2.5-pro",
+        }
+        model = (
+            _gemini_aliases.get(model_spec, model_spec)
+            if model_spec
+            else "gemini-2.0-flash"
+        )
+        return GeminiProvider(model)
     else:
         raise ValueError(f"Unknown LLM provider: {provider_name}")
