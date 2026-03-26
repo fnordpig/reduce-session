@@ -1670,14 +1670,55 @@ async def _llm_compression_pass(
 
     # Pre-compute exchange text sizes for sparkline rendering
     exchange_sizes = []
+
+    # Build initial classify_results from cached classifications for sparkline
+    cached_classify_results = []
+    for pos, obj, aggr in middle:
+        text = _extract_assistant_text(obj)
+        size = len(text) if text else 0
+        cat = classifications.get(pos)
+        if cat:
+            cached_classify_results.append((cat.value, size))
+        else:
+            cached_classify_results.append(
+                ("", size)
+            )  # placeholder for not-yet-classified
     for pos, obj, aggr in middle:
         text = _extract_assistant_text(obj)
         exchange_sizes.append(len(text) if text else 0)
 
     async def classify_worker():
-        classified_so_far = 0
-        # Running list of (category, text_size) for sparkline
-        classify_results = []
+        # Start with cached classifications for sparkline
+        classify_results = list(cached_classify_results)
+
+        # If everything is cached, emit immediately and populate distill queue
+        if not needs_classification:
+            for pos, obj, aggr in middle:
+                cat = classifications.get(pos)
+                if cat:
+                    route = ROUTING_MAP.get(cat, Route.HEURISTIC)
+                    if route == Route.DISTILL and not was_processed(
+                        obj, "distilled", profile
+                    ):
+                        await distill_queue.put((pos, obj, cat))
+            if progress_callback:
+                progress_callback(
+                    {
+                        "phase": "classify",
+                        "current": len(middle),
+                        "total": len(middle),
+                        "batch": 0,
+                        "total_batches": 0,
+                        "classifications": classify_results,
+                    }
+                )
+            await distill_queue.put(None)
+            return
+
+        # Build index: middle-list position -> index in classify_results
+        mid_pos_to_idx = {pos: idx for idx, (pos, _, _) in enumerate(middle)}
+
+        classified_so_far = reused_classifications
         for batch_num, batch in enumerate(batches, 1):
             exchange_texts = [_extract_exchange_text(obj) for _, obj, _ in batch]
             categories = await provider.classify(exchange_texts)
@@ -1691,14 +1732,13 @@ async def _llm_compression_pass(
                 )
                 route = ROUTING_MAP.get(cat, Route.HEURISTIC)
                 if route == Route.DISTILL:
-                    # Skip distillation if already distilled at same+ profile
                     if was_processed(obj, "distilled", profile):
                         continue
                     await distill_queue.put((pos, obj, cat))
-                # Find this exchange's index in the middle list
-                mid_idx = classified_so_far + i
-                size = exchange_sizes[mid_idx] if mid_idx < len(exchange_sizes) else 0
-                classify_results.append((cat.value, size))
+                # Update the classify_results at the correct position
+                idx = mid_pos_to_idx.get(pos)
+                if idx is not None and idx < len(classify_results):
+                    classify_results[idx] = (cat.value, classify_results[idx][1])
             classified_so_far += len(batch)
             if progress_callback:
                 progress_callback(
@@ -1708,7 +1748,7 @@ async def _llm_compression_pass(
                         "total": len(middle),
                         "batch": batch_num,
                         "total_batches": total_batches,
-                        "classifications": list(classify_results),
+                        "classifications": classify_results,
                     }
                 )
         await distill_queue.put(None)  # sentinel
