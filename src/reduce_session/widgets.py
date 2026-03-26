@@ -580,18 +580,21 @@ class ReduceModal(ModalScreen[bool]):
             self._phase_start_time = _time.monotonic()
             self._last_phase = phase
 
-        # Compute ETA once we have enough data (>= 3 ticks and >= 5s elapsed)
+        # Compute ETA and throughput once we have enough data
         elapsed = _time.monotonic() - self._phase_start_time
         eta_str = ""
-        if current > 2 and elapsed > 5 and current < total:
-            rate = current / elapsed  # items per second
-            remaining = (total - current) / rate
-            if remaining < 60:
-                eta_str = f"  ~{int(remaining)}s left"
-            elif remaining < 3600:
-                eta_str = f"  ~{int(remaining / 60)}m {int(remaining % 60)}s left"
-            else:
-                eta_str = f"  ~{int(remaining / 3600)}h left"
+        tps_str = ""
+        if current > 2 and elapsed > 3:
+            rate = current / elapsed
+            tps_str = f"  {rate:.1f}/s"
+            if current < total:
+                remaining = (total - current) / rate
+                if remaining < 60:
+                    eta_str = f"  ~{int(remaining)}s left"
+                elif remaining < 3600:
+                    eta_str = f"  ~{int(remaining / 60)}m {int(remaining % 60)}s left"
+                else:
+                    eta_str = f"  ~{int(remaining / 3600)}h left"
 
         spark_width = 35
         spark_chars = " \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
@@ -605,6 +608,8 @@ class ReduceModal(ModalScreen[bool]):
 
             text.append(f"Classifying ", style="bold")
             text.append(f"{current}/{total} ({pct}%)")
+            if tps_str:
+                text.append(tps_str, style="#00d4aa")
             if eta_str:
                 text.append(eta_str, style="dim")
             text.append("\n")
@@ -694,6 +699,8 @@ class ReduceModal(ModalScreen[bool]):
             phase_label = "Distilling" if phase == "distill" else "De-scaffolding"
             text.append(f"{phase_label} ", style="bold")
             text.append(f"{current}/{total} ({pct}%)")
+            if tps_str:
+                text.append(tps_str, style="#00d4aa")
             if eta_str:
                 text.append(eta_str, style="dim")
             text.append("\n")
