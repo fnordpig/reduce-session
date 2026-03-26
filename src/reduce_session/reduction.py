@@ -518,48 +518,8 @@ def minify_code(text: str) -> str:
     return "\n".join(out)
 
 
-# Unicode → ASCII replacement map for non-7bit stripping
-_UNICODE_TO_ASCII = str.maketrans(
-    {
-        "\u2192": "->",  # →
-        "\u2190": "<-",  # ←
-        "\u2194": "<->",  # ↔
-        "\u2014": "--",  # —
-        "\u2013": "-",  # –
-        "\u2018": "'",  # '
-        "\u2019": "'",  # '
-        "\u201c": '"',  # "
-        "\u201d": '"',  # "
-        "\u2026": "...",  # …
-        "\u00d7": "x",  # ×
-        "\u00b5": "u",  # µ
-        "\u2248": "~",  # ≈
-        "\u2713": "+",  # ✓
-        "\u2714": "+",  # ✔
-        "\u2705": "+",  # ✅
-        "\u274c": "x",  # ❌
-        "\u26a0": "!",  # ⚠
-        "\u21bb": "R",  # ↻
-        # Box drawing → ASCII
-        "\u2500": "-",  # ─
-        "\u2501": "=",  # ━
-        "\u2502": "|",  # │
-        "\u251c": "|-",  # ├
-        "\u2514": "+-",  # └
-        "\u2588": "#",  # █
-        "\u2591": ".",  # ░
-        "\u2593": "#",  # ▓
-        "\u2587": "#",  # ▇
-        "\u2585": "#",  # ▅
-    }
-)
-
-
 def _strip_non_ascii(text: str) -> str:
-    """Replace non-7bit characters with ASCII equivalents, drop the rest."""
-    # First pass: known replacements
-    text = text.translate(_UNICODE_TO_ASCII)
-    # Second pass: drop any remaining non-ASCII chars
+    """Drop all non-7bit characters. They're unnecessary entirely."""
     return text.encode("ascii", errors="ignore").decode("ascii")
 
 

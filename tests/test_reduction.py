@@ -216,22 +216,22 @@ def test_strip_non_ascii():
     text = "fn main() → Result ── Error │ path"
     result = _strip_non_ascii(text)
     assert "→" not in result
-    assert "->" in result
-    assert "──" not in result
-    assert "--" in result
     assert "│" not in result
-    assert "|" in result
-    # All chars should be 7-bit
+    assert "──" not in result
+    # All non-7bit chars dropped entirely
     assert all(ord(c) < 128 for c in result)
+    assert "fn main()" in result  # ASCII parts preserved
 
 
-def test_strip_non_ascii_smart_quotes():
+def test_strip_non_ascii_drops_smart_quotes():
     from reduce_session.reduction import _strip_non_ascii
 
     text = "\u201cHello\u201d and \u2018world\u2019"
     result = _strip_non_ascii(text)
-    assert '"Hello"' in result
-    assert "'world'" in result
+    # Smart quotes dropped, text preserved
+    assert "Hello" in result
+    assert "world" in result
+    assert all(ord(c) < 128 for c in result)
 
 
 def test_structural_compress_strips_non_ascii():
