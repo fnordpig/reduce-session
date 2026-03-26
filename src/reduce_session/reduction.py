@@ -1911,6 +1911,11 @@ def reduce_session(
                         new_content.append(block)
                         continue
 
+                    if bt == "text":
+                        text = block.get("text", "")
+                        if isinstance(text, str) and text:
+                            block["text"] = structural_compress(text, aggr)
+
                     if bt == "tool_use":
                         inp = block.get("input", {})
                         name = block.get("name", "")
