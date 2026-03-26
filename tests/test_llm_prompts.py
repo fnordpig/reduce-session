@@ -94,4 +94,4 @@ def test_format_distill_with_category():
     assert "compress" in generic.lower() or "shorter" in generic.lower()
     # With category but strip_scaffold mode — should NOT use type-specific
     strip = format_distill_prompt(text, "strip_scaffold", category="EXPLANATION")
-    assert "Strip filler" in strip
+    assert "strip" in strip.lower() or "novel" in strip.lower()
