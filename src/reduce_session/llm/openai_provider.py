@@ -48,11 +48,11 @@ class OpenAIProvider:
             response.choices[0].message.content, len(exchanges)
         )
 
-    async def distill(self, text: str, mode: str, category: str | None = None) -> str:
+    async def distill(self, text: str, mode: str, category: str | None = None, profile: str = "standard") -> str:
         system = (
             DISTILL_SUMMARIZE_SYSTEM if mode == "summarize" else DISTILL_STRIP_SYSTEM
         )
-        user_text = format_distill_prompt(text, mode, category=category)
+        user_text = format_distill_prompt(text, mode, category=category, profile=profile)
         response = await self._client.chat.completions.create(
             model=self._model,
             messages=[

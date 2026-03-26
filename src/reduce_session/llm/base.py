@@ -74,6 +74,10 @@ HEURISTIC_CATEGORIES = frozenset(
 class LLMProvider(Protocol):
     async def classify(self, exchanges: list[dict]) -> list[Category]: ...
     async def distill(
-        self, text: str, mode: str, category: str | None = None
+        self,
+        text: str,
+        mode: str,
+        category: str | None = None,
+        profile: str = "standard",
     ) -> str: ...
     async def shutdown(self) -> None: ...

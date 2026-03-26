@@ -35,7 +35,7 @@ class MockProvider:
                 result.append(Category.SCAFFOLDING)
         return result
 
-    async def distill(self, text, mode="summarize"):
+    async def distill(self, text, mode="summarize", category=None, profile="standard"):
         self.distill_calls += 1
         self.distill_modes.append(mode)
         return self.distill_fn(text, mode)

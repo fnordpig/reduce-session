@@ -38,72 +38,117 @@ Respond with ONLY a JSON array of category strings, one per exchange. \
 Example: ["INSTRUCTION", "SCAFFOLDING", "IMPLEMENTATION"]\
 """
 
-DISTILL_SUMMARIZE_SYSTEM = """\
-You are a ruthless text compressor. Your output MUST be at least 60% shorter than the input.
-KEEP ONLY: bare facts, decisions, numbers, error messages, file paths, constraints.
-DELETE ALL: "Let me", "I'll", "I see", "Looking at", "Based on", transitions, \
-preamble, hedging, restatements, pleasantries, meta-commentary, markdown formatting.
-Respond with ONLY the compressed text. No commentary. No "Here's the summary:". Just the compressed content.\
-"""
+# --- Profile-dependent distillation prompts ---
+# Each profile has a summarize system prompt, a scaffold strip system prompt,
+# and type-specific prompts. The profile name matches the --profile flag.
 
-DISTILL_STRIP_SYSTEM = """\
-You are a ruthless text compressor. Your output MUST be at least 50% shorter than the input.
-DELETE: every occurrence of "Let me", "I'll now", "I see that", "Looking at this", \
-"Based on what I see", "I notice", "It appears", "I think", "I believe", \
-all transitions ("First", "Next", "Then", "Also", "Additionally", "Furthermore"), \
-all hedging ("might", "could", "seems", "appears to"), \
-all meta-commentary ("Here's what I found:", "Let me explain:"), \
-all restating of what the user said.
-KEEP: every fact, number, file path, error message, decision, constraint, code reference.
-Output ONLY the stripped text. Nothing else.\
-"""
-
-DISTILL_TYPE_PROMPTS: dict[str, str] = {
-    "EXPLANATION": (
-        "Reduce to ONLY the conclusion. Delete the entire reasoning chain. "
-        "Output must be 1-2 sentences maximum. If the conclusion is "
-        "'Metal doesn't support FP64', output exactly that — not the "
-        "journey to that conclusion."
-    ),
-    "IMPLEMENTATION": (
-        "Output ONLY: which files changed and why, in 1-2 sentences. "
-        "Delete all code blocks, edit narratives, and tool call descriptions. "
-        "Example: 'Modified metal.rs: added FP16 BERT attention kernels.'"
-    ),
-    "REASONING": (
-        "Output ONLY the final recommendation or conclusion, in 1 sentence. "
-        "Delete all deliberation, pros/cons lists, and 'on the other hand'. "
-        "Example: 'Use batch_size=32 due to M2 16GB memory limit.'"
-    ),
-    "DEBUGGING": (
-        "Output ONLY: root cause + fix, in 1-2 sentences. "
-        "Delete all investigation steps, hypotheses, and 'let me check'. "
-        "Example: 'OOM at batch=64 on M2. Fixed: reduced to batch=32.'"
-    ),
-    "METRICS": (
-        "Output ONLY the numbers as a compact list. No narrative. "
-        "Example: 'BGE-small: 308/s, CodeRankEmbed: 105/s, ModernBERT: 118/s'"
-    ),
-    "COMPILATION": (
-        "Output ONLY: 'build ok' or the error message. One line. "
-        "Delete all 'Compiling', 'Downloading', 'Finished' lines."
-    ),
-    "PLANNING": (
-        "Output ONLY the decided action items as a numbered list. "
-        "Delete all brainstorming, rejected ideas, and deliberation."
-    ),
-    "TESTING": (
-        "Output ONLY: pass/fail counts and any failure messages. One line. "
-        "Example: '42 passed, 1 failed: test_metal_fp16 assertion error'"
-    ),
-    "GIT_OPERATION": (
-        "Output ONLY: 'committed: <message>' or 'pushed to <branch>'. One line."
-    ),
-    "ANALYSIS": (
-        "Output ONLY the key findings as 1-3 bullet points. "
-        "Delete methodology, verbose analysis, and caveats."
-    ),
+DISTILL_PROFILES: dict[str, dict] = {
+    "gentle": {
+        "summarize_system": (
+            "Condense this text while preserving its meaning and tone. "
+            "Target ~30% shorter. Keep the reasoning flow but tighten the language. "
+            "Remove obvious filler ('Let me', 'I think') but keep the author's voice. "
+            "Respond with ONLY the condensed text."
+        ),
+        "strip_system": (
+            "Lightly edit this text to remove filler phrases: "
+            "'Let me', 'I'll now', 'Looking at this', 'I notice that'. "
+            "Keep the overall structure and flow intact. "
+            "Output ONLY the edited text."
+        ),
+        "type_prompts": {
+            "EXPLANATION": "Tighten this explanation. Keep the reasoning but remove filler. Target ~30% shorter.",
+            "IMPLEMENTATION": "Condense this to key changes and intent. Keep code references. Target ~30% shorter.",
+            "REASONING": "Tighten the analysis. Keep tradeoffs and conclusion. Remove filler. Target ~30% shorter.",
+            "DEBUGGING": "Condense to: what was wrong, investigation highlights, fix applied. Target ~30% shorter.",
+            "METRICS": "Keep all numbers. Remove narrative around them. Present as compact text.",
+            "COMPILATION": "Keep result and any errors. Remove verbose output lines. A few sentences.",
+            "PLANNING": "Keep decisions and action items. Condense deliberation. Target ~30% shorter.",
+            "TESTING": "Keep pass/fail counts and failure details. Remove per-test output.",
+            "GIT_OPERATION": "Keep commit message and branch. Remove git output. 1-2 sentences.",
+            "ANALYSIS": "Keep findings and key data. Condense methodology. Target ~30% shorter.",
+        },
+    },
+    "standard": {
+        "summarize_system": (
+            "Compress this text significantly. Target ~50% shorter. "
+            "KEEP: facts, decisions, numbers, errors, file paths, constraints. "
+            "DELETE: preamble, transitions, hedging, restatements, meta-commentary. "
+            "Respond with ONLY the compressed text. No commentary."
+        ),
+        "strip_system": (
+            "Strip filler from this text. Target ~50% shorter. "
+            "DELETE: 'Let me', 'I'll now', 'I see that', 'Looking at this', "
+            "'Based on what I see', transitions, hedging, restatements. "
+            "KEEP: every fact, number, file path, error, decision, constraint. "
+            "Output ONLY the stripped text."
+        ),
+        "type_prompts": {
+            "EXPLANATION": "Compress to the key facts and conclusion. 2-3 sentences max. Delete the reasoning chain.",
+            "IMPLEMENTATION": "Which files changed and why. 1-2 sentences. Delete code blocks and edit narrative.",
+            "REASONING": "The conclusion and key tradeoffs only. 1-2 sentences. Delete deliberation.",
+            "DEBUGGING": "Root cause + fix. 1-2 sentences. Delete investigation steps.",
+            "METRICS": "Numbers only as a compact list. No narrative.",
+            "COMPILATION": "Result + errors if any. One line.",
+            "PLANNING": "Decided action items only. Numbered list. Delete brainstorming.",
+            "TESTING": "Pass/fail counts + failure messages. One line.",
+            "GIT_OPERATION": "Commit message + branch. One line.",
+            "ANALYSIS": "Key findings as 1-3 bullet points. Delete methodology.",
+        },
+    },
+    "aggressive": {
+        "summarize_system": (
+            "You are a ruthless text compressor. Output MUST be at least 60% shorter than input. "
+            "KEEP ONLY: bare facts, decisions, numbers, error messages, file paths, constraints. "
+            "DELETE ALL: 'Let me', 'I'll', 'I see', 'Looking at', 'Based on', transitions, "
+            "preamble, hedging, restatements, pleasantries, meta-commentary, markdown formatting. "
+            "No commentary. No 'Here\\'s the summary:'. Just the compressed content."
+        ),
+        "strip_system": (
+            "You are a ruthless text compressor. Output MUST be at least 50% shorter than input. "
+            "DELETE: every 'Let me', 'I'll now', 'I see that', 'Looking at this', "
+            "'Based on what I see', 'I notice', 'It appears', 'I think', 'I believe', "
+            "ALL transitions, ALL hedging, ALL meta-commentary, ALL restatements. "
+            "KEEP: every fact, number, file path, error message, decision, constraint. "
+            "Output ONLY the stripped text."
+        ),
+        "type_prompts": {
+            "EXPLANATION": (
+                "ONLY the conclusion. 1 sentence. Delete the entire reasoning chain. "
+                "If the conclusion is 'Metal doesn't support FP64', output exactly that."
+            ),
+            "IMPLEMENTATION": (
+                "ONLY: which files changed and why. 1 sentence. "
+                "Example: 'Modified metal.rs: added FP16 BERT attention kernels.'"
+            ),
+            "REASONING": (
+                "ONLY the final conclusion. 1 sentence. Delete all deliberation. "
+                "Example: 'Use batch_size=32 due to M2 16GB memory limit.'"
+            ),
+            "DEBUGGING": (
+                "ONLY: root cause + fix. 1 sentence. "
+                "Example: 'OOM at batch=64 on M2. Fixed: reduced to batch=32.'"
+            ),
+            "METRICS": "Numbers ONLY as compact list. Example: 'BGE: 308/s, CodeRank: 105/s, ModernBERT: 118/s'",
+            "COMPILATION": "ONLY: 'build ok' or the error. One line.",
+            "PLANNING": "ONLY decided action items. Numbered list. No deliberation.",
+            "TESTING": "ONLY: pass/fail + failures. Example: '42 passed, 1 failed: test_metal_fp16'",
+            "GIT_OPERATION": "ONLY: 'committed: <msg>' or 'pushed to <branch>'. One line.",
+            "ANALYSIS": "ONLY findings. 1-3 bullet points. Delete everything else.",
+        },
+    },
 }
+
+# Legacy aliases for backward compatibility
+DISTILL_SUMMARIZE_SYSTEM = DISTILL_PROFILES["aggressive"]["summarize_system"]
+DISTILL_STRIP_SYSTEM = DISTILL_PROFILES["aggressive"]["strip_system"]
+DISTILL_TYPE_PROMPTS = DISTILL_PROFILES["aggressive"]["type_prompts"]
+
+
+def get_distill_prompts(profile: str = "standard") -> dict:
+    """Get the distillation prompts for a profile (gentle/standard/aggressive)."""
+    return DISTILL_PROFILES.get(profile, DISTILL_PROFILES["standard"])
+
 
 _MAX_TEXT_LEN = 500
 
@@ -170,21 +215,26 @@ def parse_classify_response(response: str, expected_count: int) -> list[Category
     return result
 
 
-def format_distill_prompt(text: str, mode: str, category: str | None = None) -> str:
-    """Wrap text for distillation with the appropriate instruction context.
+def format_distill_prompt(
+    text: str, mode: str, category: str | None = None, profile: str = "standard"
+) -> str:
+    """Wrap text for distillation with profile-appropriate instruction.
 
     mode is one of: "summarize", "strip_scaffold".
+    profile is one of: "gentle", "standard", "aggressive".
     When mode is "summarize" and category is provided and has a type-specific
-    prompt in DISTILL_TYPE_PROMPTS, that prompt is used instead of the generic
-    instruction.
+    prompt, that prompt is used instead of the generic system prompt.
     """
-    if mode == "summarize" and category and category in DISTILL_TYPE_PROMPTS:
-        instruction = DISTILL_TYPE_PROMPTS[category]
+    prompts = get_distill_prompts(profile)
+    type_prompts = prompts.get("type_prompts", {})
+
+    if mode == "summarize" and category and category in type_prompts:
+        instruction = type_prompts[category]
     elif mode == "summarize":
-        instruction = "Compress the following exchange:"
+        instruction = prompts.get("summarize_system", "Compress the following:")
     elif mode == "strip_scaffold":
-        instruction = "Strip filler from the following exchange:"
+        instruction = prompts.get("strip_system", "Strip filler from the following:")
     else:
-        instruction = "Process the following exchange:"
+        instruction = "Process the following:"
 
     return f"{instruction}\n\n{text}"

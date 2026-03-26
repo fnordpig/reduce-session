@@ -43,11 +43,11 @@ class GeminiProvider:
         )
         return parse_classify_response(response.text, len(exchanges))
 
-    async def distill(self, text: str, mode: str, category: str | None = None) -> str:
+    async def distill(self, text: str, mode: str, category: str | None = None, profile: str = "standard") -> str:
         system = (
             DISTILL_SUMMARIZE_SYSTEM if mode == "summarize" else DISTILL_STRIP_SYSTEM
         )
-        user_text = format_distill_prompt(text, mode, category=category)
+        user_text = format_distill_prompt(text, mode, category=category, profile=profile)
         response = await self._client.models.generate_content(
             model=self._model,
             contents=user_text,

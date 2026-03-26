@@ -91,7 +91,7 @@ def test_format_distill_with_category():
     assert text in prompt
     # Without category — generic instruction
     generic = format_distill_prompt(text, "summarize")
-    assert "Compress the following exchange:" in generic
+    assert "compress" in generic.lower() or "shorter" in generic.lower()
     # With category but strip_scaffold mode — should NOT use type-specific
     strip = format_distill_prompt(text, "strip_scaffold", category="EXPLANATION")
     assert "Strip filler" in strip

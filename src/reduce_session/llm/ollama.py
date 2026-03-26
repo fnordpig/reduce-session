@@ -53,11 +53,11 @@ class OllamaProvider:
             return [Category.SCAFFOLDING] * len(exchanges)  # timeout → safe default
         return parse_classify_response(text, len(exchanges))
 
-    async def distill(self, text: str, mode: str, category: str | None = None) -> str:
+    async def distill(self, text: str, mode: str, category: str | None = None, profile: str = "standard") -> str:
         system = (
             DISTILL_SUMMARIZE_SYSTEM if mode == "summarize" else DISTILL_STRIP_SYSTEM
         )
-        user_text = format_distill_prompt(text, mode, category=category)
+        user_text = format_distill_prompt(text, mode, category=category, profile=profile)
         try:
             result = await self._chat(system, user_text, timeout=300.0)
         except Exception:

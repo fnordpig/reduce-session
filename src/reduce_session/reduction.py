@@ -1413,7 +1413,9 @@ def _batched(iterable, n):
         yield batch
 
 
-async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=None):
+async def _llm_compression_pass(
+    kept_objs, aggr_fn, provider, progress_callback=None, profile="standard"
+):
     """Pass 3.6 + 3.7: LLM classification, distillation, and scaffold stripping."""
     import asyncio
     from collections import Counter
@@ -1494,7 +1496,7 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
             if text and len(text) > 200:
                 original_len = len(text)
                 summary = await provider.distill(
-                    text, mode="summarize", category=cat.value
+                    text, mode="summarize", category=cat.value, profile=profile
                 )
                 if summary and len(summary) < original_len:
                     _replace_assistant_text(kept_objs[pos], summary)
@@ -1541,7 +1543,7 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
     strip_chars_saved = 0
     for idx, (pos, obj, text) in enumerate(strip_candidates, 1):
         original_len = len(text)
-        stripped = await provider.distill(text, mode="strip_scaffold")
+        stripped = await provider.distill(text, mode="strip_scaffold", profile=profile)
         if stripped and len(stripped) < original_len:
             _replace_assistant_text(kept_objs[pos], stripped)
             strip_count += 1
@@ -1776,7 +1778,9 @@ def reduce_session(
         import asyncio
 
         llm_stats = asyncio.run(
-            _llm_compression_pass(kept_objs, aggr_fn, llm_provider, progress_callback)
+            _llm_compression_pass(
+                kept_objs, aggr_fn, llm_provider, progress_callback, profile=profile
+            )
         )
         stats.update(llm_stats)
 
