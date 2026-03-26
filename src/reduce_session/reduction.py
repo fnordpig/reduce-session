@@ -1237,6 +1237,85 @@ def collapse_edit_sequences(kept_objs, aggr_fn):
     return {"edit_sequences_collapsed": collapsed} if collapsed else {}
 
 
+def nuclear_tool_replace(kept_objs, aggr_fn, tool_id_map):
+    """At aggr > 0.8, replace ALL tool content with one-line summaries."""
+    total = len(kept_objs)
+    reads = 0
+    bash = 0
+    edits = 0
+    agents = 0
+
+    for pos, obj in enumerate(kept_objs):
+        position = pos / max(total - 1, 1)
+        aggr = aggr_fn(position)
+        if aggr <= 0.8:
+            continue
+
+        t = get_msg_type(obj)
+        msg = obj.get("message", {})
+        content = msg.get("content")
+
+        # Replace user tool_result content
+        if t == "user" and isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_id = block.get("tool_use_id", "")
+                tool_name = tool_id_map.get(tool_id, "")
+                inner = block.get("content", "")
+                if not isinstance(inner, str) or len(inner) <= 200:
+                    continue
+                if tool_name in ("Read", "read"):
+                    lc = inner.count("\n") + 1
+                    block["content"] = f"[Read: {lc} lines]"
+                    reads += 1
+                elif tool_name in ("Bash", "bash"):
+                    preview = _strip_non_ascii(inner[:100].replace("\n", " "))
+                    block["content"] = f"[Bash: {preview}...]"
+                    bash += 1
+                elif tool_name in ("Agent", "agent"):
+                    preview = _strip_non_ascii(inner[:100].replace("\n", " "))
+                    block["content"] = f"[Agent result: {preview}...]"
+                    agents += 1
+                else:
+                    preview = _strip_non_ascii(inner[:80].replace("\n", " "))
+                    block["content"] = f"[{tool_name}: {preview}...]"
+
+        # Replace assistant Edit old/new strings and Agent prompts
+        if t == "assistant" and isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                name = block.get("name", "")
+                inp = block.get("input", {})
+                if not isinstance(inp, dict):
+                    continue
+                if name in ("Edit", "edit"):
+                    old = inp.get("old_string", "")
+                    new = inp.get("new_string", "")
+                    if len(old) + len(new) > 200:
+                        inp["old_string"] = f"[~{len(old)} chars]"
+                        inp["new_string"] = f"[~{len(new)} chars]"
+                        edits += 1
+                elif name in ("Agent", "agent"):
+                    prompt = inp.get("prompt", "")
+                    if len(prompt) > 200:
+                        preview = _strip_non_ascii(prompt[:150].replace("\n", " "))
+                        inp["prompt"] = f"[Agent task: {preview}...]"
+                        agents += 1
+
+    stats = {}
+    if reads:
+        stats["nuclear_reads_replaced"] = reads
+    if bash:
+        stats["nuclear_bash_replaced"] = bash
+    if edits:
+        stats["nuclear_edits_replaced"] = edits
+    if agents:
+        stats["nuclear_agents_replaced"] = agents
+    return stats
+
+
 def fix_orphaned_tool_results(kept_objs):
     use_ids = set()
     for obj in kept_objs:
@@ -1870,7 +1949,11 @@ def reduce_session(
     edit_collapse_stats = collapse_edit_sequences(kept_objs, aggr_fn)
     stats.update(edit_collapse_stats)
 
-    # -- Pass 3.6 + 3.7: LLM compression (optional) --
+    # -- Pass 3.6: Nuclear tool content replacement (deep middle zone) --
+    nuclear_stats = nuclear_tool_replace(kept_objs, aggr_fn, tool_id_map)
+    stats.update(nuclear_stats)
+
+    # -- Pass 3.65 + 3.7: LLM compression (optional) --
     if llm_provider is not None:
         import asyncio
 
