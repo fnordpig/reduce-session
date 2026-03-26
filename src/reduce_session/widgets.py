@@ -523,31 +523,32 @@ class ReduceModal(ModalScreen[bool]):
         self._llm_worker = self.run_worker(do_llm_work, thread=True)
 
     # Category colors for classification sparkline blending
+    # Three visually distinct lanes: KEEP=blue, DISTILL=green+yellow, HEURISTIC=red
     _CAT_COLORS = {
-        # KEEP types — green spectrum
-        "INSTRUCTION": (0, 212, 170),
-        "CLARIFICATION": (0, 180, 216),
-        "CONFIRMATION": (0, 200, 150),
-        "INQUIRY": (100, 200, 220),
-        "DECISION": (0, 230, 180),
-        "FEEDBACK": (80, 210, 190),
-        # DISTILL types — warm spectrum
-        "EXPLANATION": (153, 153, 153),
-        "IMPLEMENTATION": (255, 140, 0),
-        "REASONING": (200, 160, 100),
-        "DEBUGGING": (255, 102, 68),
-        "METRICS": (180, 200, 50),
-        "COMPILATION": (255, 215, 0),
-        "PLANNING": (68, 136, 255),
-        "TESTING": (136, 204, 0),
-        "GIT_OPERATION": (0, 204, 255),
-        "ANALYSIS": (136, 170, 255),
-        # HEURISTIC types — dim spectrum
-        "STATUS_UPDATE": (100, 100, 100),
-        "NOTIFICATION": (80, 80, 80),
-        "LOG_OUTPUT": (90, 90, 90),
-        "SCAFFOLDING": (102, 102, 102),
-        "ERROR_OUTPUT": (170, 60, 60),
+        # KEEP types — blue spectrum
+        "INSTRUCTION": (40, 120, 255),
+        "CLARIFICATION": (80, 150, 255),
+        "CONFIRMATION": (60, 100, 220),
+        "INQUIRY": (100, 170, 255),
+        "DECISION": (30, 90, 240),
+        "FEEDBACK": (70, 140, 250),
+        # DISTILL types — green + yellow spectrum
+        "EXPLANATION": (120, 200, 60),
+        "IMPLEMENTATION": (200, 220, 40),
+        "REASONING": (80, 180, 80),
+        "DEBUGGING": (160, 210, 50),
+        "METRICS": (220, 240, 30),
+        "COMPILATION": (240, 220, 0),
+        "PLANNING": (60, 190, 100),
+        "TESTING": (100, 210, 40),
+        "GIT_OPERATION": (140, 230, 60),
+        "ANALYSIS": (90, 200, 70),
+        # HEURISTIC types — red spectrum
+        "STATUS_UPDATE": (220, 80, 60),
+        "NOTIFICATION": (200, 60, 50),
+        "LOG_OUTPUT": (240, 100, 70),
+        "SCAFFOLDING": (180, 50, 40),
+        "ERROR_OUTPUT": (255, 60, 60),
     }
 
     def _chars_to_tokens(self, chars: int) -> int:
