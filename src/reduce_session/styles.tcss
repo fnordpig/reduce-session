@@ -171,7 +171,12 @@ ReduceModal {
     padding-bottom: 1;
 }
 
-#llm-progress {
+#llm-classify-progress {
+    height: auto;
+    padding: 0 0 1 0;
+}
+
+#llm-distill-progress {
     height: auto;
     padding: 0 0 1 0;
 }

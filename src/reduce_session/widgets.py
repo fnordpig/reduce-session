@@ -406,7 +406,8 @@ class ReduceModal(ModalScreen[bool]):
                             "Set REDUCE_SESSION_LLM or use --llm flag.",
                             id="llm-description",
                         )
-                    yield Static("", id="llm-progress")
+                    yield Static("", id="llm-classify-progress")
+                    yield Static("", id="llm-distill-progress")
                     yield Static("", id="llm-results")
 
             with Horizontal(id="modal-actions"):
@@ -506,7 +507,10 @@ class ReduceModal(ModalScreen[bool]):
 
             return llm_stats, new_lines
 
-        self.query_one("#llm-progress", Static).update("Starting LLM compression...")
+        self.query_one("#llm-classify-progress", Static).update(
+            "Starting classification..."
+        )
+        self.query_one("#llm-distill-progress", Static).update("")
         self._llm_worker = self.run_worker(do_llm_work, thread=True)
 
     # Category colors for classification sparkline blending
@@ -667,11 +671,15 @@ class ReduceModal(ModalScreen[bool]):
                 if ratio:
                     text.append(f" ({ratio}%)", style="dim")
 
-        self.query_one("#llm-progress", Static).update(text)
+        # Write to the correct widget based on phase
+        if phase == "classify":
+            self.query_one("#llm-classify-progress", Static).update(text)
+        else:
+            self.query_one("#llm-distill-progress", Static).update(text)
 
     def _render_llm_complete(self, llm_stats: dict) -> None:
         """Show LLM completion results in the right panel."""
-        self.query_one("#llm-progress", Static).update(
+        self.query_one("#llm-distill-progress", Static).update(
             Text("Complete", style="bold #00d4aa")
         )
 
@@ -732,7 +740,7 @@ class ReduceModal(ModalScreen[bool]):
                 self._render_results()  # re-render with LLM stats
                 self._render_llm_complete(llm_stats)
             elif event.state == WorkerState.ERROR:
-                self.query_one("#llm-progress", Static).update(
+                self.query_one("#llm-distill-progress", Static).update(
                     Text(
                         "LLM compression failed -- heuristic results preserved",
                         style="red",

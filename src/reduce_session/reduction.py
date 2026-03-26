@@ -1506,10 +1506,11 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
                 )
         return distill_count, chars_saved
 
-    # Run classification and distillation concurrently
-    _, (distill_count, distill_chars) = await asyncio.gather(
-        classify_worker(), distill_worker()
-    )
+    # Run classification first (uses classifier model), then distillation
+    # (uses distiller model). Sequential avoids loading both models simultaneously
+    # and prevents model-switching overhead on local inference.
+    await classify_worker()
+    distill_count, distill_chars = await distill_worker()
 
     # Phase 2: Scaffolding strip on ALL assistant text in middle zone
     # Pre-filter to only exchanges with substantial assistant text
