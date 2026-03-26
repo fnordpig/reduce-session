@@ -1493,10 +1493,8 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
             # Skip short texts — LLM overhead exceeds savings
             if text and len(text) > 200:
                 original_len = len(text)
-                # Cap input to LLM at 2000 chars — enough for summarization
-                llm_input = text[:2000] if len(text) > 2000 else text
                 summary = await provider.distill(
-                    llm_input, mode="summarize", category=cat.value
+                    text, mode="summarize", category=cat.value
                 )
                 if summary and len(summary) < original_len:
                     _replace_assistant_text(kept_objs[pos], summary)
@@ -1543,8 +1541,7 @@ async def _llm_compression_pass(kept_objs, aggr_fn, provider, progress_callback=
     strip_chars_saved = 0
     for idx, (pos, obj, text) in enumerate(strip_candidates, 1):
         original_len = len(text)
-        llm_input = text[:2000] if len(text) > 2000 else text
-        stripped = await provider.distill(llm_input, mode="strip_scaffold")
+        stripped = await provider.distill(text, mode="strip_scaffold")
         if stripped and len(stripped) < original_len:
             _replace_assistant_text(kept_objs[pos], stripped)
             strip_count += 1
