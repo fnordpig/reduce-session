@@ -308,3 +308,22 @@ def test_make_session_label_parse_error():
     )
     label = app._make_session_label(session)
     assert "\u26a0" in label.plain  # warning sign
+
+
+# --- Doctor keybinding ---
+
+
+@pytest.mark.asyncio
+async def test_doctor_keybinding_exists():
+    app = SessionBrowserApp()
+    bindings = [b.key for b in app.BINDINGS]
+    assert "D" in bindings
+
+
+@pytest.mark.asyncio
+async def test_doctor_on_no_session(empty_projects_dir):
+    """Pressing 'D' with no sessions should show a warning, not crash."""
+    app = SessionBrowserApp(projects_dir=empty_projects_dir)
+    async with app.run_test() as pilot:
+        await pilot.press("D")
+        # Should not crash -- warning notification shown
