@@ -320,6 +320,12 @@ async def test_doctor_keybinding_exists():
     assert "D" in bindings
 
 
+def test_browse_keybinding_exists():
+    """Verify 'e' is in SessionBrowserApp.BINDINGS."""
+    bindings = [b.key for b in SessionBrowserApp.BINDINGS]
+    assert "e" in bindings
+
+
 @pytest.mark.asyncio
 async def test_doctor_on_no_session(empty_projects_dir):
     """Pressing 'D' with no sessions should show a warning, not crash."""

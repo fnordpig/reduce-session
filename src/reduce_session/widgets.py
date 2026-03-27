@@ -7,14 +7,16 @@ Used by the main TUI.
 
 from __future__ import annotations
 
+import json
 import os
+from dataclasses import dataclass
 
 from rich.style import Style
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, LoadingIndicator, Static
+from textual.widgets import Button, LoadingIndicator, Static, Tree
 from textual.worker import Worker, WorkerState
 
 from .git_ops import (
@@ -27,6 +29,24 @@ from .git_ops import (
 )
 from .reduction import ReductionResult, reduce_session
 from .session import Exchange, SessionInfo
+
+
+# --- Conversation Browser data model ---
+
+
+@dataclass
+class BrowseExchange:
+    """Single exchange for the conversation browser."""
+
+    index: int  # line number in JSONL
+    role: str  # "user", "assistant", "system", "tool"
+    text: str  # first 200 chars of content
+    full_text: str  # full rendered content for preview panel
+    tool_name: str | None
+    is_error: bool
+    ontology_class: str | None  # from _reduce.cls
+    reduce_route: str | None  # KEEP, DISTILL, HEURISTIC
+    token_size: int  # len(json.dumps(obj)) // 4
 
 
 def token_color(tokens: int) -> str:
@@ -1856,3 +1876,469 @@ class DoctorModal(ModalScreen[bool]):
                     self._selected.add(i)
                 break
         self._render_results()
+
+
+# --- Conversation Browser ---
+
+# Skip types that are noise (same as session.py)
+_BROWSER_SKIP_TYPES = frozenset(
+    {"progress", "system", "file-history-snapshot", "last-prompt"}
+)
+
+
+def parse_browse_exchanges(path: str) -> list[BrowseExchange]:
+    """Parse a full JSONL file into BrowseExchange objects.
+
+    Runs in a worker thread. Extracts role, text preview, _reduce tags,
+    and token size for each meaningful line.
+    """
+    exchanges: list[BrowseExchange] = []
+    try:
+        with open(path, "r", errors="replace") as f:
+            for line_idx, raw in enumerate(f):
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+
+                if not isinstance(obj, dict):
+                    continue
+
+                rtype = obj.get("type", "")
+                if rtype in _BROWSER_SKIP_TYPES:
+                    continue
+
+                msg = obj.get("message", {})
+                if not isinstance(msg, dict):
+                    continue
+
+                content = msg.get("content")
+                role = _browser_extract_role(obj, msg)
+                full_text = ""
+                tool_name = None
+                is_error = False
+
+                if isinstance(content, str):
+                    full_text = content.strip()
+                elif isinstance(content, list):
+                    parts: list[str] = []
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type", "")
+                        if btype == "thinking":
+                            continue
+                        if btype == "text":
+                            parts.append(block.get("text", ""))
+                        elif btype == "tool_use":
+                            name = block.get("name", "unknown")
+                            inp = block.get("input", {})
+                            desc = _browser_tool_use_desc(name, inp)
+                            parts.append(f"[{name}: {desc}]")
+                            tool_name = name
+                        elif btype == "tool_result":
+                            tc = block.get("content", "")
+                            is_error = block.get("is_error", False)
+                            if isinstance(tc, str):
+                                parts.append(tc[:200])
+                            elif isinstance(tc, list):
+                                for item in tc:
+                                    if (
+                                        isinstance(item, dict)
+                                        and item.get("type") == "text"
+                                    ):
+                                        parts.append(item.get("text", "")[:200])
+                    full_text = "\n".join(parts).strip()
+
+                if not full_text:
+                    continue
+
+                text = full_text[:200]
+
+                # Extract _reduce tag
+                reduce_tag = obj.get("_reduce", {})
+                ontology_class = None
+                reduce_route = None
+                if isinstance(reduce_tag, dict):
+                    ontology_class = reduce_tag.get("cls")
+                    reduce_route = reduce_tag.get("route")
+
+                token_size = len(json.dumps(obj)) // 4
+
+                exchanges.append(
+                    BrowseExchange(
+                        index=line_idx,
+                        role=role,
+                        text=text,
+                        full_text=full_text,
+                        tool_name=tool_name,
+                        is_error=is_error,
+                        ontology_class=ontology_class,
+                        reduce_route=reduce_route,
+                        token_size=token_size,
+                    )
+                )
+    except (OSError, PermissionError):
+        pass
+
+    return exchanges
+
+
+def _browser_extract_role(obj: dict, msg: dict) -> str:
+    """Determine the role of a JSONL record."""
+    rtype = obj.get("type", "")
+    role = msg.get("role", rtype)
+    if role in ("user", "assistant", "system", "tool"):
+        return role
+    if rtype in ("user", "assistant", "system", "tool"):
+        return rtype
+    return "user"
+
+
+def _browser_tool_use_desc(name: str, inp: dict) -> str:
+    """One-line description of a tool_use block."""
+    if name == "Bash":
+        cmd = inp.get("command", "")
+        return cmd[:80] if len(cmd) <= 80 else cmd[:77] + "..."
+    if name in ("Read", "Write", "Edit"):
+        return inp.get("file_path", inp.get("path", ""))[:80]
+    if name in ("Glob", "Grep"):
+        return inp.get("pattern", "")[:80]
+    if name == "Agent":
+        desc = inp.get("prompt", inp.get("description", ""))
+        return desc[:80] if len(desc) <= 80 else desc[:77] + "..."
+    for v in inp.values():
+        if isinstance(v, str) and v:
+            return v[:80]
+    return ""
+
+
+def _format_tok_short(tokens: int) -> str:
+    """Format token count compactly: '42k', '1.2M'."""
+    if tokens >= 1_000_000:
+        val = tokens / 1_000_000
+        return f"{val:.1f}M" if val != int(val) else f"{int(val)}M"
+    if tokens >= 1_000:
+        val = tokens / 1_000
+        return f"{int(val)}k" if val == int(val) else f"{val:.0f}k"
+    return str(tokens)
+
+
+def _make_token_bar(
+    section_tokens: int, max_section_tokens: int, width: int = 6
+) -> str:
+    """Build a token usage bar like '████░░'."""
+    if max_section_tokens <= 0:
+        return "\u2591" * width
+    ratio = min(section_tokens / max_section_tokens, 1.0)
+    filled = int(ratio * width)
+    empty = width - filled
+    return "\u2588" * filled + "\u2591" * empty
+
+
+def get_section_snippet(exchanges: list[BrowseExchange]) -> str:
+    """Get a representative snippet for a section.
+
+    Prefers the last KEEP-tagged message, else the last user message.
+    """
+    last_keep = None
+    last_user = None
+    for ex in exchanges:
+        if ex.reduce_route == "KEEP":
+            last_keep = ex
+        if ex.role == "user":
+            last_user = ex
+    chosen = last_keep or last_user
+    if chosen:
+        return chosen.text.replace("\n", " ")[:60]
+    return ""
+
+
+def _compute_section_percentile(
+    section_tokens: int, all_section_tokens: list[int]
+) -> str:
+    """Return color based on percentile of section tokens among peers."""
+    if not all_section_tokens:
+        return "#44aa88"
+    sorted_tokens = sorted(all_section_tokens)
+    n = len(sorted_tokens)
+    # Find rank
+    rank = 0
+    for t in sorted_tokens:
+        if t <= section_tokens:
+            rank += 1
+    pct = rank / n
+    if pct <= 0.25:
+        return "#44aa88"  # green - bottom 25%
+    if pct <= 0.75:
+        return "#ddaa22"  # amber - middle 50%
+    return "#ee4444"  # red - top 25%
+
+
+def build_browse_tree(
+    exchanges: list[BrowseExchange],
+    tree_widget: Tree,
+) -> None:
+    """Build the hierarchical tree from parsed exchanges.
+
+    Uses recursive chunking: max ~100 sections at top level,
+    max 50 leaves per section.
+    """
+    tree_widget.clear()
+    tree_widget.root.expand()
+
+    n = len(exchanges)
+    if n == 0:
+        tree_widget.root.add_leaf(Text("(empty session)", style="dim"))
+        return
+
+    # Pre-compute section token totals for percentile coloring
+    def _compute_chunks(start: int, end: int) -> list[tuple[int, int]]:
+        """Return list of (chunk_start, chunk_end) for this level."""
+        count = end - start
+        if count <= 50:
+            return []  # leaf level
+        chunk_size = max(50, count // 100)
+        chunks = []
+        for cs in range(start, end, chunk_size):
+            ce = min(cs + chunk_size, end)
+            chunks.append((cs, ce))
+        return chunks
+
+    def _gather_section_tokens(start: int, end: int) -> list[int]:
+        """Get token totals for all peer sections at this level."""
+        chunks = _compute_chunks(start, end)
+        if not chunks:
+            return []
+        return [sum(ex.token_size for ex in exchanges[cs:ce]) for cs, ce in chunks]
+
+    def _build(parent_node, start: int, end: int) -> None:
+        count = end - start
+        if count <= 50:
+            # Leaf level: add individual exchanges
+            for ex in exchanges[start:end]:
+                label = _format_leaf_label(ex)
+                parent_node.add_leaf(label, data=ex)
+            return
+
+        chunk_size = max(50, count // 100)
+        peer_tokens = _gather_section_tokens(start, end)
+
+        for cs in range(start, end, chunk_size):
+            ce = min(cs + chunk_size, end)
+            section_exs = exchanges[cs:ce]
+            section_tokens = sum(ex.token_size for ex in section_exs)
+            snippet = get_section_snippet(section_exs)
+            color = _compute_section_percentile(section_tokens, peer_tokens)
+            bar = _make_token_bar(
+                section_tokens,
+                max(peer_tokens) if peer_tokens else 0,
+            )
+
+            label = Text()
+            # Range (1-indexed)
+            label.append(f"\u00a7{cs + 1}-{ce}", style=color)
+            label.append(" [", style="dim")
+            label.append(bar, style=color)
+            label.append("] ", style="dim")
+            label.append(f"{_format_tok_short(section_tokens)} tok", style=color)
+            if snippet:
+                label.append("  ", style="dim")
+                label.append(f'"{snippet}"', style="dim italic")
+
+            node = parent_node.add(
+                label,
+                data={"start": cs, "end": ce, "tokens": section_tokens},
+            )
+            _build(node, cs, ce)
+
+    _build(tree_widget.root, 0, n)
+
+
+def _format_leaf_label(ex: BrowseExchange) -> Text:
+    """Format an individual exchange as a tree leaf label."""
+    label = Text()
+
+    # Line number (right-aligned, 5 chars)
+    idx_str = str(ex.index + 1).rjust(5)
+    label.append(idx_str, style="dim")
+    label.append(" ", style="dim")
+
+    # Role
+    role_colors = {
+        "user": "#44cc88",
+        "assistant": "#6688cc",
+        "system": "dim",
+        "tool": "#ccaa44",
+    }
+    label.append(ex.role, style=role_colors.get(ex.role, "dim"))
+    label.append(": ", style="dim")
+
+    # Route indicator
+    if ex.reduce_route == "KEEP":
+        label.append("\u2605 KEEP ", style="#6688cc bold")
+    elif ex.reduce_route == "DISTILL":
+        pass  # content will be dimmed below
+
+    # Ontology class
+    if ex.ontology_class:
+        label.append(f"[{ex.ontology_class}] ", style="dim")
+
+    # Truncated content
+    snippet = ex.text.replace("\n", " ")[:80]
+    if ex.reduce_route == "DISTILL":
+        label.append(f'"{snippet}"', style="dim")
+    elif ex.is_error:
+        label.append(f'"{snippet}"', style="#ee4444")
+    else:
+        label.append(f'"{snippet}"', style="")
+
+    return label
+
+
+def _render_browse_preview(
+    data: BrowseExchange | dict | None,
+    exchanges: list[BrowseExchange],
+) -> Text:
+    """Render preview content for the right panel.
+
+    data is either a BrowseExchange (leaf) or a dict (section).
+    """
+    text = Text()
+
+    if isinstance(data, BrowseExchange):
+        # Leaf: show full exchange with role-colored text
+        role_colors = {
+            "user": "#44cc88",
+            "assistant": "#6688cc",
+            "system": "dim",
+            "tool": "#ccaa44",
+        }
+        ex = data
+        color = role_colors.get(ex.role, "dim")
+
+        text.append(f"{ex.role}", style=f"bold {color}")
+        text.append(f"  (line {ex.index + 1})", style="dim")
+        if ex.reduce_route:
+            text.append(f"  [{ex.reduce_route}]", style="dim")
+        if ex.ontology_class:
+            text.append(f"  {ex.ontology_class}", style="dim")
+        text.append(f"  ~{_format_tok_short(ex.token_size)} tok", style="dim")
+        text.append("\n\n")
+
+        # Full text content
+        text.append(ex.full_text, style=color)
+
+    elif isinstance(data, dict):
+        # Section summary
+        start = data.get("start", 0)
+        end = data.get("end", 0)
+        tokens = data.get("tokens", 0)
+        count = end - start
+        section_exs = exchanges[start:end]
+
+        text.append(
+            f"Section \u00a7{start + 1}-{end}: "
+            f"{count} exchanges, {_format_tok_short(tokens)} tok\n\n",
+            style="bold",
+        )
+
+        # Show a few snippet exchanges from the section
+        shown = 0
+        for ex in section_exs:
+            if ex.role == "user" or ex.reduce_route == "KEEP":
+                role_colors = {
+                    "user": "#44cc88",
+                    "assistant": "#6688cc",
+                    "system": "dim",
+                    "tool": "#ccaa44",
+                }
+                color = role_colors.get(ex.role, "dim")
+                text.append(f"  {ex.index + 1} ", style="dim")
+                text.append(f"{ex.role}: ", style=f"bold {color}")
+                text.append(ex.text.replace("\n", " ")[:100], style=color)
+                text.append("\n")
+                shown += 1
+                if shown >= 10:
+                    text.append(f"  ... and {count - shown} more\n", style="dim")
+                    break
+
+    return text
+
+
+class ConversationBrowserModal(ModalScreen[None]):
+    """Browse all exchanges in a session with hierarchical folding.
+
+    Left panel: Tree widget with collapsible section nodes.
+    Right panel: Preview of selected exchange/section.
+    """
+
+    BINDINGS = [
+        ("escape", "close", "Close"),
+    ]
+
+    def __init__(self, session_path: str) -> None:
+        super().__init__()
+        self.session_path = session_path
+        self._exchanges: list[BrowseExchange] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="browser-outer"):
+            with Horizontal(id="browser-container"):
+                yield Tree("Session", id="browser-tree")
+                with VerticalScroll(id="browser-preview"):
+                    yield Static("Loading session...", id="browser-preview-content")
+            with Horizontal(id="browser-actions"):
+                yield Button("Close", id="btn-close-browser")
+
+    def on_mount(self) -> None:
+        self.run_worker(self._load_session, thread=True)
+
+    def _load_session(self) -> None:
+        """Parse JSONL into BrowseExchange list (worker thread)."""
+        self._exchanges = parse_browse_exchanges(self.session_path)
+        self.app.call_from_thread(self._populate_tree)
+
+    def _populate_tree(self) -> None:
+        """Build tree on the UI thread after parsing completes."""
+        tree: Tree = self.query_one("#browser-tree", Tree)
+        build_browse_tree(self._exchanges, tree)
+
+        preview = self.query_one("#browser-preview-content", Static)
+        n = len(self._exchanges)
+        total_tok = sum(ex.token_size for ex in self._exchanges)
+        preview.update(
+            Text.from_markup(
+                f"[bold]{n}[/bold] exchanges, "
+                f"[bold]~{_format_tok_short(total_tok)}[/bold] tokens\n\n"
+                "Select an exchange or section to preview."
+            )
+        )
+
+    def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
+        """Update preview panel with selected exchange/section."""
+        data = event.node.data
+        if data is None:
+            return
+        preview = self.query_one("#browser-preview-content", Static)
+        text = _render_browse_preview(data, self._exchanges)
+        preview.update(text)
+
+    def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
+        """Update preview on cursor movement too."""
+        data = event.node.data
+        if data is None:
+            return
+        preview = self.query_one("#browser-preview-content", Static)
+        text = _render_browse_preview(data, self._exchanges)
+        preview.update(text)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-close-browser":
+            self.dismiss(None)
+
+    def action_close(self) -> None:
+        self.dismiss(None)

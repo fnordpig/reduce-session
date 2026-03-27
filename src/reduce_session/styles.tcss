@@ -268,3 +268,51 @@ DoctorModal {
     min-width: 16;
 }
 
+/* Conversation Browser Modal */
+ConversationBrowserModal {
+    align-horizontal: center;
+    align-vertical: middle;
+}
+
+#browser-outer {
+    width: 90%;
+    height: 90%;
+    border: solid;
+    background: $surface;
+    padding: 1;
+}
+
+#browser-container {
+    height: 1fr;
+}
+
+#browser-tree {
+    width: 3fr;
+    height: 1fr;
+}
+
+#browser-preview {
+    width: 1fr;
+    height: 1fr;
+    border-left: solid;
+    padding: 0 1;
+}
+
+#browser-preview-content {
+    height: auto;
+}
+
+#browser-actions {
+    height: 3;
+    dock: bottom;
+    align-horizontal: right;
+    padding-top: 1;
+}
+
+#browser-actions Button {
+    height: 1;
+    padding: 0;
+    border: none;
+    min-width: 16;
+}
+

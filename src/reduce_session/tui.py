@@ -18,6 +18,7 @@ from textual.widgets import Footer, Header, Static, Tree
 
 from .session import SessionInfo, scan_projects
 from .widgets import (
+    ConversationBrowserModal,
     ConversationPreview,
     DoctorModal,
     HistoryModal,
@@ -56,6 +57,7 @@ class SessionBrowserApp(App):
         Binding("q", "quit", "Quit"),
         Binding("escape", "quit", "Quit", show=False),
         Binding("r", "reduce", "Reduce", show=True),
+        Binding("e", "browse", "Browse", show=True),
         Binding("D", "doctor", "Doctor", show=True),
         Binding("h", "history", "History", show=True),
         Binding("ctrl+l", "refresh", "Refresh", show=True, key_display="^L"),
@@ -201,6 +203,14 @@ class SessionBrowserApp(App):
         """Handle modal dismissal -- refresh tree if reduction was applied."""
         if applied:
             self._load_sessions()
+
+    def action_browse(self) -> None:
+        """Open conversation browser modal for the highlighted session."""
+        session = self.selected_session
+        if session:
+            self.push_screen(ConversationBrowserModal(str(session.path)))
+        else:
+            self.notify("Select a session first", severity="warning")
 
     def action_history(self) -> None:
         """Open Time Machine history browser for the selected session."""
