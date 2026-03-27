@@ -233,13 +233,38 @@ def _estimate_content_tokens(lines: list[dict]) -> int:
 
 
 def _fix_stale_tokens(lines: list[dict]) -> dict:
-    stripped = 0
-    for obj in lines:
+    """Recalibrate the last usage block to match estimated content tokens.
+
+    Instead of stripping all usage (which makes Claude Code see 0 tokens),
+    update the last usage block with a char-based estimate.
+    """
+    estimated = _estimate_content_tokens(lines)
+
+    # Find the last assistant message with usage and update it
+    for obj in reversed(lines):
         msg = obj.get("message")
-        if isinstance(msg, dict) and "usage" in msg:
-            del msg["usage"]
-            stripped += 1
-    return {"usage_stripped": stripped}
+        if isinstance(msg, dict):
+            usage = msg.get("usage")
+            if isinstance(usage, dict):
+                usage["input_tokens"] = estimated
+                usage["cache_read_input_tokens"] = 0
+                usage["cache_creation_input_tokens"] = 0
+                return {"usage_recalibrated": estimated}
+
+    # No usage block found — add one to the last assistant message
+    for obj in reversed(lines):
+        if obj.get("type") == "assistant":
+            msg = obj.get("message")
+            if isinstance(msg, dict):
+                msg["usage"] = {
+                    "input_tokens": estimated,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                }
+                return {"usage_added": estimated}
+
+    return {"usage_unchanged": 0}
 
 
 def diagnose_stale_tokens(lines: list[dict], file_path: str) -> DiagnosticResult:
@@ -263,9 +288,12 @@ def diagnose_stale_tokens(lines: list[dict], file_path: str) -> DiagnosticResult
         ("estimated", estimated),
     ]
 
-    if stale_count == 0:
+    if stale_count == 0 and estimated < 100:
         severity = "ok"
         summary = "No usage data found"
+    elif stale_count == 0 and estimated >= 100:
+        severity = "warning"
+        summary = f"Usage data missing but session has ~{estimated:,} est tokens"
     elif estimated < 100:
         # Estimate too low to be reliable (non-text content) — don't flag
         severity = "ok"
@@ -285,7 +313,9 @@ def diagnose_stale_tokens(lines: list[dict], file_path: str) -> DiagnosticResult
         severity=severity,
         summary=summary,
         sparkline_data=sparkline,
-        fix_description="Strip all message.usage fields" if fix_fn else "",
+        fix_description=f"Recalibrate usage to ~{estimated:,} estimated tokens"
+        if fix_fn
+        else "",
         fix_fn=fix_fn,
     )
 

@@ -1565,6 +1565,7 @@ def fix_orphaned_tool_results(kept_objs):
                 if uid:
                     use_ids.add(uid)
     orphans = 0
+    dropped_uuids = {}  # uuid -> parentUuid for reparenting
     result = []
     for obj in kept_objs:
         blocks = get_content_blocks(obj)
@@ -1593,7 +1594,26 @@ def fix_orphaned_tool_results(kept_objs):
                 obj["message"]["content"] = new_blocks
             result.append(obj)
         else:
+            # Entire message dropped — record for reparenting
+            uuid = obj.get("uuid")
+            if uuid:
+                dropped_uuids[uuid] = obj.get("parentUuid")
             orphans += 1
+
+    # Reparent children of dropped messages
+    if dropped_uuids:
+        reparented = 0
+        for obj in result:
+            parent = obj.get("parentUuid")
+            if parent in dropped_uuids:
+                # Walk the chain to find a non-dropped ancestor
+                visited = set()
+                while parent in dropped_uuids and parent not in visited:
+                    visited.add(parent)
+                    parent = dropped_uuids[parent]
+                obj["parentUuid"] = parent
+                reparented += 1
+
     return result, orphans
 
 

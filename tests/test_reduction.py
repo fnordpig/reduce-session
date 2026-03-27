@@ -977,3 +977,59 @@ def test_replace_dead_persisted_outputs_keeps_existing():
     finally:
         os.unlink(real_file)
         os.unlink(real_path)
+
+
+def test_fix_orphaned_tool_results_reparents_chain():
+    """Dropping a message with only orphaned tool_results must reparent children."""
+    from reduce_session.reduction import fix_orphaned_tool_results
+
+    objs = [
+        {
+            "uuid": "u1",
+            "parentUuid": None,
+            "type": "assistant",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "id": "tu1", "name": "Bash", "input": {}}
+                ]
+            },
+        },
+        {
+            "uuid": "u2",
+            "parentUuid": "u1",
+            "type": "user",
+            "message": {
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tu1", "content": "ok"}
+                ]
+            },
+        },
+        {
+            "uuid": "u3",
+            "parentUuid": "u2",
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu_orphan",
+                        "content": "dead",
+                    }
+                ]
+            },
+        },
+        {
+            "uuid": "u4",
+            "parentUuid": "u3",
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "hello"}]},
+        },
+    ]
+
+    result, orphans = fix_orphaned_tool_results(objs)
+    assert orphans >= 1
+    # u3 was dropped — u4 should be reparented to u2
+    u4 = next(o for o in result if o.get("uuid") == "u4")
+    assert u4["parentUuid"] == "u2", (
+        f"u4 should be reparented to u2, got {u4['parentUuid']}"
+    )

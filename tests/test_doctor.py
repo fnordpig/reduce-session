@@ -343,12 +343,12 @@ class TestStaleTokens:
 
         result = diagnose_stale_tokens(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["usage_stripped"] == 1
-        # Verify usage is gone
-        for obj in lines:
-            msg = obj.get("message", {})
-            if isinstance(msg, dict):
-                assert "usage" not in msg
+        assert "usage_recalibrated" in stats
+        # Verify usage was recalibrated (not stripped)
+        a1 = next(l for l in lines if l.get("uuid") == "a-1")
+        usage = a1["message"]["usage"]
+        assert usage["input_tokens"] > 0
+        assert usage["input_tokens"] != 50000  # changed from original
 
 
 # --- diagnose_unreduced_metadata ---
@@ -561,7 +561,7 @@ class TestApplyFixes:
 
         stats = apply_fixes(lines, str(path), [d_meta, d_tokens])
         assert "progress" in stats
-        assert "usage_stripped" in stats
+        assert "usage_recalibrated" in stats
 
     def test_skips_none_fix_fns(self, tmp_path):
         lines = _make_lines(
