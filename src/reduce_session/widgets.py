@@ -1716,9 +1716,24 @@ class DoctorModal(ModalScreen[bool]):
 
     def _do_apply(self) -> None:
         import json
+        import os
+        import tempfile
+        from pathlib import Path
 
         from reduce_session.doctor import apply_fixes
         from reduce_session.git_ops import ensure_git_repo, git_snapshot
+
+        p = Path(self.session_path)
+        project_dir = str(p.parent)
+        basename = p.name
+        short = p.stem[:8]
+
+        # Pre-fix snapshot — ensures we can always roll back
+        try:
+            ensure_git_repo(project_dir)
+            git_snapshot(project_dir, basename, None, f"doctor: pre-fix {short}")
+        except Exception:
+            pass
 
         with open(self.session_path) as f:
             lines = []
@@ -1738,9 +1753,6 @@ class DoctorModal(ModalScreen[bool]):
         stats = apply_fixes(lines, self.session_path, selected_diags)
 
         # Atomic write — temp file then rename
-        import os
-        import tempfile
-
         tmp_fd, tmp_path = tempfile.mkstemp(
             dir=os.path.dirname(self.session_path), suffix=".tmp"
         )
@@ -1753,18 +1765,19 @@ class DoctorModal(ModalScreen[bool]):
             os.unlink(tmp_path)
             raise
 
-        # Git snapshot
-        from pathlib import Path
-
-        p = Path(self.session_path)
-        project_dir = str(p.parent)
-        basename = p.name
-        short = p.stem[:8]
+        # Post-fix snapshot
+        fix_names = [
+            self._diagnostics[i].name
+            for i in sorted(self._selected)
+            if i < len(self._diagnostics)
+        ]
+        fix_summary = ", ".join(fix_names) if fix_names else "fixes"
         try:
-            ensure_git_repo(project_dir)
-            git_snapshot(project_dir, basename, None, f"doctor fixes {short}")
+            git_snapshot(
+                project_dir, basename, None, f"doctor: {fix_summary} ({short})"
+            )
         except Exception:
-            pass  # git optional
+            pass
 
         self._fix_stats = stats
         self._selected.clear()
