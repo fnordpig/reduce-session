@@ -12,7 +12,7 @@ import os
 from rich.style import Style
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, LoadingIndicator, Static
 from textual.worker import Worker, WorkerState
@@ -1514,7 +1514,8 @@ class DoctorModal(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="doctor-container"):
             yield Static("", id="doctor-title")
-            yield Static("Running diagnostics...", id="doctor-results")
+            with VerticalScroll(id="doctor-scroll"):
+                yield Static("Running diagnostics...", id="doctor-results")
             with Horizontal(id="doctor-actions"):
                 yield Button("Apply Selected", id="btn-apply-doctor", variant="success")
                 yield Button("Close", id="btn-close-doctor")

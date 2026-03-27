@@ -237,7 +237,6 @@ DoctorModal {
     border: solid;
     background: $surface;
     padding: 1 2;
-    overflow-y: auto;
 }
 
 #doctor-title {
@@ -246,9 +245,12 @@ DoctorModal {
     padding: 0 0 1 0;
 }
 
-#doctor-results {
+#doctor-scroll {
     height: 1fr;
-    overflow-y: auto;
+}
+
+#doctor-results {
+    height: auto;
 }
 
 #doctor-actions {
