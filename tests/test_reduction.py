@@ -905,3 +905,75 @@ def test_agent_result_limit_scales_with_aggr():
     assert agent_limit(1.0) == 200  # floor at 200
     # Limit at aggr=0.6 is strictly less than at aggr=0.4
     assert agent_limit(0.6) < agent_limit(0.4)
+
+
+def test_replace_dead_persisted_outputs():
+    from reduce_session.reduction import _replace_dead_persisted_outputs
+
+    # Simulate a message with a dead persisted-output reference
+    objs = [
+        {
+            "type": "user",
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tu1",
+                        "content": "<persisted-output>\nOutput too large (60KB). "
+                        "Full output saved to: /nonexistent/path/tool-results/abc123.txt\n\n"
+                        "Preview:\nhello\n</persisted-output>",
+                    }
+                ]
+            },
+        }
+    ]
+
+    count = _replace_dead_persisted_outputs(objs)
+    assert count == 1
+
+    result_content = objs[0]["message"]["content"][0]["content"]
+    assert "output file removed" in result_content
+    assert "persisted-output" not in result_content
+    assert len(result_content) < 100  # much smaller than original
+
+
+def test_replace_dead_persisted_outputs_keeps_existing():
+    """Don't replace references to files that still exist."""
+    import tempfile
+
+    from reduce_session.reduction import _replace_dead_persisted_outputs
+
+    # Create a real file
+    with tempfile.NamedTemporaryFile(
+        suffix=".txt", dir=tempfile.gettempdir(), delete=False, prefix="tool-results-"
+    ) as f:
+        f.write(b"real output")
+        real_path = f.name
+
+    # Make a path that looks like tool-results/xxx
+    # The regex requires /tool-results/ in the path
+    import os
+
+    tool_results_dir = os.path.join(tempfile.gettempdir(), "tool-results")
+    os.makedirs(tool_results_dir, exist_ok=True)
+    real_file = os.path.join(tool_results_dir, "real123.txt")
+    with open(real_file, "w") as f:
+        f.write("exists")
+
+    try:
+        objs = [
+            {
+                "type": "user",
+                "message": {
+                    "content": f"<persisted-output>\nOutput too large. "
+                    f"Full output saved to: {real_file}\n</persisted-output>",
+                },
+            }
+        ]
+
+        count = _replace_dead_persisted_outputs(objs)
+        assert count == 0
+        assert "persisted-output" in objs[0]["message"]["content"]
+    finally:
+        os.unlink(real_file)
+        os.unlink(real_path)

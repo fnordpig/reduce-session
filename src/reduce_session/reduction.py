@@ -1416,6 +1416,60 @@ def collapse_edit_sequences(kept_objs, aggr_fn):
     return {"edit_sequences_collapsed": collapsed} if collapsed else {}
 
 
+def _replace_dead_persisted_outputs(kept_objs):
+    """Replace <persisted-output> blocks that point to missing files.
+
+    When tool output was too large, Claude Code saved it to a tool-results/
+    file and left a truncation notice in the message. After reduction strips
+    content, these files may be orphaned/deleted. The notice becomes dead
+    weight pointing to a file that no longer exists.
+    """
+    import os
+
+    _PERSISTED_RE = re.compile(
+        r"<persisted-output>\s*Output too large.*?saved to:\s*(\S+/tool-results/\S+)"
+        r".*?</persisted-output>",
+        re.DOTALL,
+    )
+    replaced = 0
+
+    for obj in kept_objs:
+        msg = obj.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            for m in _PERSISTED_RE.finditer(content):
+                fpath = m.group(1)
+                if not os.path.exists(fpath):
+                    fname = os.path.basename(fpath)
+                    content = content.replace(
+                        m.group(0), f"[output file removed: {fname}]"
+                    )
+                    replaced += 1
+            if replaced:
+                msg["content"] = content
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                for key in ("text", "content"):
+                    val = block.get(key)
+                    if not isinstance(val, str):
+                        continue
+                    for m in _PERSISTED_RE.finditer(val):
+                        fpath = m.group(1)
+                        if not os.path.exists(fpath):
+                            fname = os.path.basename(fpath)
+                            val = val.replace(
+                                m.group(0), f"[output file removed: {fname}]"
+                            )
+                            replaced += 1
+                    block[key] = val
+
+    return replaced
+
+
 def nuclear_tool_replace(kept_objs, aggr_fn, tool_id_map):
     """At aggr > 0.8, replace ALL tool content with one-line summaries."""
     total = len(kept_objs)
@@ -2316,6 +2370,11 @@ def reduce_session(
     # -- Pass 3.55: Collapse edit sequences --
     edit_collapse_stats = collapse_edit_sequences(kept_objs, aggr_fn)
     stats.update(edit_collapse_stats)
+
+    # -- Pass 3.55: Replace dead persisted-output references --
+    dead_output_count = _replace_dead_persisted_outputs(kept_objs)
+    if dead_output_count:
+        stats["dead_output_refs_replaced"] = dead_output_count
 
     # -- Pass 3.6: Nuclear tool content replacement (deep middle zone) --
     nuclear_stats = nuclear_tool_replace(kept_objs, aggr_fn, tool_id_map)
