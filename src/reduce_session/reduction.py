@@ -1468,6 +1468,28 @@ def trim_tool_result(block, tool_name, aggr, agg_lim, gen_lim):
                 item["text"] = truncate(text, item_limit, tool_name)
 
 
+def _trim_tur_deep(tur, key, aggr, limit):
+    """Trim a TUR field that may be str or dict with nested string values."""
+    val = tur.get(key)
+    if isinstance(val, str):
+        val = structural_compress(val, aggr)
+        tur[key] = truncate(val, limit, f"tur.{key}") if len(val) > limit else val
+    elif isinstance(val, dict):
+        # Recursively compress/truncate all string values in the dict
+        total = len(json.dumps(val))
+        if total > limit:
+            for k, v in val.items():
+                if isinstance(v, str) and len(v) > 200:
+                    v = structural_compress(v, aggr)
+                    val[k] = truncate(v, max(limit // 4, 200), f"tur.{key}.{k}")
+                elif isinstance(v, list):
+                    # Truncate long lists (e.g., message arrays in task)
+                    if len(json.dumps(v)) > limit // 2:
+                        val[k] = (
+                            v[:3] + [{"_truncated": len(v) - 3}] if len(v) > 3 else v
+                        )
+
+
 def trim_toolUseResult(tur, aggr, agg_lim, gen_lim):
     if not isinstance(tur, dict):
         return
@@ -1498,6 +1520,14 @@ def trim_toolUseResult(tur, aggr, agg_lim, gen_lim):
                 if isinstance(pl, list) and len(pl) > max_lines:
                     half = max_lines // 2
                     patch["lines"] = pl[:half] + ["[...truncated...]"] + pl[-half:]
+    # Agent task/prompt/result fields
+    _trim_tur_deep(tur, "task", aggr, bl("tur.content"))
+    if isinstance(tur.get("prompt"), str):
+        tur["prompt"] = structural_compress(tur["prompt"], aggr)
+    trim_string(tur, "prompt", bl("tur.content"), "tur.prompt")
+    if isinstance(tur.get("result"), str):
+        tur["result"] = structural_compress(tur["result"], aggr)
+    trim_string(tur, "result", bl("tur.content"), "tur.result")
     file_val = tur.get("file")
     fl = bl("tur.file")
     if isinstance(file_val, dict):
