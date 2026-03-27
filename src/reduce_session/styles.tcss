@@ -254,7 +254,9 @@ DoctorModal {
 }
 
 #doctor-actions Button {
-    height: 3;
+    height: 1;
+    min-height: 1;
+    padding: 0 1;
     margin: 0 0 0 1;
 }
 
