@@ -1557,6 +1557,7 @@ class DoctorModal(ModalScreen[bool]):
         from reduce_session.doctor import (
             diagnose_bloated_tur,
             diagnose_compaction_summaries,
+            diagnose_orphaned_tool_results,
             diagnose_overlapping_files,
             diagnose_parent_chain,
             diagnose_reduce_tags,
@@ -1582,6 +1583,7 @@ class DoctorModal(ModalScreen[bool]):
             diagnose_unreduced_metadata(lines, self.session_path),
             diagnose_reduce_tags(lines, self.session_path),
             diagnose_bloated_tur(lines, self.session_path),
+            diagnose_orphaned_tool_results(lines, self.session_path),
         ]
         self._diagnostics = diagnostics
 
@@ -1724,6 +1726,18 @@ class DoctorModal(ModalScreen[bool]):
                 text.append(spark_chars[idx], style="#ee4444")
             text.append("\n")
 
+        elif d.name == "orphaned_tool_results" and d.sparkline_data:
+            bins = self._bucket_bool_sparkline(d.sparkline_data)
+            text.append("  ")
+            for hits, total in bins:
+                if hits > 0:
+                    text.append("\u2588", style="#ee4444")
+                elif total > 0:
+                    text.append("\u2581", style="#44aa88")
+                else:
+                    text.append(" ")
+            text.append("\n")
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-close-doctor":
             self.dismiss(False)
@@ -1816,6 +1830,7 @@ class DoctorModal(ModalScreen[bool]):
         from reduce_session.doctor import (
             diagnose_bloated_tur,
             diagnose_compaction_summaries,
+            diagnose_orphaned_tool_results,
             diagnose_overlapping_files,
             diagnose_parent_chain,
             diagnose_reduce_tags,
@@ -1841,6 +1856,7 @@ class DoctorModal(ModalScreen[bool]):
             diagnose_unreduced_metadata(lines, self.session_path),
             diagnose_reduce_tags(lines, self.session_path),
             diagnose_bloated_tur(lines, self.session_path),
+            diagnose_orphaned_tool_results(lines, self.session_path),
         ]
         self.app.call_from_thread(self._render_post_fix)
 

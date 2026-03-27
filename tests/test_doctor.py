@@ -646,3 +646,55 @@ class TestRenderSeverityColors:
         assert DoctorModal._SEVERITY_ICONS["critical"] == "\u2717"
         assert DoctorModal._SEVERITY_ICONS["warning"] == "\u26a0"
         assert DoctorModal._SEVERITY_ICONS["info"] == "\u26a0"
+
+
+class TestOrphanedToolResults:
+    def test_no_results_dir_is_ok(self, tmp_path):
+        from reduce_session.doctor import diagnose_orphaned_tool_results
+
+        lines = [{"type": "user", "uuid": "u1", "message": {"content": "hi"}}]
+        path = tmp_path / "test.jsonl"
+        path.write_text(json.dumps(lines[0]))
+        result = diagnose_orphaned_tool_results(lines, str(path))
+        assert result.severity == "ok"
+
+    def test_detects_orphaned_files(self, tmp_path):
+        from reduce_session.doctor import diagnose_orphaned_tool_results
+
+        # Create session file
+        session_id = "abcd1234-0000-0000-0000-000000000000"
+        path = tmp_path / f"{session_id}.jsonl"
+        lines = [
+            {"type": "user", "uuid": "u1", "message": {"content": "hello ref_file1"}}
+        ]
+        path.write_text(json.dumps(lines[0]))
+
+        # Create tool-results dir with orphaned and referenced files
+        results_dir = tmp_path / session_id / "tool-results"
+        results_dir.mkdir(parents=True)
+        (results_dir / "ref_file1.txt").write_text("x" * 1000)  # referenced
+        (results_dir / "orphan1.txt").write_text("y" * 5000)  # orphaned
+
+        result = diagnose_orphaned_tool_results(lines, str(path))
+        assert result.severity in ("info", "warning")
+        assert "1 orphaned" in result.summary
+        assert result.fix_fn is not None
+
+    def test_fix_deletes_orphaned(self, tmp_path):
+        from reduce_session.doctor import diagnose_orphaned_tool_results
+
+        session_id = "abcd1234-0000-0000-0000-000000000000"
+        path = tmp_path / f"{session_id}.jsonl"
+        lines = [{"type": "user", "uuid": "u1", "message": {"content": "keep ref1"}}]
+        path.write_text(json.dumps(lines[0]))
+
+        results_dir = tmp_path / session_id / "tool-results"
+        results_dir.mkdir(parents=True)
+        (results_dir / "ref1.txt").write_text("kept")
+        (results_dir / "orphan.txt").write_text("deleted")
+
+        result = diagnose_orphaned_tool_results(lines, str(path))
+        stats = result.fix_fn(lines)
+        assert stats["orphaned_files_deleted"] == 1
+        assert not (results_dir / "orphan.txt").exists()
+        assert (results_dir / "ref1.txt").exists()

@@ -563,6 +563,108 @@ def diagnose_bloated_tur(lines: list[dict], file_path: str) -> DiagnosticResult:
 
 
 # ---------------------------------------------------------------------------
+# 8. Orphaned tool-result files
+# ---------------------------------------------------------------------------
+
+
+def _fix_orphaned_tool_results_files(lines: list[dict], file_path: str = "") -> dict:
+    """Delete tool-result files that are no longer referenced in the JSONL."""
+    import shutil
+
+    p = Path(file_path)
+    results_dir = p.parent / p.stem / "tool-results"
+    if not results_dir.is_dir():
+        return {"orphaned_files_deleted": 0, "bytes_freed": 0}
+
+    # Build set of referenced filenames
+    jsonl_text = "\n".join(
+        line.get("_raw", "") if isinstance(line, dict) else "" for line in lines
+    )
+    # Fallback: re-serialize to check references
+    import json
+
+    if not jsonl_text.strip():
+        jsonl_text = "\n".join(json.dumps(line) for line in lines)
+
+    deleted = 0
+    bytes_freed = 0
+    for f in results_dir.iterdir():
+        if not f.is_file():
+            continue
+        stem = f.stem
+        if stem not in jsonl_text:
+            bytes_freed += f.stat().st_size
+            f.unlink()
+            deleted += 1
+
+    return {"orphaned_files_deleted": deleted, "bytes_freed": bytes_freed}
+
+
+def diagnose_orphaned_tool_results(
+    lines: list[dict], file_path: str
+) -> DiagnosticResult:
+    """Check for tool-result files on disk not referenced in the JSONL."""
+    import json
+
+    p = Path(file_path)
+    results_dir = p.parent / p.stem / "tool-results"
+    if not results_dir.is_dir():
+        return DiagnosticResult(
+            name="orphaned_tool_results",
+            severity="ok",
+            summary="No tool-results directory",
+            sparkline_data=[],
+            fix_description="",
+            fix_fn=None,
+        )
+
+    jsonl_text = "\n".join(json.dumps(line) for line in lines)
+
+    orphaned = 0
+    orphaned_bytes = 0
+    referenced = 0
+    for f in sorted(results_dir.iterdir()):
+        if not f.is_file():
+            continue
+        stem = f.stem
+        if stem in jsonl_text:
+            referenced += 1
+        else:
+            orphaned += 1
+            orphaned_bytes += f.stat().st_size
+
+    total = orphaned + referenced
+    sparkline: list[tuple[float, bool]] = []
+    for i, f in enumerate(sorted(results_dir.iterdir())):
+        if not f.is_file():
+            continue
+        pos = i / max(total - 1, 1)
+        sparkline.append((pos, f.stem not in jsonl_text))
+
+    if orphaned > 0:
+        mb = orphaned_bytes / 1024 / 1024
+        return DiagnosticResult(
+            name="orphaned_tool_results",
+            severity="warning" if mb > 10 else "info",
+            summary=f"{orphaned} orphaned file(s) ({mb:.1f} MB), {referenced} referenced",
+            sparkline_data=sparkline,
+            fix_description=f"Delete {orphaned} orphaned tool-result file(s) ({mb:.1f} MB)",
+            fix_fn=lambda lines, fp=file_path: _fix_orphaned_tool_results_files(
+                lines, fp
+            ),
+        )
+
+    return DiagnosticResult(
+        name="orphaned_tool_results",
+        severity="ok",
+        summary=f"{referenced} tool-result file(s), all referenced",
+        sparkline_data=sparkline,
+        fix_description="",
+        fix_fn=None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
