@@ -2513,16 +2513,19 @@ def reduce_session(
                             count("thinking_truncated")
                         else:
                             block["thinking"] = thinking
-                        # Strip signature from empty thinking blocks — opaque
-                        # ciphertext, ~5KB avg, carries no value without content
+                        # The API requires `signature` on thinking blocks.
+                        # A thinking block without a valid signature causes
+                        # a 400 error on session resume.
                         if not block.get("thinking"):
-                            if block.pop("signature", None) is not None:
+                            # Empty thinking: drop entirely (no content to preserve)
+                            if "signature" in block:
                                 count("thinking_signature_stripped")
-                        # If thinking was truncated, signature is now invalid
-                        # (it signs the original text) — strip it
-                        elif block["thinking"] != original_thinking:
-                            if block.pop("signature", None) is not None:
-                                count("thinking_signature_stripped")
+                            continue
+                        if block["thinking"] != original_thinking:
+                            # Thinking was truncated — signature is now invalid.
+                            # Drop the block to avoid API errors.
+                            count("thinking_signature_stripped")
+                            continue
                         new_content.append(block)
                         continue
 
