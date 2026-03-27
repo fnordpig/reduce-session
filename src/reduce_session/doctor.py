@@ -768,14 +768,39 @@ def diagnose_orphaned_tool_results(
 # ---------------------------------------------------------------------------
 
 
+# Fix ordering: content-removing fixes first, then chain repair, then token recalibration last.
+# This ensures:
+# 1. bloated_tur/metadata removal happens before token estimate
+# 2. parent_chain repair runs after metadata removal (which can expose hidden breaks)
+# 3. stale_tokens recalibration runs last (after all content changes)
+_FIX_ORDER = {
+    "compaction_summaries": 0,
+    "unreduced_metadata": 1,
+    "bloated_tur": 2,
+    "orphaned_tool_results": 3,
+    "parent_chain": 4,  # after metadata removal
+    "reduce_tags": 5,
+    "overlapping_files": 6,
+    "stale_tokens": 9,  # always last — depends on final content size
+}
+
+
 def apply_fixes(
     lines: list[dict],
     file_path: str,
     selected_diagnostics: list[DiagnosticResult],
 ) -> dict:
-    """Run selected fix_fns in order, return combined stats dict."""
+    """Run selected fix_fns in priority order, return combined stats dict.
+
+    Fixes are ordered so content-removing operations run first, chain
+    repair runs after, and token recalibration runs last.
+    """
+    ordered = sorted(
+        selected_diagnostics,
+        key=lambda d: _FIX_ORDER.get(d.name, 5),
+    )
     combined: dict = {}
-    for diag in selected_diagnostics:
+    for diag in ordered:
         if diag.fix_fn is not None:
             stats = diag.fix_fn(lines)
             if isinstance(stats, dict):
