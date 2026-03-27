@@ -131,6 +131,12 @@ def browse_session(session_path: str, page: int = 0, prefix: str = "") -> str:
             end = int(parts[1]) if len(parts) > 1 else start + 1
             end = min(end, n)
             start = max(start, 0)
+            if start >= end:
+                return json.dumps(
+                    {
+                        "error": f"Range out of bounds: {prefix} (session has {n} exchanges)",
+                    }
+                )
         except (ValueError, IndexError):
             return json.dumps({"error": f"Invalid prefix: {prefix}"})
     else:
