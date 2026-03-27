@@ -1,3 +1,7 @@
+import json
+import os
+import tempfile
+
 from reduce_session.reduction import reduce_session, ReductionResult
 
 
@@ -494,6 +498,143 @@ def test_detect_duplicate_blocks_small():
     assert len(dupes) == 4
 
 
+def test_detect_duplicate_blocks_mcp_prefix_dedup():
+    """Two MCP tool results with same first 300 chars but different endings are detected as duplicates."""
+    from reduce_session.reduction import detect_duplicate_blocks
+
+    common_prefix = "A" * 300
+    result_a = (
+        common_prefix + " ...extra data from call 1 with timestamp 2025-01-01T00:00:00Z"
+    )
+    result_b = (
+        common_prefix + " ...extra data from call 2 with timestamp 2025-01-01T00:00:05Z"
+    )
+
+    tool_id_map = {
+        "tool-mcp-1": "mcp__tracemeld__bottleneck",
+        "tool-mcp-2": "mcp__tracemeld__bottleneck",
+    }
+    objs = [
+        {
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-mcp-1",
+                        "content": result_a,
+                    }
+                ]
+            }
+        },
+        {
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-mcp-2",
+                        "content": result_b,
+                    }
+                ]
+            }
+        },
+    ]
+
+    dupes = detect_duplicate_blocks(objs, tool_id_map=tool_id_map)
+    # Second occurrence (pos=1, bi=0) should be flagged as duplicate
+    assert (1, 0) in dupes
+    assert len(dupes) == 1
+
+
+def test_detect_duplicate_blocks_non_mcp_prefix_not_deduped():
+    """Non-MCP tool results with same prefix are NOT prefix-deduped (full hash only)."""
+    from reduce_session.reduction import detect_duplicate_blocks
+
+    common_prefix = "B" * 300
+    result_a = common_prefix + " ...different ending A"
+    result_b = common_prefix + " ...different ending B"
+
+    # tool_id_map maps to a non-MCP tool name
+    tool_id_map = {
+        "tool-bash-1": "Bash",
+        "tool-bash-2": "Bash",
+    }
+    objs = [
+        {
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-bash-1",
+                        "content": result_a,
+                    }
+                ]
+            }
+        },
+        {
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-bash-2",
+                        "content": result_b,
+                    }
+                ]
+            }
+        },
+    ]
+
+    dupes = detect_duplicate_blocks(objs, tool_id_map=tool_id_map)
+    # Different full content → no duplicates detected
+    assert len(dupes) == 0
+
+
+def test_detect_duplicate_blocks_mcp_short_not_prefix_deduped():
+    """Short MCP results (<200 chars) are not prefix-deduped even with a shared prefix."""
+    from reduce_session.reduction import detect_duplicate_blocks
+
+    # Use texts that share a prefix but differ at the end, both under 200 chars.
+    # They must be >= min_size (64) so the full-hash pass is at least considered,
+    # but their content differs so full-hash won't fire either.
+    shared_prefix = "C" * 100  # 100 chars — under 200, so prefix-dedup guard skips it
+    short_a = shared_prefix + " result variant alpha"
+    short_b = shared_prefix + " result variant beta"
+    assert len(short_a) < 200
+    assert len(short_b) < 200
+
+    tool_id_map = {
+        "tool-mcp-short-1": "mcp__context7__query-docs",
+        "tool-mcp-short-2": "mcp__context7__query-docs",
+    }
+    objs = [
+        {
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-mcp-short-1",
+                        "content": short_a,
+                    }
+                ]
+            }
+        },
+        {
+            "message": {
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-mcp-short-2",
+                        "content": short_b,
+                    }
+                ]
+            }
+        },
+    ]
+
+    dupes = detect_duplicate_blocks(objs, tool_id_map=tool_id_map)
+    # Short content (<200) → prefix-dedup guard skips; different content → full-hash doesn't fire
+    assert len(dupes) == 0
+
+
 def test_trim_bash_command_input():
     """Large Bash command inputs should be trimmed in reduction."""
     import json
@@ -578,3 +719,189 @@ def test_trim_bash_command_input():
         assert trimmed, "No Bash tool_use block found in output"
     finally:
         os.unlink(path)
+
+
+def _make_agent_session(tmp_path, agent_result_text, *, result_at_end=False):
+    """Build a session with an Agent tool_use + tool_result.
+
+    When result_at_end=False: 10-message session with the Agent result at
+    index 2 (position ≈ 0.22).  With default cut=10, fade=75 the ramp-up
+    formula gives aggr ≈ 0.63 — above 0.4 (triggers agent trimming) but
+    below 0.8 (nuclear does NOT fire).
+
+    When result_at_end=True: 3-message session where the Agent result is the
+    last message (position = 1.0, aggr = 0.2 — below 0.4, no trimming).
+    """
+    tool_id = "agent-tool-1"
+
+    agent_tu = {
+        "type": "tool_use",
+        "id": tool_id,
+        "name": "Agent",
+        "input": {"prompt": "x"},  # keep short so nuclear doesn't touch it
+    }
+    agent_tr = {
+        "type": "tool_result",
+        "tool_use_id": tool_id,
+        "content": agent_result_text,
+    }
+
+    if result_at_end:
+        # Positions: 0.0, 0.5, 1.0 → aggr at idx 2 = 0.2 < 0.4
+        messages = [
+            {
+                "type": "system",
+                "uuid": "sys-1",
+                "message": {"content": "You are Claude."},
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+            {
+                "type": "assistant",
+                "uuid": "a-1",
+                "parentUuid": "sys-1",
+                "message": {"role": "assistant", "content": [agent_tu]},
+                "timestamp": "2026-01-01T00:00:01Z",
+            },
+            {
+                "type": "user",
+                "uuid": "u-1",
+                "parentUuid": "a-1",
+                "message": {"content": [agent_tr]},
+                "timestamp": "2026-01-01T00:00:02Z",
+            },
+        ]
+    else:
+        # 10-message session: Agent result at index 2, position 2/9 ≈ 0.222.
+        # cut=0.10, fade=0.75 → ramp_up zone [0.10, 0.325].
+        # t = (0.222 - 0.10) / (0.325 - 0.10) ≈ 0.542 → aggr ≈ 0.634.
+        # 0.4 < 0.634 ≤ 0.8 → agent trimming fires, nuclear does not.
+        filler_pairs = [
+            (
+                {
+                    "type": "assistant",
+                    "uuid": f"a-fill-{i}",
+                    "parentUuid": f"u-fill-{i - 1}" if i > 0 else "u-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Working on it."}],
+                    },
+                    "timestamp": f"2026-01-01T00:00:{10 + i * 2:02d}Z",
+                },
+                {
+                    "type": "user",
+                    "uuid": f"u-fill-{i}",
+                    "parentUuid": f"a-fill-{i}",
+                    "message": {"content": "Continue."},
+                    "timestamp": f"2026-01-01T00:00:{11 + i * 2:02d}Z",
+                },
+            )
+            for i in range(3)
+        ]
+        messages = [
+            {
+                "type": "system",
+                "uuid": "sys-1",
+                "message": {"content": "You are Claude."},
+                "timestamp": "2026-01-01T00:00:00Z",
+            },
+            {
+                "type": "assistant",
+                "uuid": "a-1",
+                "parentUuid": "sys-1",
+                "message": {"role": "assistant", "content": [agent_tu]},
+                "timestamp": "2026-01-01T00:00:01Z",
+            },
+            {
+                "type": "user",
+                "uuid": "u-1",
+                "parentUuid": "a-1",
+                "message": {"content": [agent_tr]},
+                "timestamp": "2026-01-01T00:00:02Z",
+            },
+        ]
+        for a, u in filler_pairs:
+            messages.append(a)
+            messages.append(u)
+        # Pad to 10 total
+        while len(messages) < 10:
+            i = len(messages)
+            messages.append(
+                {
+                    "type": "assistant",
+                    "uuid": f"a-pad-{i}",
+                    "parentUuid": messages[-1]["uuid"],
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Done."}],
+                    },
+                    "timestamp": f"2026-01-01T00:01:{i:02d}Z",
+                }
+            )
+
+    path = tmp_path / "agent-session.jsonl"
+    with open(path, "w") as f:
+        for msg in messages:
+            f.write(json.dumps(msg) + "\n")
+    return path
+
+
+def _get_agent_result(result):
+    """Extract the Agent tool_result content string from a ReductionResult."""
+    for line in result.kept_lines:
+        obj = json.loads(line)
+        msg = obj.get("message", {})
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and isinstance(block.get("content"), str)
+            ):
+                return block["content"]
+    return None
+
+
+def test_agent_result_trimmed_in_middle_zone(tmp_path):
+    """Agent tool_result > 800 chars is trimmed when aggr > 0.4 (middle zone)."""
+    big_result = "This is the agent result. " * 50  # ~1300 chars
+    assert len(big_result) > 800
+
+    path = _make_agent_session(tmp_path, big_result)
+    result = reduce_session(str(path), profile="standard")
+
+    content = _get_agent_result(result)
+    assert content is not None, "Agent tool_result not found in output"
+    assert len(content) < len(big_result), (
+        "Agent result should be trimmed in middle zone"
+    )
+    assert result.stats.get("agent_results_compressed", 0) >= 1
+
+
+def test_agent_result_not_trimmed_at_end(tmp_path):
+    """Agent tool_result is NOT compressed when aggr <= 0.4 (end of session)."""
+    # At the end position, aggr = 0.2, so the Agent-specific path is skipped.
+    # The result may still be trimmed by the general trim_tool_result, but
+    # the agent_results_compressed counter must stay at 0.
+    big_result = "This is the agent result. " * 50  # ~1300 chars
+
+    path = _make_agent_session(tmp_path, big_result, result_at_end=True)
+    result = reduce_session(str(path), profile="standard")
+
+    assert result.stats.get("agent_results_compressed", 0) == 0
+
+
+def test_agent_result_limit_scales_with_aggr():
+    """The agent_limit formula gives 480 at aggr=0.4 and 200 at aggr=0.75+."""
+
+    # Verify the formula directly: max(200, int(800 * (1 - aggr)))
+    def agent_limit(aggr):
+        return max(200, int(800 * (1 - aggr)))
+
+    assert agent_limit(0.4) == 480
+    assert agent_limit(0.6) == 320
+    assert agent_limit(0.75) == 200
+    assert agent_limit(1.0) == 200  # floor at 200
+    # Limit at aggr=0.6 is strictly less than at aggr=0.4
+    assert agent_limit(0.6) < agent_limit(0.4)

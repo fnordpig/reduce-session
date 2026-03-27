@@ -98,7 +98,7 @@ PROFILES = {
             "tur.file": 3000,
             "tool_input.Write": 3000,
             "tool_input.Edit": 2000,
-            "tool_input.Agent": 4000,
+            "tool_input.Agent": 3000,
             "tool_input.Bash": 3000,
             "thinking": 3000,
             "user_text": 8000,
@@ -946,7 +946,7 @@ def detect_stale_reads(kept_objs):
     return stale_ids
 
 
-def detect_duplicate_blocks(kept_objs, min_size=64):
+def detect_duplicate_blocks(kept_objs, min_size=64, tool_id_map=None):
     block_hashes = {}
     for pos, obj in enumerate(kept_objs):
         for bi, block in enumerate(get_content_blocks(obj)):
@@ -954,6 +954,26 @@ def detect_duplicate_blocks(kept_objs, min_size=64):
             if len(text) >= min_size:
                 h = hashlib.md5(text.encode()).hexdigest()
                 block_hashes.setdefault(h, []).append((pos, bi, len(text)))
+
+    # Prefix-based dedup for MCP tool results (often differ only in timestamps/ordering)
+    PREFIX_LEN = 300
+    for pos, obj in enumerate(kept_objs):
+        for bi, block in enumerate(get_content_blocks(obj)):
+            if block.get("type") != "tool_result":
+                continue
+            tool_id = block.get("tool_use_id", "")
+            # Check if this is an MCP tool result
+            tool_name = tool_id_map.get(tool_id, "") if tool_id_map else ""
+            if not tool_name.startswith("mcp__"):
+                continue
+            text = text_of(block)
+            if len(text) < 200:
+                continue
+            prefix = text[:PREFIX_LEN]
+            prefix_hash = hashlib.md5(prefix.encode()).hexdigest()
+            key = f"mcp_prefix:{prefix_hash}"
+            block_hashes.setdefault(key, []).append((pos, bi, len(text)))
+
     duplicates = set()
     for h, occurrences in block_hashes.items():
         if len(occurrences) > 1:
@@ -1296,6 +1316,52 @@ def detect_superseded_edits(kept_objs):
         for pos, bi in edits[:-1]:
             results[pos] = f"[Edit: {_strip_non_ascii(fp)} - superseded by later edit]"
     return results
+
+
+def detect_blind_edits(kept_objs):
+    """Detect Edit/Write tool_use blocks where the file was not read first.
+
+    Returns set of (position, block_index) tuples for tool_result blocks
+    that correspond to blind edits — these can be aggressively trimmed.
+    """
+    # Build tool_use map: tool_use_id -> (pos, name, file_path)
+    tool_uses = {}
+    for pos, obj in enumerate(kept_objs):
+        for bi, block in enumerate(get_content_blocks(obj)):
+            if block.get("type") == "tool_use":
+                name = block.get("name", "")
+                inp = block.get("input", {})
+                if isinstance(inp, dict):
+                    fp = inp.get("file_path", "")
+                    tool_uses[block.get("id", "")] = (pos, name, fp)
+
+    # Track files read at each position
+    read_positions = {}  # file_path -> last position read
+
+    for pos, obj in enumerate(kept_objs):
+        for block in get_content_blocks(obj):
+            if block.get("type") == "tool_use":
+                name = block.get("name", "")
+                inp = block.get("input", {})
+                if isinstance(inp, dict):
+                    fp = inp.get("file_path", "")
+                    if name == "Read" and fp:
+                        read_positions[fp] = pos
+
+    # Find blind edits: Edit/Write without prior Read
+    blind_result_positions = set()
+    for pos, obj in enumerate(kept_objs):
+        for bi, block in enumerate(get_content_blocks(obj)):
+            if block.get("type") == "tool_result":
+                tool_id = block.get("tool_use_id", "")
+                if tool_id in tool_uses:
+                    use_pos, name, fp = tool_uses[tool_id]
+                    if name in ("Edit", "Write") and fp:
+                        # Check if file was read before this edit
+                        if fp not in read_positions or read_positions[fp] > use_pos:
+                            blind_result_positions.add((pos, bi))
+
+    return blind_result_positions
 
 
 def collapse_edit_sequences(kept_objs, aggr_fn):
@@ -2141,7 +2207,7 @@ def reduce_session(
     stale_read_ids = detect_stale_reads(kept_objs)
     if stale_read_ids:
         stats["stale_reads_detected"] = len(stale_read_ids)
-    duplicate_blocks = detect_duplicate_blocks(kept_objs)
+    duplicate_blocks = detect_duplicate_blocks(kept_objs, tool_id_map=tool_id_map)
     if duplicate_blocks:
         stats["duplicate_blocks_detected"] = len(duplicate_blocks)
     error_retry_drops = detect_error_retries(kept_objs)
@@ -2178,6 +2244,9 @@ def reduce_session(
     confirmations = detect_confirmations(kept_objs)
     stale_read_results = detect_stale_read_results(kept_objs)
     superseded_edits = detect_superseded_edits(kept_objs)
+    blind_edits = detect_blind_edits(kept_objs)
+    if blind_edits:
+        stats["blind_edits_detected"] = len(blind_edits)
 
     total = len(kept_objs)
     sem_passing = 0
@@ -2333,6 +2402,56 @@ def reduce_session(
                                                 "[stale: file was later edited]"
                                             )
                                             count("stale_reads_trimmed")
+                                continue
+
+                        if (pos, bi) in blind_edits and aggr > 0.3:
+                            inner = block.get("content")
+                            if isinstance(inner, str) and len(inner) > 100:
+                                block["content"] = (
+                                    inner[:100] + " [blind edit — file not read first]"
+                                )
+                                count("blind_edits_trimmed")
+                                continue
+                            elif isinstance(inner, list):
+                                for item in inner:
+                                    if (
+                                        isinstance(item, dict)
+                                        and item.get("type") == "text"
+                                    ):
+                                        text = item.get("text", "")
+                                        if len(text) > 100:
+                                            item["text"] = (
+                                                text[:100]
+                                                + " [blind edit — file not read first]"
+                                            )
+                                            count("blind_edits_trimmed")
+                                continue
+
+                        # Agent results: compress aggressively in middle zone
+                        # Agent output is redundant with the code it produced
+                        if tool_name == "Agent" and aggr > 0.4:
+                            inner = block.get("content")
+                            agent_limit = max(
+                                200, int(800 * (1 - aggr))
+                            )  # 800 at aggr=0.4, 200 at aggr=0.75+
+                            if isinstance(inner, str) and len(inner) > agent_limit:
+                                block["content"] = truncate(
+                                    inner, agent_limit, "Agent.result"
+                                )
+                                count("agent_results_compressed")
+                                continue
+                            elif isinstance(inner, list):
+                                for item in inner:
+                                    if (
+                                        isinstance(item, dict)
+                                        and item.get("type") == "text"
+                                    ):
+                                        text = item.get("text", "")
+                                        if len(text) > agent_limit:
+                                            item["text"] = truncate(
+                                                text, agent_limit, "Agent.result"
+                                            )
+                                            count("agent_results_compressed")
                                 continue
 
                         trim_tool_result(block, tool_name, aggr, agg_lim, gen_lim)

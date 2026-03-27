@@ -163,6 +163,155 @@ def test_detect_superseded_edits():
     assert 4 not in result  # only edit of b.rs
 
 
+def test_detect_blind_edits_write_without_read():
+    """Write without a preceding Read is flagged as a blind edit."""
+    from reduce_session.reduction import detect_blind_edits
+
+    objs = [
+        _make_assistant_msg(
+            [
+                _make_tool_use(
+                    "t1", "Write", {"file_path": "/src/a.rs", "content": "fn main() {}"}
+                )
+            ]
+        ),
+        _make_user_msg([_make_tool_result("t1", "File written successfully")]),
+    ]
+    result = detect_blind_edits(objs)
+    # (pos=1, bi=0) — tool_result for the blind Write
+    assert (1, 0) in result
+
+
+def test_detect_blind_edits_write_with_read_not_flagged():
+    """Write with a preceding Read of the same file is NOT flagged."""
+    from reduce_session.reduction import detect_blind_edits
+
+    objs = [
+        _make_assistant_msg(
+            [_make_tool_use("t1", "Read", {"file_path": "/src/a.rs"})],
+            uuid="a1",
+        ),
+        _make_user_msg(
+            [_make_tool_result("t1", "fn main() {}")], uuid="u1", parent="a1"
+        ),
+        _make_assistant_msg(
+            [
+                _make_tool_use(
+                    "t2",
+                    "Write",
+                    {
+                        "file_path": "/src/a.rs",
+                        "content": "fn main() { /* updated */ }",
+                    },
+                )
+            ],
+            uuid="a2",
+            parent="u1",
+        ),
+        _make_user_msg(
+            [_make_tool_result("t2", "File written successfully")],
+            uuid="u2",
+            parent="a2",
+        ),
+    ]
+    result = detect_blind_edits(objs)
+    assert (3, 0) not in result
+
+
+def test_detect_blind_edits_edit_with_read_not_flagged():
+    """Read followed by Edit of same file is NOT flagged."""
+    from reduce_session.reduction import detect_blind_edits
+
+    objs = [
+        _make_assistant_msg(
+            [_make_tool_use("t1", "Read", {"file_path": "/src/b.rs"})],
+            uuid="a1",
+        ),
+        _make_user_msg(
+            [_make_tool_result("t1", "struct Foo {}")], uuid="u1", parent="a1"
+        ),
+        _make_assistant_msg(
+            [
+                _make_tool_use(
+                    "t2",
+                    "Edit",
+                    {
+                        "file_path": "/src/b.rs",
+                        "old_string": "Foo",
+                        "new_string": "Bar",
+                    },
+                )
+            ],
+            uuid="a2",
+            parent="u1",
+        ),
+        _make_user_msg(
+            [_make_tool_result("t2", "Edit applied successfully")],
+            uuid="u2",
+            parent="a2",
+        ),
+    ]
+    result = detect_blind_edits(objs)
+    assert (3, 0) not in result
+
+
+def test_blind_edit_result_truncated_in_reduce_session(tmp_path):
+    """Blind edit results are truncated in the output at high aggressiveness."""
+    from reduce_session.reduction import reduce_session
+
+    long_result = "X" * 500
+
+    # Build a session long enough that middle messages are in high-aggr zone
+    messages = []
+    for i in range(30):
+        messages.append(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "uuid": f"a{i}",
+                    "parentUuid": f"u{i - 1}" if i > 0 else "root",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            _make_tool_use(
+                                f"t{i}",
+                                "Write",
+                                {
+                                    "file_path": f"/src/file{i}.rs",
+                                    "content": "fn main() {}",
+                                },
+                            )
+                        ],
+                    },
+                    "timestamp": f"2026-03-25T{i:02d}:00:00Z",
+                }
+            )
+        )
+        messages.append(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": f"u{i}",
+                    "parentUuid": f"a{i}",
+                    "message": {
+                        "role": "user",
+                        "content": [_make_tool_result(f"t{i}", long_result)],
+                    },
+                    "timestamp": f"2026-03-25T{i:02d}:00:01Z",
+                }
+            )
+        )
+    session_file = tmp_path / "blind_edits.jsonl"
+    session_file.write_text("\n".join(messages) + "\n")
+
+    result = reduce_session(str(session_file))
+    assert result.stats.get("blind_edits_detected", 0) > 0
+    # At least some middle-zone blind edits should have been trimmed
+    assert result.stats.get("blind_edits_trimmed", 0) > 0
+    # The total output should be smaller than leaving them at 500 chars each
+    assert result.new_size < result.orig_size
+
+
 def test_semantic_elision_in_reduce_session(sample_session):
     from reduce_session.reduction import reduce_session
 
