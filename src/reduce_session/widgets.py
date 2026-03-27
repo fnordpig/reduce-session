@@ -1991,13 +1991,21 @@ def parse_browse_exchanges(path: str) -> list[BrowseExchange]:
 
                 token_size = len(json.dumps(obj)) // 4
 
-                # Check for persisted output file
+                # Check for persisted output file — two sources:
+                # 1. toolUseResult.persistedOutputPath (structured)
+                # 2. <persisted-output> tag in tool_result content text
                 output_file = None
                 tur = obj.get("toolUseResult")
                 if isinstance(tur, dict):
                     pop = tur.get("persistedOutputPath")
                     if isinstance(pop, str) and pop:
                         output_file = pop
+                if not output_file and "persisted-output" in full_text:
+                    import re
+
+                    m = re.search(r"saved to:\s*(\S+/tool-results/\S+)", full_text)
+                    if m:
+                        output_file = m.group(1)
 
                 exchanges.append(
                     BrowseExchange(
