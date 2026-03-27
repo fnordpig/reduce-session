@@ -1588,24 +1588,45 @@ class DoctorModal(ModalScreen[bool]):
 
         self.query_one("#doctor-results", Static).update(text)
 
+    _SPARK_WIDTH = 70
+
+    def _bucket_bool_sparkline(self, data, width=None):
+        """Bucket boolean sparkline data [(pos, bool)] into fixed-width bins.
+        Returns list of (hit_count, total_count) per bin."""
+        w = width or self._SPARK_WIDTH
+        if not data:
+            return [(0, 0)] * w
+        bins = [(0, 0)] * w
+        for pos, flag in data:
+            bi = min(int(pos * w), w - 1)
+            hits, total = bins[bi]
+            bins[bi] = (hits + (1 if flag else 0), total + 1)
+        return bins
+
     def _render_sparkline(self, text: Text, d) -> None:
         """Append diagnostic-specific sparkline visualization to *text*."""
         if d.name == "compaction_summaries" and d.sparkline_data:
+            bins = self._bucket_bool_sparkline(d.sparkline_data)
             text.append("  ")
-            for _pos, is_summary in d.sparkline_data:
-                if is_summary:
+            for hits, total in bins:
+                if hits > 0:
                     text.append("\u2588", style="#ee4444")
-                else:
+                elif total > 0:
                     text.append("\u2581", style="#333333")
+                else:
+                    text.append(" ")
             text.append("\n")
 
         elif d.name == "parent_chain" and d.sparkline_data:
+            bins = self._bucket_bool_sparkline(d.sparkline_data)
             text.append("  ")
-            for _pos, is_broken in d.sparkline_data:
-                text.append(
-                    "\u2588" if is_broken else "\u2581",
-                    style="#ee4444" if is_broken else "#44aa88",
-                )
+            for hits, total in bins:
+                if hits > 0:
+                    text.append("\u2588", style="#ee4444")
+                elif total > 0:
+                    text.append("\u2581", style="#44aa88")
+                else:
+                    text.append(" ")
             text.append("\n")
 
         elif d.name == "stale_tokens" and len(d.sparkline_data) >= 2:
@@ -1644,19 +1665,28 @@ class DoctorModal(ModalScreen[bool]):
                 )
 
         elif d.name == "reduce_tags" and d.sparkline_data:
+            bins = self._bucket_bool_sparkline(d.sparkline_data)
             text.append("  ")
-            for _pos, has_tag in d.sparkline_data:
-                if has_tag:
+            for hits, total in bins:
+                if total == 0:
+                    text.append(" ")
+                elif hits > total // 2:
                     text.append("\u2588", style="#44aa88")
                 else:
                     text.append("\u2588", style="#333333")
             text.append("\n")
 
         elif d.name == "bloated_tur" and d.sparkline_data:
-            max_size = max(s for _, s in d.sparkline_data) if d.sparkline_data else 1
+            # Bucket size data into fixed width
+            w = self._SPARK_WIDTH
+            bin_maxes = [0.0] * w
+            for pos, size in d.sparkline_data:
+                bi = min(int(pos * w), w - 1)
+                bin_maxes[bi] = max(bin_maxes[bi], size)
+            max_size = max(bin_maxes) if bin_maxes else 1
             spark_chars = " \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
             text.append("  ")
-            for _pos, size in d.sparkline_data:
+            for size in bin_maxes:
                 idx = min(
                     int(size / max(max_size, 1) * (len(spark_chars) - 1)),
                     len(spark_chars) - 1,
