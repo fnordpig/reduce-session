@@ -451,6 +451,7 @@ def _reset_structural_stats():
         "blank_lines_collapsed": 0,
         "non_ascii_stripped": 0,
         "chars_dropped_stochastic": 0,
+        "rle_chars_saved": 0,
         "chars_saved_structural": 0,
     }
 
@@ -596,14 +597,6 @@ def structural_compress(text: str, aggr: float) -> str:
     )
     orig_len = len(text)
 
-    # 0. Run-length encoding: collapse 10+ identical characters to char×N
-    new_text = _rle_collapse(text)
-    if new_text != text:
-        _structural_stats["rle_chars_saved"] = (
-            _structural_stats.get("rle_chars_saved", 0) + len(text) - len(new_text)
-        )
-        text = new_text
-
     # 1. Path shortening
     if aggr > thresholds["paths"]:
         pat = _get_home_prefix_re()
@@ -664,7 +657,16 @@ def structural_compress(text: str, aggr: float) -> str:
             )
             text = new_text
 
-    # 7. Stochastic character drop (vowel-first, for high aggr in middle zone)
+    # 7. Run-length encoding: collapse 10+ identical characters to char×N
+    # Runs AFTER non-ASCII strip so ▁×1400 is stripped first, not mangled to ▁*1400→*1400
+    new_text = _rle_collapse(text)
+    if new_text != text:
+        _structural_stats["rle_chars_saved"] = (
+            _structural_stats.get("rle_chars_saved", 0) + len(text) - len(new_text)
+        )
+        text = new_text
+
+    # 8. Stochastic character drop (vowel-first, for high aggr in middle zone)
     text = stochastic_char_drop(text, aggr, threshold=thresholds["chardrop"])
 
     saved = orig_len - len(text)

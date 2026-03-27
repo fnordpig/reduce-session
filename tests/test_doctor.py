@@ -258,14 +258,14 @@ class TestStaleTokens:
                     "type": "user",
                     "uuid": "u-1",
                     "parentUuid": None,
-                    "message": {"content": "Hello"},
+                    "message": {"content": "word " * 200},
                 },
                 {
                     "type": "assistant",
                     "uuid": "a-1",
                     "parentUuid": "u-1",
                     "message": {
-                        "content": "Short reply",
+                        "content": "word " * 200,
                         "usage": {
                             "input_tokens": 100000,
                             "cache_read_input_tokens": 0,
@@ -289,14 +289,14 @@ class TestStaleTokens:
                     "type": "user",
                     "uuid": "u-1",
                     "parentUuid": None,
-                    "message": {"content": "Hello"},
+                    "message": {"content": "word " * 200},
                 },
                 {
                     "type": "assistant",
                     "uuid": "a-1",
                     "parentUuid": "u-1",
                     "message": {
-                        "content": "Reply",
+                        "content": "word " * 200,
                         "usage": {"input_tokens": 50000},
                     },
                 },
@@ -503,7 +503,7 @@ class TestApplyFixes:
                     "type": "user",
                     "uuid": "u-1",
                     "parentUuid": None,
-                    "message": {"content": "Hello"},
+                    "message": {"content": "word " * 200},
                 },
                 {"type": "progress", "uuid": "p-1", "parentUuid": "u-1", "data": {}},
                 {
@@ -511,7 +511,7 @@ class TestApplyFixes:
                     "uuid": "a-1",
                     "parentUuid": "p-1",
                     "message": {
-                        "content": "Reply",
+                        "content": "word " * 200,
                         "usage": {"input_tokens": 99999},
                     },
                 },

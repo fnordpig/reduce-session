@@ -107,6 +107,10 @@ def test_rle_collapse_unicode_wall():
     result = structural_compress(wall, aggr=0.0)
     assert len(result) < 20
 
+    # Boundary: 9 chars must NOT collapse, 10 must
+    assert _rle_collapse("=" * 9) == "=" * 9
+    assert _rle_collapse("=" * 10) == "=*10"
+
     # Short runs preserved
     assert _rle_collapse("===" + "abc") == "===" + "abc"
 
@@ -115,6 +119,11 @@ def test_rle_collapse_unicode_wall():
     result = _rle_collapse(mixed)
     assert "=*50" in result
     assert "Hello " in result
+
+    # RLE + non-ASCII strip interaction: at aggr > 0.3, non-ASCII strip
+    # runs BEFORE RLE, so ▁×1400 is stripped to empty, not mangled to *1400
+    result_mid = structural_compress("\u2581" * 1400, aggr=0.5)
+    assert "*1400" not in result_mid  # non-ASCII stripped first, RLE sees nothing
 
 
 def test_blank_line_collapse():

@@ -153,22 +153,34 @@ def diagnose_parent_chain(lines: list[dict], file_path: str) -> DiagnosticResult
             broken += 1
         sparkline.append((pos, is_broken))
 
+    is_continuation = False
     if broken:
         detail.append(f"{broken} broken parent reference(s)")
-        # Check if this looks like a continuation file
         p = Path(file_path)
         from reduce_session.session import CONTINUATION_RE
 
         if CONTINUATION_RE.match(p.name):
+            is_continuation = True
             detail.append(f"{broken} breaks from continuation file (pre-existing)")
 
-    severity = "critical" if broken else "ok"
+    if not broken:
+        severity = "ok"
+    elif is_continuation:
+        severity = "info"
+    else:
+        severity = "critical"
+
+    summary = (
+        f"{broken} broken refs (continuation file)"
+        if is_continuation
+        else f"{broken} broken parent reference(s)"
+        if broken
+        else "Parent chain intact"
+    )
     return DiagnosticResult(
         name="parent_chain",
         severity=severity,
-        summary=f"{broken} broken parent reference(s)"
-        if broken
-        else "Parent chain intact",
+        summary=summary,
         sparkline_data=sparkline,
         fix_description="",
         fix_fn=None,  # report only
@@ -223,6 +235,12 @@ def diagnose_stale_tokens(lines: list[dict], file_path: str) -> DiagnosticResult
     if stale_count == 0:
         severity = "ok"
         summary = "No usage data found"
+    elif estimated < 100:
+        # Estimate too low to be reliable (non-text content) — don't flag
+        severity = "ok"
+        summary = (
+            f"Token count ({stale_count:,}), estimate unreliable (too little text)"
+        )
     elif abs(stale_count - estimated) / max(stale_count, 1) > 0.10:
         severity = "warning"
         summary = f"Stale tokens ({stale_count:,}) differ from estimate ({estimated:,}) by >{10}%"
@@ -250,7 +268,7 @@ def diagnose_overlapping_files(lines: list[dict], file_path: str) -> DiagnosticR
     p = Path(file_path)
     directory = p.parent
 
-    from reduce_session.session import UUID_RE, SKIP_SUFFIXES
+    from reduce_session.session import SKIP_SUFFIXES
 
     # Extract the session UUID from the current file path
     session_uuid = p.stem.split(".")[0]

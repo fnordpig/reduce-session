@@ -1543,7 +1543,14 @@ class DoctorModal(ModalScreen[bool]):
         )
 
         with open(self.session_path) as f:
-            lines = [json.loads(line) for line in f]
+            lines = []
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        lines.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
 
         diagnostics = [
             diagnose_compaction_summaries(lines, self.session_path),
@@ -1714,7 +1721,14 @@ class DoctorModal(ModalScreen[bool]):
         from reduce_session.git_ops import ensure_git_repo, git_snapshot
 
         with open(self.session_path) as f:
-            lines = [json.loads(line) for line in f]
+            lines = []
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        lines.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
 
         selected_diags = [
             self._diagnostics[i]
@@ -1723,10 +1737,21 @@ class DoctorModal(ModalScreen[bool]):
         ]
         stats = apply_fixes(lines, self.session_path, selected_diags)
 
-        # Write back
-        with open(self.session_path, "w") as f:
-            for obj in lines:
-                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        # Atomic write — temp file then rename
+        import os
+        import tempfile
+
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(self.session_path), suffix=".tmp"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                for obj in lines:
+                    f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            os.replace(tmp_path, self.session_path)
+        except Exception:
+            os.unlink(tmp_path)
+            raise
 
         # Git snapshot
         from pathlib import Path
@@ -1749,11 +1774,12 @@ class DoctorModal(ModalScreen[bool]):
         self.dismiss(False)
 
     def action_toggle_fix(self) -> None:
-        """Toggle the first fixable diagnostic (for keyboard use)."""
+        """Toggle the next fixable diagnostic (for keyboard use)."""
         for i, d in enumerate(self._diagnostics):
             if d.fix_fn:
                 if i in self._selected:
                     self._selected.discard(i)
                 else:
                     self._selected.add(i)
+                break
         self._render_results()
