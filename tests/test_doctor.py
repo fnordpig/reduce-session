@@ -201,7 +201,43 @@ class TestParentChain:
 
         result = diagnose_parent_chain(lines, str(path))
         assert result.severity == "critical"
-        assert result.fix_fn is None
+        assert result.fix_fn is not None
+
+    def test_fix_reparents_broken_links(self, tmp_path):
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {"content": "Hello"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": "MISSING-UUID",
+                    "message": {"content": "Hi"},
+                },
+                {
+                    "type": "user",
+                    "uuid": "u-2",
+                    "parentUuid": "ALSO-MISSING",
+                    "message": {"content": "Continue"},
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_parent_chain(lines, str(path))
+        stats = result.fix_fn(lines)
+        assert stats["parent_refs_reparented"] == 2
+        # a-1 should now point to u-1 (nearest valid preceding)
+        a1 = next(l for l in lines if l.get("uuid") == "a-1")
+        assert a1["parentUuid"] == "u-1"
+        # u-2 should now point to a-1
+        u2 = next(l for l in lines if l.get("uuid") == "u-2")
+        assert u2["parentUuid"] == "a-1"
 
     def test_valid_chain_is_ok(self, tmp_path):
         lines = _make_lines(

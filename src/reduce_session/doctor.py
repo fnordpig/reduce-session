@@ -133,6 +133,32 @@ def diagnose_compaction_summaries(
 # ---------------------------------------------------------------------------
 
 
+def _fix_parent_chain(lines: list[dict]) -> dict:
+    """Reparent broken refs to the nearest preceding valid UUID."""
+    uuid_set: set[str] = set()
+    for obj in lines:
+        uid = obj.get("uuid")
+        if uid:
+            uuid_set.add(uid)
+
+    reparented = 0
+    for i, obj in enumerate(lines):
+        parent = obj.get("parentUuid")
+        if parent and parent not in uuid_set:
+            # Walk backwards to nearest valid parent
+            for j in range(i - 1, -1, -1):
+                prev_uuid = lines[j].get("uuid")
+                if prev_uuid and prev_uuid in uuid_set:
+                    obj["parentUuid"] = prev_uuid
+                    reparented += 1
+                    break
+            else:
+                obj["parentUuid"] = None
+                reparented += 1
+
+    return {"parent_refs_reparented": reparented}
+
+
 def diagnose_parent_chain(lines: list[dict], file_path: str) -> DiagnosticResult:
     uuid_set: set[str] = set()
     for obj in lines:
@@ -178,13 +204,17 @@ def diagnose_parent_chain(lines: list[dict], file_path: str) -> DiagnosticResult
         if broken
         else "Parent chain intact"
     )
+
+    fix_fn = _fix_parent_chain if broken else None
+    fix_desc = "Reparent to nearest valid preceding message" if broken else ""
+
     return DiagnosticResult(
         name="parent_chain",
         severity=severity,
         summary=summary,
         sparkline_data=sparkline,
-        fix_description="",
-        fix_fn=None,  # report only
+        fix_description=fix_desc,
+        fix_fn=fix_fn,
         detail_lines=detail,
     )
 
