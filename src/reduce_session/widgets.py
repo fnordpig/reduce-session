@@ -2118,9 +2118,12 @@ def build_browse_tree(
     def _build(parent_node, start: int, end: int) -> None:
         count = end - start
         if count <= 50:
-            # Leaf level: add individual exchanges
-            for ex in exchanges[start:end]:
-                label = _format_leaf_label(ex)
+            # Leaf level: add individual exchanges with token weight
+            leaf_exs = exchanges[start:end]
+            peer_tokens = [ex.token_size for ex in leaf_exs]
+            max_leaf_tokens = max(peer_tokens) if peer_tokens else 1
+            for ex in leaf_exs:
+                label = _format_leaf_label(ex, max_leaf_tokens, peer_tokens)
                 parent_node.add_leaf(label, data=ex)
             return
 
@@ -2158,9 +2161,20 @@ def build_browse_tree(
     _build(tree_widget.root, 0, n)
 
 
-def _format_leaf_label(ex: BrowseExchange) -> Text:
+def _format_leaf_label(
+    ex: BrowseExchange,
+    max_peer_tokens: int = 0,
+    peer_tokens: list[int] | None = None,
+) -> Text:
     """Format an individual exchange as a tree leaf label."""
     label = Text()
+
+    # Token weight indicator (compact: 3-char bar + count)
+    if max_peer_tokens > 0:
+        bar = _make_token_bar(ex.token_size, max_peer_tokens, width=3)
+        color = _compute_section_percentile(ex.token_size, peer_tokens or [])
+        label.append(bar, style=color)
+        label.append(f" {_format_tok_short(ex.token_size):>4s} ", style=color)
 
     # Line number (right-aligned, 5 chars)
     idx_str = str(ex.index + 1).rjust(5)
