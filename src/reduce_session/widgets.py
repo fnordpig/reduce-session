@@ -1596,7 +1596,7 @@ class DoctorModal(ModalScreen[bool]):
                 if is_summary:
                     text.append("\u2588", style="#ee4444")
                 else:
-                    text.append("\u2581", style="#333")
+                    text.append("\u2581", style="#333333")
             text.append("\n")
 
         elif d.name == "parent_chain" and d.sparkline_data:
@@ -1649,7 +1649,7 @@ class DoctorModal(ModalScreen[bool]):
                 if has_tag:
                     text.append("\u2588", style="#44aa88")
                 else:
-                    text.append("\u2588", style="#333")
+                    text.append("\u2588", style="#333333")
             text.append("\n")
 
         elif d.name == "bloated_tur" and d.sparkline_data:
