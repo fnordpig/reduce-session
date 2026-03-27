@@ -272,3 +272,309 @@ def test_structural_compress_strips_non_ascii():
     text = "error: can\u2019t find \u2192 path ── section"
     result = structural_compress(text, aggr=0.5)
     assert all(ord(c) < 128 for c in result)
+
+
+def test_strip_constant_metadata():
+    from reduce_session.reduction import strip_constant_metadata
+
+    objs = [
+        {
+            "type": "user",
+            "uuid": "u1",
+            "sessionId": "abc",
+            "isSidechain": False,
+            "entrypoint": "cli",
+            "userType": "external",
+            "version": "2.1.80",
+            "message": {"content": "hello"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "a1",
+            "sessionId": "abc",
+            "message": {"content": "hi"},
+        },
+    ]
+
+    # Default mode: strip only constants
+    count = strip_constant_metadata(objs)
+    assert "sessionId" not in objs[0]
+    assert "isSidechain" not in objs[0]
+    assert "entrypoint" not in objs[0]
+    assert "userType" not in objs[0]
+    assert "version" in objs[0]  # NOT stripped in default mode
+    assert "uuid" in objs[0]  # uuid is NOT stripped
+    assert "message" in objs[0]  # content preserved
+    # 4 fields from first obj + 1 (sessionId) from second obj = 5
+    assert count == 5
+
+
+def test_strip_constant_metadata_aggressive():
+    from reduce_session.reduction import strip_constant_metadata
+
+    objs = [
+        {
+            "type": "user",
+            "uuid": "u1",
+            "sessionId": "abc",
+            "version": "2.1.80",
+            "requestId": "req-1",
+            "promptId": "p-1",
+            "slug": "s",
+            "message": {"content": "hello"},
+        },
+    ]
+    count = strip_constant_metadata(objs, aggressive=True)
+    assert "sessionId" not in objs[0]
+    assert "version" not in objs[0]
+    assert "requestId" not in objs[0]
+    assert "slug" not in objs[0]
+    assert "uuid" in objs[0]  # uuid is NOT stripped
+    assert "message" in objs[0]  # content preserved
+
+
+# ---------------------------------------------------------------------------
+# Thinking signature stripping
+# ---------------------------------------------------------------------------
+
+
+def _make_thinking_session(tmp_path, thinking_text, signature="ErUBCk" + "A" * 5000):
+    """Build a minimal JSONL with a single assistant thinking block."""
+    import json
+
+    messages = [
+        {
+            "type": "system",
+            "uuid": "sys-1",
+            "message": {"content": "You are Claude."},
+            "timestamp": "2026-03-23T01:00:00Z",
+        },
+        {
+            "type": "user",
+            "uuid": "u-1",
+            "parentUuid": "sys-1",
+            "message": {"content": "Think hard."},
+            "timestamp": "2026-03-23T01:01:00Z",
+        },
+        {
+            "type": "assistant",
+            "uuid": "a-1",
+            "parentUuid": "u-1",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": thinking_text,
+                        "signature": signature,
+                    },
+                    {"type": "text", "text": "Done."},
+                ],
+            },
+            "timestamp": "2026-03-23T01:01:30Z",
+        },
+    ]
+    path = tmp_path / "thinking-session.jsonl"
+    with open(path, "w") as f:
+        for msg in messages:
+            f.write(json.dumps(msg) + "\n")
+    return path
+
+
+def test_strip_thinking_signature_empty(tmp_path):
+    """Empty thinking blocks should have their signature stripped."""
+    import json
+
+    session = _make_thinking_session(tmp_path, thinking_text="")
+    result = reduce_session(str(session))
+
+    for line in result.kept_lines:
+        obj = json.loads(line)
+        if obj.get("type") != "assistant":
+            continue
+        for block in obj.get("message", {}).get("content", []):
+            if block.get("type") == "thinking":
+                assert "signature" not in block, (
+                    "signature should be stripped from empty thinking block"
+                )
+
+
+def test_strip_thinking_signature_preserved_when_text(tmp_path):
+    """Non-empty, non-truncated thinking blocks keep their signature."""
+    import json
+
+    # Short thinking text that won't be truncated at any aggr level
+    session = _make_thinking_session(
+        tmp_path,
+        thinking_text="I need to think carefully.",
+        signature="abc123",
+    )
+    result = reduce_session(str(session))
+
+    for line in result.kept_lines:
+        obj = json.loads(line)
+        if obj.get("type") != "assistant":
+            continue
+        for block in obj.get("message", {}).get("content", []):
+            if block.get("type") == "thinking":
+                assert block.get("signature") == "abc123", (
+                    "signature should be preserved on non-truncated thinking block"
+                )
+
+
+def test_strip_thinking_signature_truncated(tmp_path):
+    """Thinking blocks whose text is truncated should lose their signature."""
+    import json
+
+    # Very long thinking text — will be truncated at any profile
+    long_thinking = "I must reason carefully. " * 10_000
+    session = _make_thinking_session(tmp_path, thinking_text=long_thinking)
+    result = reduce_session(str(session), profile="aggressive")
+
+    for line in result.kept_lines:
+        obj = json.loads(line)
+        if obj.get("type") != "assistant":
+            continue
+        for block in obj.get("message", {}).get("content", []):
+            if block.get("type") == "thinking":
+                assert "signature" not in block, (
+                    "signature should be stripped after thinking text is truncated"
+                )
+
+
+def test_strip_thinking_signature_stat_counted(tmp_path):
+    """thinking_signature_stripped counter increments when signature is removed."""
+    session = _make_thinking_session(tmp_path, thinking_text="")
+    result = reduce_session(str(session))
+    assert result.stats.get("thinking_signature_stripped", 0) >= 1
+
+
+def test_text_of_list_content():
+    """text_of should extract text from list-content tool_results."""
+    from reduce_session.reduction import text_of
+
+    # String content — existing behavior
+    assert text_of({"type": "tool_result", "content": "hello"}) == "hello"
+
+    # List content — the fix
+    block = {
+        "type": "tool_result",
+        "content": [
+            {"type": "text", "text": "line one"},
+            {"type": "text", "text": "line two"},
+        ],
+    }
+    result = text_of(block)
+    assert "line one" in result
+    assert "line two" in result
+
+    # Empty list
+    assert text_of({"type": "tool_result", "content": []}) == ""
+
+
+def test_detect_duplicate_blocks_small():
+    """Duplicate detection should catch blocks under 1024 chars."""
+    from reduce_session.reduction import detect_duplicate_blocks
+
+    repeated = "The file metal.rs has been updated successfully." + " " * 30
+    objs = []
+    for i in range(5):
+        objs.append(
+            {
+                "message": {
+                    "content": [
+                        {"type": "tool_result", "content": repeated},
+                    ]
+                }
+            }
+        )
+
+    dupes = detect_duplicate_blocks(objs, min_size=64)
+    # First occurrence kept, 4 marked as duplicates
+    assert len(dupes) == 4
+
+
+def test_trim_bash_command_input():
+    """Large Bash command inputs should be trimmed in reduction."""
+    import json
+    import os
+    import tempfile
+
+    from reduce_session.reduction import reduce_session
+
+    # Create a minimal session with a large Bash command
+    big_command = "python3 << 'EOF'\n" + "print('hello')\n" * 500 + "EOF"
+    lines = [
+        json.dumps(
+            {
+                "type": "system",
+                "uuid": "s1",
+                "parentUuid": None,
+                "timestamp": "2025-01-01T00:00:00Z",
+                "message": {"role": "system", "content": "You are Claude."},
+            }
+        ),
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "a1",
+                "parentUuid": "s1",
+                "timestamp": "2025-01-01T00:00:01Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "tu1",
+                            "name": "Bash",
+                            "input": {"command": big_command},
+                        }
+                    ],
+                },
+            }
+        ),
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "u1",
+                "parentUuid": "a1",
+                "timestamp": "2025-01-01T00:00:02Z",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tu1",
+                            "content": "ok",
+                        }
+                    ],
+                },
+            }
+        ),
+    ]
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        f.write("\n".join(lines))
+        path = f.name
+
+    try:
+        result = reduce_session(path, cut=0.1, fade=0.3, profile="standard")
+        # Check kept_lines (reduce_session does not write back to disk)
+        trimmed = False
+        for line in result.kept_lines:
+            obj = json.loads(line)
+            msg = obj.get("message", {})
+            if isinstance(msg, dict):
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "tool_use":
+                            inp = block.get("input", {})
+                            if isinstance(inp, dict) and "command" in inp:
+                                assert len(inp["command"]) < len(big_command), (
+                                    "Bash command should be trimmed"
+                                )
+                                trimmed = True
+        assert trimmed, "No Bash tool_use block found in output"
+    finally:
+        os.unlink(path)

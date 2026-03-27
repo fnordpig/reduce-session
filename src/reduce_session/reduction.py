@@ -34,6 +34,7 @@ PROFILES = {
             "tool_input.Write": 200,
             "tool_input.Edit": 200,
             "tool_input.Agent": 300,
+            "tool_input.Bash": 400,
             "thinking": 0,
             "user_text": 800,
         },
@@ -54,6 +55,7 @@ PROFILES = {
             "tool_input.Write": 2000,
             "tool_input.Edit": 1500,
             "tool_input.Agent": 3000,
+            "tool_input.Bash": 2000,
             "thinking": 2000,
             "user_text": 6000,
         },
@@ -76,6 +78,7 @@ PROFILES = {
             "tool_input.Write": 600,
             "tool_input.Edit": 500,
             "tool_input.Agent": 800,
+            "tool_input.Bash": 600,
             "thinking": 0,
             "user_text": 1500,
         },
@@ -96,6 +99,7 @@ PROFILES = {
             "tool_input.Write": 3000,
             "tool_input.Edit": 2000,
             "tool_input.Agent": 4000,
+            "tool_input.Bash": 3000,
             "thinking": 3000,
             "user_text": 8000,
         },
@@ -832,11 +836,51 @@ def text_of(block):
         val = block.get(key, "")
         if isinstance(val, str) and val:
             return val
+        if isinstance(val, list):
+            # Handle list-content tool_results: [{"type": "text", "text": "..."}]
+            parts = []
+            for item in val:
+                if isinstance(item, dict):
+                    t = item.get("text", "")
+                    if isinstance(t, str) and t:
+                        parts.append(t)
+            if parts:
+                return "\n".join(parts)
     return ""
 
 
 def get_msg_type(msg):
     return msg.get("type", "unknown")
+
+
+# --- Metadata stripping ---
+
+# Fields that are always constant or redundant with filename — safe to strip unconditionally
+_ALWAYS_STRIP = {"sessionId", "isSidechain", "entrypoint", "userType"}
+
+# Fields stripped in aggressive mode (not needed for replay)
+_AGGRESSIVE_STRIP = {
+    "version",
+    "requestId",
+    "promptId",
+    "sourceToolAssistantUUID",
+    "slug",
+}
+
+
+def strip_constant_metadata(objs, aggressive=False):
+    """Strip redundant constant-value metadata fields from JSONL objects.
+
+    Returns count of fields stripped.
+    """
+    fields = _ALWAYS_STRIP | (_AGGRESSIVE_STRIP if aggressive else set())
+    stripped = 0
+    for obj in objs:
+        for f in fields:
+            if f in obj:
+                del obj[f]
+                stripped += 1
+    return stripped
 
 
 # --- Line-level filtering ---
@@ -902,7 +946,7 @@ def detect_stale_reads(kept_objs):
     return stale_ids
 
 
-def detect_duplicate_blocks(kept_objs, min_size=1024):
+def detect_duplicate_blocks(kept_objs, min_size=64):
     block_hashes = {}
     for pos, obj in enumerate(kept_objs):
         for bi, block in enumerate(get_content_blocks(obj)):
@@ -2341,6 +2385,7 @@ def reduce_session(
                             count("thinking_removed")
                             continue
                         block = dict(block)
+                        original_thinking = thinking
                         thinking = structural_compress(thinking, aggr)
                         if len(thinking) > think_limit:
                             block["thinking"] = truncate(
@@ -2349,6 +2394,16 @@ def reduce_session(
                             count("thinking_truncated")
                         else:
                             block["thinking"] = thinking
+                        # Strip signature from empty thinking blocks — opaque
+                        # ciphertext, ~5KB avg, carries no value without content
+                        if not block.get("thinking"):
+                            if block.pop("signature", None) is not None:
+                                count("thinking_signature_stripped")
+                        # If thinking was truncated, signature is now invalid
+                        # (it signs the original text) — strip it
+                        elif block["thinking"] != original_thinking:
+                            if block.pop("signature", None) is not None:
+                                count("thinking_signature_stripped")
                         new_content.append(block)
                         continue
 
@@ -2383,6 +2438,15 @@ def reduce_session(
                                     bl("tool_input.Agent", aggr),
                                     "Agent.prompt",
                                 )
+                            elif name == "Bash":
+                                if isinstance(inp.get("command"), str):
+                                    cmd = inp["command"]
+                                    cmd = structural_compress(cmd, aggr)
+                                    cmd_limit = bl("tool_input.Bash", aggr)
+                                    if len(cmd) > cmd_limit:
+                                        inp["command"] = truncate(
+                                            cmd, cmd_limit, "tool_input.Bash"
+                                        )
 
                     if (pos, bi) in duplicate_blocks:
                         text = text_of(block)
@@ -2416,6 +2480,12 @@ def reduce_session(
         # Stamp structural compression tag
         if aggr > 0.2:
             stamp_reduce_tag(obj, structural=True, profile=profile)
+
+    # -- Strip constant/redundant metadata fields --
+    meta_stripped = strip_constant_metadata(
+        kept_objs, aggressive=(profile == "aggressive")
+    )
+    stats["metadata_fields_stripped"] = meta_stripped
 
     # -- Pass 5: Orphan repair --
     kept_objs, orphan_count = fix_orphaned_tool_results(kept_objs)
