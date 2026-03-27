@@ -111,7 +111,20 @@ class SessionBrowserApp(App):
             projects.setdefault(session.project_name, []).append(session)
 
         for proj_name, sessions in projects.items():
-            proj_node = tree.root.add(proj_name, expand=True)
+            # Show full resolved path, or dangling indicator
+            sample = sessions[0]
+            if sample.is_dangling:
+                proj_label = Text()
+                proj_label.append("? ", style="bold #ee4444")
+                proj_label.append(proj_name, style="#ee4444")
+                proj_label.append(f"  ({sample.project_slug})", style="dim #ee4444")
+            elif sample.resolved_dir:
+                proj_label = Text()
+                proj_label.append(proj_name, style="bold")
+                proj_label.append(f"  {sample.resolved_dir}", style="dim")
+            else:
+                proj_label = Text(proj_name, style="bold")
+            proj_node = tree.root.add(proj_label, expand=True)
             for session in sessions:
                 label = self._make_session_label(session)
                 leaf = proj_node.add_leaf(label)

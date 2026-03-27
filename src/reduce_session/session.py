@@ -43,16 +43,123 @@ class SessionInfo:
     last_exchanges: list[Exchange] = field(default_factory=list)
     parse_error: bool = False
     density_profile: list[int] = field(default_factory=list)
+    resolved_dir: Path | None = None  # actual project directory on disk
+    is_dangling: bool = False  # True if slug doesn't match a real directory
+    project_slug: str = ""  # raw directory slug for full path display
+
+
+def resolve_slug_to_path(slug: str) -> Path | None:
+    """Resolve a Claude Code project slug to the actual filesystem directory.
+
+    Claude Code encodes /Users/rwaugh/src/mine/ripvec as
+    -Users-rwaugh-src-mine-ripvec. Since path components can contain
+    hyphens, we walk the filesystem: start from /, progressively join
+    one segment at a time, and when a segment doesn't exist as a dir,
+    try joining it with the next segment via hyphen until we find a
+    match or exhaust the slug.
+
+    Returns the resolved Path, or None if no matching directory exists.
+    """
+    if not slug.startswith("-"):
+        return None
+
+    segments = slug[1:].split("-")
+    if not segments:
+        return None
+
+    current = Path("/")
+    i = 0
+    while i < len(segments):
+        # Try progressively joining segments with hyphens
+        found = False
+        for j in range(i + 1, len(segments) + 1):
+            candidate = "-".join(segments[i:j])
+            test_path = current / candidate
+            if test_path.is_dir():
+                current = test_path
+                i = j
+                found = True
+                break
+        if not found:
+            # No directory matches from position i — slug is dangling
+            return None
+
+    return current
+
+
+# Cache for slug resolution (populated once per scan)
+_slug_cache: dict[str, tuple[Path | None, str]] = {}
 
 
 def derive_project_name(slug: str) -> str:
     """Convert directory slug to readable name.
 
+    Resolves the slug to an actual filesystem path, then derives a
+    short display name from it. Caches results.
+
     '-Users-rwaugh-src-mine-ripvec' -> 'ripvec'
-    Uses last non-empty path component.
+    '-Users-rwaugh-src-archiuvium-aws-org-root' -> 'archiuvium/aws-org-root'
+    (dangling slug) -> '? slug-text'
     """
-    parts = [p for p in slug.split("-") if p]
-    return parts[-1] if parts else slug
+    if slug in _slug_cache:
+        return _slug_cache[slug][1]
+
+    resolved = resolve_slug_to_path(slug)
+    if resolved is None:
+        # No matching directory — extract best name from slug pattern
+        # Still useful for test fixtures and deleted projects
+        parts = [p for p in slug.split("-") if p]
+        # Skip home dir components
+        skip = {"Users", "home"}
+        tail = []
+        found_user = False
+        for p in parts:
+            if p in skip:
+                found_user = True
+                tail.clear()
+                continue
+            if found_user and not tail:
+                # This is the username — skip it
+                found_user = False
+                continue
+            if p == "src" and not tail:
+                continue
+            if p == "mine" and not tail:
+                continue
+            tail.append(p)
+        name = "-".join(tail) if tail else (parts[-1] if parts else slug)
+        _slug_cache[slug] = (None, name)
+        return name
+
+    # Derive a short name from the resolved path
+    home = Path.home()
+    try:
+        rel = resolved.relative_to(home)
+    except ValueError:
+        rel = resolved
+
+    parts = rel.parts
+    # Strip common prefixes: src, src/mine
+    interesting = list(parts)
+    for prefix in ("src", "mine"):
+        if interesting and interesting[0] == prefix:
+            interesting.pop(0)
+
+    name = "/".join(interesting) if interesting else resolved.name
+    _slug_cache[slug] = (resolved, name)
+    return name
+
+
+def get_resolved_path(slug: str) -> Path | None:
+    """Get the resolved filesystem path for a slug (from cache)."""
+    if slug not in _slug_cache:
+        derive_project_name(slug)  # populates cache
+    return _slug_cache[slug][0]
+
+
+def is_dangling_project(slug: str) -> bool:
+    """Check if a project slug doesn't map to a real directory."""
+    return get_resolved_path(slug) is None
 
 
 def format_age(timestamp: datetime) -> str:
@@ -510,6 +617,9 @@ def scan_projects(projects_dir: Path) -> list[SessionInfo]:
             except Exception:
                 density = []
 
+            resolved = get_resolved_path(proj_dir.name)
+            dangling = resolved is None
+
             sessions.append(
                 SessionInfo(
                     path=path,
@@ -525,6 +635,9 @@ def scan_projects(projects_dir: Path) -> list[SessionInfo]:
                     last_exchanges=last_exchanges,
                     parse_error=parse_error,
                     density_profile=density,
+                    resolved_dir=resolved,
+                    is_dangling=dangling,
+                    project_slug=proj_dir.name,
                 )
             )
 
