@@ -430,7 +430,13 @@ def reduce(
                 (1 - result.new_size / max(result.orig_size, 1)) * 100, 1
             ),
             "stats": result.stats,
-            "apply": apply_result,
+            "apply": {
+                "orig_size": apply_result.orig_size,
+                "new_size": apply_result.new_size,
+                "bak_path": apply_result.bak_path,
+                "pre_tag": apply_result.pre_tag,
+                "post_tag": apply_result.post_tag,
+            },
         },
         indent=2,
     )
