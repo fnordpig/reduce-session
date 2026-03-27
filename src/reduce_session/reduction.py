@@ -2685,9 +2685,13 @@ def reduce_session(
         if tur:
             trim_toolUseResult(tur, aggr, agg_lim, gen_lim)
 
-        # Stamp structural compression tag
+        # Stamp reduce tag on every message
+        # structural=True only when compression was actually applied (aggr > 0.2)
         if aggr > 0.2:
             stamp_reduce_tag(obj, structural=True, profile=profile)
+        elif not get_reduce_tag(obj):
+            # Tag unprocessed messages so they show as "seen but not compressed"
+            stamp_reduce_tag(obj, profile=profile)
 
     # -- Strip constant/redundant metadata fields --
     meta_stripped = strip_constant_metadata(

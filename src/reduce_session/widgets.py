@@ -2567,6 +2567,7 @@ class ConversationBrowserModal(ModalScreen[None]):
             PROFILES,
             _extract_exchange_text,
             stamp_reduce_tag,
+            get_reduce_tag,
         )
         from reduce_session.llm.base import ROUTING_MAP, Route, Category
 
@@ -2600,6 +2601,10 @@ class ConversationBrowserModal(ModalScreen[None]):
                     )
         except Exception:
             pass  # LLM unavailable, skip classification
+
+        # Ensure a reduce tag exists even if LLM classification failed
+        if not get_reduce_tag(obj):
+            stamp_reduce_tag(obj, structural=True, profile=profile)
 
         # Apply structural compression based on profile
         prof = PROFILES.get(profile, PROFILES["standard"])
