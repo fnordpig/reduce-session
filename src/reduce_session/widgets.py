@@ -2590,6 +2590,20 @@ class ConversationBrowserModal(ModalScreen[None]):
         msg = obj.get("message", {})
         content = msg.get("content")
         if isinstance(content, str):
+            # Replace dead persisted-output refs instead of compressing them
+            if "<persisted-output>" in content:
+                import re
+
+                content = re.sub(
+                    r"<persisted-output>.*?saved to:\s*(\S+/tool-results/(\S+)).*?</persisted-output>",
+                    lambda m: (
+                        m.group(0)
+                        if os.path.exists(m.group(1))
+                        else f"[output file removed: {os.path.basename(m.group(1))}]"
+                    ),
+                    content,
+                    flags=re.DOTALL,
+                )
             msg["content"] = structural_compress(content, aggr)
         elif isinstance(content, list):
             for block in content:
@@ -2597,6 +2611,20 @@ class ConversationBrowserModal(ModalScreen[None]):
                     for k in ("text", "content", "thinking"):
                         v = block.get(k, "")
                         if isinstance(v, str) and v:
+                            # Replace dead persisted-output refs first
+                            if "<persisted-output>" in v:
+                                import re
+
+                                v = re.sub(
+                                    r"<persisted-output>.*?saved to:\s*(\S+/tool-results/(\S+)).*?</persisted-output>",
+                                    lambda m: (
+                                        m.group(0)
+                                        if os.path.exists(m.group(1))
+                                        else f"[output file removed: {os.path.basename(m.group(1))}]"
+                                    ),
+                                    v,
+                                    flags=re.DOTALL,
+                                )
                             compressed = structural_compress(v, aggr)
                             limit = blended_limit("default", aggr, agg_lim, gen_lim)
                             if len(compressed) > limit:

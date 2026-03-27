@@ -567,100 +567,161 @@ def diagnose_bloated_tur(lines: list[dict], file_path: str) -> DiagnosticResult:
 # ---------------------------------------------------------------------------
 
 
-def _fix_orphaned_tool_results_files(lines: list[dict], file_path: str = "") -> dict:
-    """Delete tool-result files that are no longer referenced in the JSONL."""
-    import shutil
+_PERSISTED_OUTPUT_RE = re.compile(
+    r"<persisted-output>\s*Output too large.*?saved to:\s*(\S+/tool-results/\S+)"
+    r".*?</persisted-output>",
+    re.DOTALL,
+)
+
+
+def _fix_orphaned_tool_results(lines: list[dict], file_path: str = "") -> dict:
+    """Delete orphaned files AND replace dead <persisted-output> refs in JSONL."""
+    import json
+    import os
 
     p = Path(file_path)
     results_dir = p.parent / p.stem / "tool-results"
-    if not results_dir.is_dir():
-        return {"orphaned_files_deleted": 0, "bytes_freed": 0}
 
-    # Build set of referenced filenames
-    jsonl_text = "\n".join(
-        line.get("_raw", "") if isinstance(line, dict) else "" for line in lines
-    )
-    # Fallback: re-serialize to check references
-    import json
-
-    if not jsonl_text.strip():
-        jsonl_text = "\n".join(json.dumps(line) for line in lines)
-
-    deleted = 0
-    bytes_freed = 0
-    for f in results_dir.iterdir():
-        if not f.is_file():
+    # 1. Replace dead <persisted-output> references in JSONL content
+    refs_replaced = 0
+    for obj in lines:
+        msg = obj.get("message", {})
+        if not isinstance(msg, dict):
             continue
-        stem = f.stem
-        if stem not in jsonl_text:
-            bytes_freed += f.stat().st_size
-            f.unlink()
-            deleted += 1
+        content = msg.get("content")
+        if isinstance(content, str):
+            for m in _PERSISTED_OUTPUT_RE.finditer(content):
+                fpath = m.group(1)
+                if not os.path.exists(fpath):
+                    fname = os.path.basename(fpath)
+                    content = content.replace(
+                        m.group(0), f"[output file removed: {fname}]"
+                    )
+                    refs_replaced += 1
+            if refs_replaced:
+                msg["content"] = content
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                for key in ("text", "content"):
+                    val = block.get(key)
+                    if not isinstance(val, str):
+                        continue
+                    for m in _PERSISTED_OUTPUT_RE.finditer(val):
+                        fpath = m.group(1)
+                        if not os.path.exists(fpath):
+                            fname = os.path.basename(fpath)
+                            val = val.replace(
+                                m.group(0), f"[output file removed: {fname}]"
+                            )
+                            refs_replaced += 1
+                    block[key] = val
 
-    return {"orphaned_files_deleted": deleted, "bytes_freed": bytes_freed}
+    # 2. Delete orphaned files on disk
+    files_deleted = 0
+    bytes_freed = 0
+    if results_dir.is_dir():
+        jsonl_text = "\n".join(json.dumps(line) for line in lines)
+        for f in results_dir.iterdir():
+            if not f.is_file():
+                continue
+            if f.stem not in jsonl_text:
+                bytes_freed += f.stat().st_size
+                f.unlink()
+                files_deleted += 1
+
+    return {
+        "dead_refs_replaced": refs_replaced,
+        "orphaned_files_deleted": files_deleted,
+        "bytes_freed": bytes_freed,
+    }
 
 
 def diagnose_orphaned_tool_results(
     lines: list[dict], file_path: str
 ) -> DiagnosticResult:
-    """Check for tool-result files on disk not referenced in the JSONL."""
+    """Check for orphaned tool-result files AND dead references in JSONL."""
     import json
+    import os
 
     p = Path(file_path)
     results_dir = p.parent / p.stem / "tool-results"
-    if not results_dir.is_dir():
+
+    # Count dead <persisted-output> references in JSONL content
+    dead_refs = 0
+    for obj in lines:
+        msg = obj.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        texts: list[str] = []
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    for key in ("text", "content"):
+                        val = block.get(key)
+                        if isinstance(val, str):
+                            texts.append(val)
+        for t in texts:
+            for m in _PERSISTED_OUTPUT_RE.finditer(t):
+                if not os.path.exists(m.group(1)):
+                    dead_refs += 1
+
+    # Count orphaned files on disk
+    orphaned_files = 0
+    orphaned_bytes = 0
+    referenced = 0
+    sparkline: list[tuple[float, bool]] = []
+
+    if results_dir.is_dir():
+        jsonl_text = "\n".join(json.dumps(line) for line in lines)
+        files = sorted(f for f in results_dir.iterdir() if f.is_file())
+        total = len(files)
+        for i, f in enumerate(files):
+            pos = i / max(total - 1, 1)
+            is_orphan = f.stem not in jsonl_text
+            sparkline.append((pos, is_orphan))
+            if is_orphan:
+                orphaned_files += 1
+                orphaned_bytes += f.stat().st_size
+            else:
+                referenced += 1
+
+    issues = orphaned_files + dead_refs
+    if issues == 0:
+        summary = f"{referenced} tool-result file(s), all referenced"
+        if not results_dir.is_dir():
+            summary = "No tool-results directory"
         return DiagnosticResult(
             name="orphaned_tool_results",
             severity="ok",
-            summary="No tool-results directory",
-            sparkline_data=[],
+            summary=summary,
+            sparkline_data=sparkline,
             fix_description="",
             fix_fn=None,
         )
 
-    jsonl_text = "\n".join(json.dumps(line) for line in lines)
-
-    orphaned = 0
-    orphaned_bytes = 0
-    referenced = 0
-    for f in sorted(results_dir.iterdir()):
-        if not f.is_file():
-            continue
-        stem = f.stem
-        if stem in jsonl_text:
-            referenced += 1
-        else:
-            orphaned += 1
-            orphaned_bytes += f.stat().st_size
-
-    total = orphaned + referenced
-    sparkline: list[tuple[float, bool]] = []
-    for i, f in enumerate(sorted(results_dir.iterdir())):
-        if not f.is_file():
-            continue
-        pos = i / max(total - 1, 1)
-        sparkline.append((pos, f.stem not in jsonl_text))
-
-    if orphaned > 0:
+    parts = []
+    if dead_refs:
+        parts.append(f"{dead_refs} dead ref(s) in JSONL")
+    if orphaned_files:
         mb = orphaned_bytes / 1024 / 1024
-        return DiagnosticResult(
-            name="orphaned_tool_results",
-            severity="warning" if mb > 10 else "info",
-            summary=f"{orphaned} orphaned file(s) ({mb:.1f} MB), {referenced} referenced",
-            sparkline_data=sparkline,
-            fix_description=f"Delete {orphaned} orphaned tool-result file(s) ({mb:.1f} MB)",
-            fix_fn=lambda lines, fp=file_path: _fix_orphaned_tool_results_files(
-                lines, fp
-            ),
-        )
+        parts.append(f"{orphaned_files} orphaned file(s) ({mb:.1f} MB)")
+
+    severity = (
+        "warning" if orphaned_bytes > 10 * 1024 * 1024 or dead_refs > 0 else "info"
+    )
 
     return DiagnosticResult(
         name="orphaned_tool_results",
-        severity="ok",
-        summary=f"{referenced} tool-result file(s), all referenced",
+        severity=severity,
+        summary=", ".join(parts),
         sparkline_data=sparkline,
-        fix_description="",
-        fix_fn=None,
+        fix_description="Replace dead refs + delete orphaned files",
+        fix_fn=lambda lines, fp=file_path: _fix_orphaned_tool_results(lines, fp),
     )
 
 
