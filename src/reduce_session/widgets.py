@@ -2233,14 +2233,17 @@ def _format_leaf_label(
     label.append(ex.role, style=role_colors.get(ex.role, "dim"))
     label.append(": ", style="dim")
 
-    # Route indicator
+    # Route + ontology badge (combined for compact display)
     if ex.reduce_route == "KEEP":
-        label.append("\u2605 KEEP ", style="#6688cc bold")
+        cls_label = ex.ontology_class or "KEEP"
+        label.append(f"\u2605 {cls_label} ", style="#6688cc bold")
     elif ex.reduce_route == "DISTILL":
-        pass  # content will be dimmed below
-
-    # Ontology class
-    if ex.ontology_class:
+        cls_label = ex.ontology_class or "DISTILL"
+        label.append(f"{cls_label} ", style="#ddaa22")
+    elif ex.reduce_route == "HEURISTIC":
+        cls_label = ex.ontology_class or "HEURISTIC"
+        label.append(f"{cls_label} ", style="dim")
+    elif ex.ontology_class:
         label.append(f"[{ex.ontology_class}] ", style="dim")
 
     # Processing indicator
