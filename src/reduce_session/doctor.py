@@ -69,39 +69,29 @@ def _is_summary(obj: dict) -> bool:
 
 
 def _fix_compaction_summaries(lines: list[dict]) -> dict:
-    summary_indices = []
+    """Graft orphaned compaction summaries back into the parentUuid chain.
+
+    Summaries have parentUuid=null which makes them tree roots, orphaning
+    everything before them.  The fix sets their parentUuid to the last real
+    message before them, turning them into regular chain members.  Children
+    already point at the summary's uuid, so they stay connected.
+    """
+    grafted = 0
     for i, obj in enumerate(lines):
-        if _is_summary(obj):
-            summary_indices.append(i)
+        if not _is_summary(obj):
+            continue
+        # Already linked — nothing to do
+        if obj.get("parentUuid"):
+            continue
+        # Find previous real message to graft onto
+        for j in range(i - 1, -1, -1):
+            prev_uuid = lines[j].get("uuid")
+            if prev_uuid and lines[j].get("type") in ("user", "assistant"):
+                obj["parentUuid"] = prev_uuid
+                grafted += 1
+                break
 
-    # Build reparent map: dropped uuid -> replacement uuid
-    dropped_uuids: dict[str, str | None] = {}
-    for i in summary_indices:
-        uuid = lines[i].get("uuid")
-        parent = lines[i].get("parentUuid")
-        if uuid:
-            # Find previous real message to reparent to
-            for j in range(i - 1, -1, -1):
-                prev_uuid = lines[j].get("uuid")
-                if prev_uuid and lines[j].get("type") in ("user", "assistant"):
-                    dropped_uuids[uuid] = prev_uuid
-                    break
-            else:
-                dropped_uuids[uuid] = parent
-
-    # Reparent children
-    reparented = 0
-    for obj in lines:
-        p = obj.get("parentUuid")
-        if p in dropped_uuids:
-            obj["parentUuid"] = dropped_uuids[p]
-            reparented += 1
-
-    # Remove summary lines (reverse order to preserve indices)
-    for i in sorted(summary_indices, reverse=True):
-        lines.pop(i)
-
-    return {"summaries_removed": len(summary_indices), "reparented": reparented}
+    return {"summaries_grafted": grafted}
 
 
 def diagnose_compaction_summaries(
@@ -124,7 +114,7 @@ def diagnose_compaction_summaries(
             severity="critical",
             summary=f"{summary_count} compaction summary message(s) found",
             sparkline_data=sparkline,
-            fix_description="Remove summary messages and reparent children",
+            fix_description="Graft summaries into chain (set parentUuid to previous message)",
             fix_fn=_fix_compaction_summaries,
         )
     return DiagnosticResult(

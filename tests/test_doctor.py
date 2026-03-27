@@ -88,7 +88,7 @@ class TestCompactionSummaries:
         assert result.severity == "ok"
         assert result.fix_fn is None
 
-    def test_fix_removes_and_reparents(self, tmp_path):
+    def test_fix_grafts_into_chain(self, tmp_path):
         lines = _make_lines(
             [
                 {
@@ -106,7 +106,7 @@ class TestCompactionSummaries:
                 {
                     "type": "assistant",
                     "uuid": "summary-1",
-                    "parentUuid": "u-1",
+                    "parentUuid": None,  # orphaned root — the real bug
                     "message": {
                         "content": "This conversation is being continued from a previous conversation."
                     },
@@ -131,14 +131,13 @@ class TestCompactionSummaries:
         result = diagnose_compaction_summaries(lines, str(path))
         stats = result.fix_fn(lines)
 
-        assert stats["summaries_removed"] == 1
-        assert stats["reparented"] >= 1
-        # Summary should be gone
-        uuids = [l.get("uuid") for l in lines]
-        assert "summary-1" not in uuids
-        # u-2 should now point to u-1 (the previous real message)
+        assert stats["summaries_grafted"] == 1
+        # Summary is still present
+        summary = next(l for l in lines if l.get("uuid") == "summary-1")
+        assert summary["parentUuid"] == "u-1"
+        # u-2 still points at summary — chain is intact
         u2 = next(l for l in lines if l.get("uuid") == "u-2")
-        assert u2["parentUuid"] == "u-1"
+        assert u2["parentUuid"] == "summary-1"
 
     def test_sparkline_data_positions(self, tmp_path):
         lines = _make_lines(
