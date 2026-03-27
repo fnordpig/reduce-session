@@ -287,3 +287,35 @@ def format_distill_prompt(
         instruction = "Process the following:"
 
     return f"{instruction}\n\n{text}"
+
+
+def classify_exchange(provider, text: str, msg_type: str) -> dict:
+    """Classify a single exchange via LLM. Returns {"cls": ..., "route": ...}.
+
+    This is a convenience wrapper for interactive (browser) classification
+    of a single exchange. For batch classification, use provider.classify()
+    directly.
+    """
+    prompt = f"""Classify this Claude Code conversation exchange.
+
+Type: {msg_type}
+Content (truncated):
+{text}
+
+Respond with a JSON object only:
+{{"cls": "<class>", "route": "<route>"}}
+
+Classes: IMPLEMENTATION, REASONING, LOG_OUTPUT, NOTIFICATION, INSTRUCTION,
+STATUS_UPDATE, COMPILATION, ANALYSIS, SCAFFOLDING, EXPLANATION, METRICS,
+TESTING, DEBUGGING, GIT_OPERATION, ERROR_OUTPUT, PLANNING, CONFIRMATION,
+CLARIFICATION, FEEDBACK, INQUIRY, DECISION
+
+Routes: KEEP (valuable instructions/decisions), DISTILL (can be summarized),
+HEURISTIC (mechanical output, can be aggressively trimmed)"""
+
+    response = provider.complete(prompt)
+    # Parse JSON from response
+    match = re.search(r"\{[^}]+\}", response)
+    if match:
+        return json.loads(match.group())
+    return {"cls": "UNKNOWN", "route": "HEURISTIC"}

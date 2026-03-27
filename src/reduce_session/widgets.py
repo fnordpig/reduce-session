@@ -47,6 +47,8 @@ class BrowseExchange:
     ontology_class: str | None  # from _reduce.cls
     reduce_route: str | None  # KEEP, DISTILL, HEURISTIC
     token_size: int  # len(json.dumps(obj)) // 4
+    is_structural: bool = False  # structural compression applied
+    is_distilled: bool = False  # LLM distillation applied
 
 
 def token_color(tokens: int) -> str:
@@ -1962,9 +1964,13 @@ def parse_browse_exchanges(path: str) -> list[BrowseExchange]:
                 reduce_tag = obj.get("_reduce", {})
                 ontology_class = None
                 reduce_route = None
+                is_structural = False
+                is_distilled = False
                 if isinstance(reduce_tag, dict):
                     ontology_class = reduce_tag.get("cls")
                     reduce_route = reduce_tag.get("route")
+                    is_structural = reduce_tag.get("structural", False)
+                    is_distilled = reduce_tag.get("distilled", False)
 
                 token_size = len(json.dumps(obj)) // 4
 
@@ -1979,6 +1985,8 @@ def parse_browse_exchanges(path: str) -> list[BrowseExchange]:
                         ontology_class=ontology_class,
                         reduce_route=reduce_route,
                         token_size=token_size,
+                        is_structural=is_structural,
+                        is_distilled=is_distilled,
                     )
                 )
     except (OSError, PermissionError):
@@ -2201,6 +2209,12 @@ def _format_leaf_label(
     if ex.ontology_class:
         label.append(f"[{ex.ontology_class}] ", style="dim")
 
+    # Processing indicator
+    if ex.is_distilled:
+        label.append("\u2697 ", style="#44aa88")  # alembic = distilled
+    elif ex.is_structural:
+        label.append("\u2298 ", style="dim")  # circled dash = structural only
+
     # Truncated content
     snippet = ex.text.replace("\n", " ")[:80]
     if ex.reduce_route == "DISTILL":
@@ -2236,12 +2250,34 @@ def _render_browse_preview(
 
         text.append(f"{ex.role}", style=f"bold {color}")
         text.append(f"  (line {ex.index + 1})", style="dim")
-        if ex.reduce_route:
-            text.append(f"  [{ex.reduce_route}]", style="dim")
-        if ex.ontology_class:
-            text.append(f"  {ex.ontology_class}", style="dim")
-        text.append(f"  ~{_format_tok_short(ex.token_size)} tok", style="dim")
         text.append("\n\n")
+
+        # Metadata header
+        text.append("── Metadata ──\n", style="dim")
+        if ex.reduce_route:
+            route_colors = {"KEEP": "#6688cc", "DISTILL": "#ddaa22", "HEURISTIC": "dim"}
+            text.append(
+                f"  [{ex.reduce_route}]", style=route_colors.get(ex.reduce_route, "dim")
+            )
+            text.append("\n")
+        if ex.ontology_class:
+            text.append(f"  Class: {ex.ontology_class}\n", style="")
+        text.append(f"  Tokens: ~{ex.token_size:,}\n", style="dim")
+
+        # Processing status
+        processing = []
+        if ex.is_structural:
+            processing.append("structural")
+        if ex.is_distilled:
+            processing.append("LLM-distilled")
+        if processing:
+            text.append(f"  Processed: {', '.join(processing)}\n", style="#44aa88")
+        elif ex.reduce_route:
+            text.append("  Processed: classified only\n", style="dim")
+        else:
+            text.append("  Processed: none (unreduced)\n", style="#ee4444")
+
+        text.append("\n── Content ──\n", style="dim")
 
         # Full text content
         text.append(ex.full_text, style=color)
@@ -2259,6 +2295,24 @@ def _render_browse_preview(
             f"{count} exchanges, {_format_tok_short(tokens)} tok\n\n",
             style="bold",
         )
+
+        # Route distribution
+        routes: dict[str, int] = {"KEEP": 0, "DISTILL": 0, "HEURISTIC": 0, "none": 0}
+        for ex in section_exs:
+            routes[ex.reduce_route or "none"] += 1
+
+        text.append("── Route Distribution ──\n", style="dim")
+        route_display_colors = {
+            "KEEP": "#6688cc",
+            "DISTILL": "#ddaa22",
+            "HEURISTIC": "dim",
+            "none": "#ee4444",
+        }
+        for route, rcount in routes.items():
+            if rcount > 0:
+                rcolor = route_display_colors.get(route, "")
+                text.append(f"  {route}: {rcount}\n", style=rcolor)
+        text.append("\n")
 
         # Show a few snippet exchanges from the section
         shown = 0
@@ -2292,12 +2346,17 @@ class ConversationBrowserModal(ModalScreen[None]):
 
     BINDINGS = [
         ("escape", "close", "Close"),
+        ("d", "delete_exchange", "Delete"),
+        ("l", "classify_exchange", "Classify"),
+        ("L", "classify_aggressive", "Classify+"),
     ]
 
     def __init__(self, session_path: str) -> None:
         super().__init__()
         self.session_path = session_path
         self._exchanges: list[BrowseExchange] = []
+        self._pending_delete: int = -1
+        self._pending_classify: tuple[int, str] = (-1, "standard")
 
     def compose(self) -> ComposeResult:
         with Vertical(id="browser-outer"):
@@ -2353,6 +2412,173 @@ class ConversationBrowserModal(ModalScreen[None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-close-browser":
             self.dismiss(None)
+
+    def action_delete_exchange(self) -> None:
+        """Delete the selected exchange from the session file."""
+        tree = self.query_one("#browser-tree", Tree)
+        node = tree.cursor_node
+        if node is None or not isinstance(node.data, BrowseExchange):
+            self.app.notify("Select an exchange to delete", severity="warning")
+            return
+        ex = node.data
+        self._pending_delete = ex.index
+        self.run_worker(self._do_delete, thread=True)
+
+    def _do_delete(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from reduce_session.git_ops import ensure_git_repo, git_snapshot
+
+        idx = self._pending_delete
+        p = Path(self.session_path)
+
+        # Git snapshot before delete
+        try:
+            ensure_git_repo(str(p.parent))
+            git_snapshot(str(p.parent), p.name, None, f"browser: pre-delete line {idx}")
+        except Exception:
+            pass
+
+        # Read, remove line, write back atomically
+        with open(self.session_path) as f:
+            lines = f.readlines()
+
+        if 0 <= idx < len(lines):
+            del lines[idx]
+
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                f.writelines(lines)
+            os.replace(tmp_path, self.session_path)
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+
+        # Git snapshot after delete
+        try:
+            git_snapshot(str(p.parent), p.name, None, f"browser: deleted line {idx}")
+        except Exception:
+            pass
+
+        # Reload the tree
+        self.app.call_from_thread(self._reload_tree)
+
+    def action_classify_exchange(self) -> None:
+        self._classify_selected("standard")
+
+    def action_classify_aggressive(self) -> None:
+        self._classify_selected("aggressive")
+
+    def _classify_selected(self, profile: str) -> None:
+        tree = self.query_one("#browser-tree", Tree)
+        node = tree.cursor_node
+        if node is None or not isinstance(node.data, BrowseExchange):
+            self.app.notify("Select an exchange to classify", severity="warning")
+            return
+        ex = node.data
+        self._pending_classify = (ex.index, profile)
+        self.app.notify(f"Classifying line {ex.index + 1}...")
+        self.run_worker(self._do_classify, thread=True)
+
+    def _do_classify(self) -> None:
+        import asyncio
+        import tempfile
+        from pathlib import Path
+        from reduce_session.reduction import (
+            structural_compress,
+            truncate,
+            blended_limit,
+            PROFILES,
+            _extract_exchange_text,
+            stamp_reduce_tag,
+        )
+        from reduce_session.llm.base import ROUTING_MAP, Route, Category
+
+        idx, profile = self._pending_classify
+
+        with open(self.session_path) as f:
+            raw_lines = f.readlines()
+
+        if idx < 0 or idx >= len(raw_lines):
+            return
+
+        obj = json.loads(raw_lines[idx])
+
+        # Try to classify via LLM
+        try:
+            llm_spec = getattr(self.app, "llm_spec", None)
+            if llm_spec:
+                from reduce_session.llm import create_provider
+
+                provider = create_provider(llm_spec)
+                exchange_text = _extract_exchange_text(obj)
+                categories = asyncio.run(provider.classify([exchange_text]))
+                if categories:
+                    cat = categories[0]
+                    route = ROUTING_MAP.get(cat, Route.HEURISTIC)
+                    stamp_reduce_tag(
+                        obj,
+                        cls=cat.value,
+                        route=route.value,
+                        profile=profile,
+                    )
+        except Exception:
+            pass  # LLM unavailable, skip classification
+
+        # Apply structural compression based on profile
+        prof = PROFILES.get(profile, PROFILES["standard"])
+        agg_lim = prof["aggressive"]
+        gen_lim = prof["gentle"]
+        aggr = 0.5 if profile == "standard" else 0.8
+
+        msg = obj.get("message", {})
+        content = msg.get("content")
+        if isinstance(content, str):
+            msg["content"] = structural_compress(content, aggr)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    for k in ("text", "content", "thinking"):
+                        v = block.get(k, "")
+                        if isinstance(v, str) and v:
+                            compressed = structural_compress(v, aggr)
+                            limit = blended_limit("default", aggr, agg_lim, gen_lim)
+                            if len(compressed) > limit:
+                                compressed = truncate(compressed, limit, k)
+                            block[k] = compressed
+
+        # Write back
+        from reduce_session.git_ops import ensure_git_repo, git_snapshot
+
+        raw_lines[idx] = json.dumps(obj, ensure_ascii=False) + "\n"
+
+        p = Path(self.session_path)
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                f.writelines(raw_lines)
+            os.replace(tmp_path, self.session_path)
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+
+        try:
+            ensure_git_repo(str(p.parent))
+            git_snapshot(
+                str(p.parent),
+                p.name,
+                None,
+                f"browser: classified line {idx} ({profile})",
+            )
+        except Exception:
+            pass
+
+        self.app.call_from_thread(self._reload_tree)
+
+    def _reload_tree(self) -> None:
+        """Reload the tree from disk after modifications."""
+        self.run_worker(self._load_session, thread=True)
 
     def action_close(self) -> None:
         self.dismiss(None)

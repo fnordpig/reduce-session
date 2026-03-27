@@ -18,6 +18,7 @@ from reduce_session.widgets import (
     _compute_section_percentile,
     _format_leaf_label,
     _make_token_bar,
+    _render_browse_preview,
 )
 
 
@@ -39,6 +40,8 @@ def _make_exchange(
     reduce_route: str | None = None,
     ontology_class: str | None = None,
     token_size: int = 100,
+    is_structural: bool = False,
+    is_distilled: bool = False,
 ) -> BrowseExchange:
     return BrowseExchange(
         index=index,
@@ -50,6 +53,8 @@ def _make_exchange(
         ontology_class=ontology_class,
         reduce_route=reduce_route,
         token_size=token_size,
+        is_structural=is_structural,
+        is_distilled=is_distilled,
     )
 
 
@@ -402,3 +407,79 @@ class TestTokenBar:
         """Zero max should produce all empty chars."""
         bar = _make_token_bar(0, 0, width=6)
         assert bar == "\u2591" * 6
+
+
+# --- Delete and classify keybinding tests ---
+
+
+class TestDeleteClassifyKeybindings:
+    def test_delete_keybinding_exists(self):
+        """Verify 'd' is in ConversationBrowserModal.BINDINGS."""
+        from reduce_session.widgets import ConversationBrowserModal
+
+        keys = [
+            b[0] if isinstance(b, tuple) else b.key
+            for b in ConversationBrowserModal.BINDINGS
+        ]
+        assert "d" in keys
+
+    def test_classify_keybinding_exists(self):
+        """Verify 'l' and 'L' are in ConversationBrowserModal.BINDINGS."""
+        from reduce_session.widgets import ConversationBrowserModal
+
+        keys = [
+            b[0] if isinstance(b, tuple) else b.key
+            for b in ConversationBrowserModal.BINDINGS
+        ]
+        assert "l" in keys
+        assert "L" in keys
+
+
+# --- Metadata fields and preview rendering ---
+
+
+def test_browse_exchange_has_metadata_fields():
+    """BrowseExchange should have is_structural and is_distilled fields."""
+    ex = _make_exchange()
+    assert ex.is_structural is False
+    assert ex.is_distilled is False
+
+    ex2 = _make_exchange(is_structural=True, is_distilled=True)
+    assert ex2.is_structural is True
+    assert ex2.is_distilled is True
+
+
+def test_preview_shows_route_badge():
+    """Preview for a KEEP exchange should contain '[KEEP]' in the output."""
+    ex = _make_exchange(
+        index=0,
+        role="user",
+        text="keep this message",
+        reduce_route="KEEP",
+        token_size=200,
+    )
+    result = _render_browse_preview(ex, [ex])
+    assert "[KEEP]" in result.plain
+
+
+def test_leaf_label_shows_processing_indicator():
+    """Distilled exchanges should show the alembic ⚗ icon in their label."""
+    ex = _make_exchange(
+        index=0,
+        role="assistant",
+        text="distilled content",
+        reduce_route="DISTILL",
+        is_distilled=True,
+    )
+    label = _format_leaf_label(ex)
+    assert "\u2697" in label.plain  # alembic
+
+    ex_structural = _make_exchange(
+        index=1,
+        role="assistant",
+        text="compressed content",
+        is_structural=True,
+        is_distilled=False,
+    )
+    label2 = _format_leaf_label(ex_structural)
+    assert "\u2298" in label2.plain  # circled dash
