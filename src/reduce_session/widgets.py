@@ -1766,9 +1766,69 @@ class DoctorModal(ModalScreen[bool]):
         except Exception:
             pass  # git optional
 
-        summary = ", ".join(f"{k}={v}" for k, v in stats.items())
-        self.app.call_from_thread(self.app.notify, f"Doctor fixes applied: {summary}")
-        self.app.call_from_thread(self.dismiss, True)
+        self._fix_stats = stats
+        self._selected.clear()
+        # Re-run diagnostics to show post-fix state
+        self.app.call_from_thread(self._run_diagnostics_after_fix)
+
+    def _run_diagnostics_after_fix(self) -> None:
+        """Re-run diagnostics after applying fixes, show summary."""
+        self.run_worker(self._rerun_and_render, thread=True)
+
+    def _rerun_and_render(self) -> None:
+        import json
+
+        from reduce_session.doctor import (
+            diagnose_bloated_tur,
+            diagnose_compaction_summaries,
+            diagnose_overlapping_files,
+            diagnose_parent_chain,
+            diagnose_reduce_tags,
+            diagnose_stale_tokens,
+            diagnose_unreduced_metadata,
+        )
+
+        with open(self.session_path) as f:
+            lines = []
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        lines.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+
+        self._diagnostics = [
+            diagnose_compaction_summaries(lines, self.session_path),
+            diagnose_parent_chain(lines, self.session_path),
+            diagnose_stale_tokens(lines, self.session_path),
+            diagnose_overlapping_files(lines, self.session_path),
+            diagnose_unreduced_metadata(lines, self.session_path),
+            diagnose_reduce_tags(lines, self.session_path),
+            diagnose_bloated_tur(lines, self.session_path),
+        ]
+        self.app.call_from_thread(self._render_post_fix)
+
+    def _render_post_fix(self) -> None:
+        from rich.text import Text
+
+        text = Text()
+        stats = getattr(self, "_fix_stats", {})
+        if stats:
+            text.append(" Fixes applied:\n", style="bold #44aa88")
+            for k, v in stats.items():
+                text.append(f"   {k}: {v}\n", style="#44aa88")
+            text.append("\n")
+
+        text.append(" Post-fix status:\n\n", style="bold")
+        for d in self._diagnostics:
+            color = self._SEVERITY_COLORS.get(d.severity, "#6688aa")
+            icon = self._SEVERITY_ICONS.get(d.severity, "?")
+            text.append(f"  {icon} ", style=color)
+            text.append(f"{d.name}", style=f"bold {color}")
+            text.append(f"  {d.summary}\n", style=color)
+
+        self.query_one("#doctor-results", Static).update(text)
 
     def action_cancel(self) -> None:
         self.dismiss(False)

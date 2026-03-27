@@ -43,7 +43,7 @@ class TestCompactionSummaries:
                 {
                     "type": "assistant",
                     "uuid": "a-1",
-                    "parentUuid": "u-1",
+                    "parentUuid": None,
                     "message": {
                         "content": "This conversation is being continued from a previous conversation. Here is a summary."
                     },

@@ -101,18 +101,19 @@ def diagnose_compaction_summaries(
     sparkline: list[tuple[float, bool]] = []
     summary_count = 0
 
+    orphaned_count = 0
     for i, obj in enumerate(lines):
         pos = i / max(total - 1, 1)
-        hit = _is_summary(obj)
+        hit = _is_summary(obj) and not obj.get("parentUuid")
         sparkline.append((pos, hit))
         if hit:
-            summary_count += 1
+            orphaned_count += 1
 
-    if summary_count > 0:
+    if orphaned_count > 0:
         return DiagnosticResult(
             name="compaction_summaries",
             severity="critical",
-            summary=f"{summary_count} compaction summary message(s) found",
+            summary=f"{orphaned_count} orphaned compaction summary(ies) found",
             sparkline_data=sparkline,
             fix_description="Graft summaries into chain (set parentUuid to previous message)",
             fix_fn=_fix_compaction_summaries,
