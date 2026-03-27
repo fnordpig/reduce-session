@@ -1616,12 +1616,16 @@ class DoctorModal(ModalScreen[bool]):
             stale_w = int(stale / max_val * bar_width)
             est_w = int(est / max_val * bar_width)
             text.append(
-                f"  stale: {'\u2588' * stale_w}{'\u2591' * (bar_width - stale_w)}"
-                f" {stale // 1000}k\n"
+                "  stale: "
+                + "\u2588" * stale_w
+                + "\u2591" * (bar_width - stale_w)
+                + f" {stale // 1000}k\n"
             )
             text.append(
-                f"  real:  {'\u2588' * est_w}{'\u2591' * (bar_width - est_w)}"
-                f" {est // 1000}k (est)\n"
+                "  real:  "
+                + "\u2588" * est_w
+                + "\u2591" * (bar_width - est_w)
+                + f" {est // 1000}k (est)\n"
             )
 
         elif d.name == "overlapping_files" and d.sparkline_data:
@@ -1635,7 +1639,7 @@ class DoctorModal(ModalScreen[bool]):
             for type_name, count in d.sparkline_data:
                 bar_len = min(count // 10, 30)
                 text.append(
-                    f"  {type_name:<16s} {'\u2588' * bar_len} {count}\n",
+                    "  " + f"{type_name:<16s} " + "\u2588" * bar_len + f" {count}\n",
                     style="dim",
                 )
 
