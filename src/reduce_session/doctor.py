@@ -262,6 +262,9 @@ def diagnose_overlapping_files(lines: list[dict], file_path: str) -> DiagnosticR
 
     from reduce_session.session import UUID_RE, SKIP_SUFFIXES
 
+    # Extract the session UUID from the current file path
+    session_uuid = p.stem.split(".")[0]
+
     active_files: list[tuple[str, str | None, str | None]] = []
     try:
         for f in sorted(directory.iterdir()):
@@ -269,9 +272,8 @@ def diagnose_overlapping_files(lines: list[dict], file_path: str) -> DiagnosticR
                 continue
             if any(f.name.endswith(sfx) for sfx in SKIP_SUFFIXES):
                 continue
-            stem = f.stem
-            # Only consider main UUID files
-            if not UUID_RE.match(stem.split(".")[0]):
+            # Only match files for the SAME session UUID
+            if not f.name.startswith(session_uuid):
                 continue
             # Get first and last timestamps
             first_ts = None
