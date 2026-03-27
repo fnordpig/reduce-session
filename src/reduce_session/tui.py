@@ -19,6 +19,7 @@ from textual.widgets import Footer, Header, Static, Tree
 from .session import SessionInfo, scan_projects
 from .widgets import (
     ConversationPreview,
+    DoctorModal,
     HistoryModal,
     InfoBar,
     ReduceModal,
@@ -55,6 +56,7 @@ class SessionBrowserApp(App):
         Binding("q", "quit", "Quit"),
         Binding("escape", "quit", "Quit", show=False),
         Binding("r", "reduce", "Reduce", show=True),
+        Binding("D", "doctor", "Doctor", show=True),
         Binding("h", "history", "History", show=True),
         Binding("ctrl+l", "refresh", "Refresh", show=True, key_display="^L"),
         Binding("shift+r", "refresh", "Refresh", show=False),
@@ -214,6 +216,22 @@ class SessionBrowserApp(App):
     def _on_history_dismiss(self, restored: bool | None) -> None:
         """Refresh session list if a restore was performed."""
         if restored:
+            self._load_sessions()
+
+    def action_doctor(self) -> None:
+        """Open Doctor modal for selected session."""
+        session = self.selected_session
+        if session:
+            self.push_screen(
+                DoctorModal(str(session.path)),
+                callback=self._on_doctor_dismiss,
+            )
+        else:
+            self.notify("Select a session first", severity="warning")
+
+    def _on_doctor_dismiss(self, applied: bool | None) -> None:
+        """Refresh session list if doctor fixes were applied."""
+        if applied:
             self._load_sessions()
 
     def action_cursor_down(self) -> None:

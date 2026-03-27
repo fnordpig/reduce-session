@@ -1481,3 +1481,244 @@ class HistoryModal(ModalScreen[bool]):
 
     def action_cancel(self) -> None:
         self.dismiss(False)
+
+
+class DoctorModal(ModalScreen[bool]):
+    """Doctor modal -- diagnoses and fixes session health issues."""
+
+    BINDINGS = [
+        ("escape", "cancel", "Close"),
+        ("space", "toggle_fix", "Toggle fix"),
+    ]
+
+    _SEVERITY_COLORS = {
+        "ok": "#44aa88",
+        "critical": "#ee4444",
+        "warning": "#ddaa22",
+        "info": "#6688aa",
+    }
+
+    _SEVERITY_ICONS = {
+        "ok": "\u2713",
+        "critical": "\u2717",
+        "warning": "\u26a0",
+        "info": "\u26a0",
+    }
+
+    def __init__(self, session_path: str):
+        super().__init__()
+        self.session_path = session_path
+        self._diagnostics: list = []  # list[DiagnosticResult]
+        self._selected: set[int] = set()  # indices of checked fixes
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="doctor-container"):
+            yield Static("", id="doctor-title")
+            yield Static("Running diagnostics...", id="doctor-results")
+            with Horizontal(id="doctor-actions"):
+                yield Button("Apply Selected", id="btn-apply-doctor", variant="success")
+                yield Button("Close", id="btn-close-doctor")
+
+    def on_mount(self) -> None:
+        from pathlib import Path
+
+        short_id = Path(self.session_path).stem[:8]
+        self.query_one("#doctor-title", Static).update(
+            Text(f" Doctor: {short_id} ", style="bold")
+        )
+        self.run_worker(self._run_diagnostics, thread=True)
+
+    def _run_diagnostics(self) -> None:
+        import json
+
+        from reduce_session.doctor import (
+            diagnose_bloated_tur,
+            diagnose_compaction_summaries,
+            diagnose_overlapping_files,
+            diagnose_parent_chain,
+            diagnose_reduce_tags,
+            diagnose_stale_tokens,
+            diagnose_unreduced_metadata,
+        )
+
+        with open(self.session_path) as f:
+            lines = [json.loads(line) for line in f]
+
+        diagnostics = [
+            diagnose_compaction_summaries(lines, self.session_path),
+            diagnose_parent_chain(lines, self.session_path),
+            diagnose_stale_tokens(lines, self.session_path),
+            diagnose_overlapping_files(lines, self.session_path),
+            diagnose_unreduced_metadata(lines, self.session_path),
+            diagnose_reduce_tags(lines, self.session_path),
+            diagnose_bloated_tur(lines, self.session_path),
+        ]
+        self._diagnostics = diagnostics
+
+        # Auto-select all fixable critical/warning items
+        for i, d in enumerate(diagnostics):
+            if d.fix_fn and d.severity in ("critical", "warning"):
+                self._selected.add(i)
+
+        self.app.call_from_thread(self._render_results)
+
+    def _render_results(self) -> None:
+        text = Text()
+        for i, d in enumerate(self._diagnostics):
+            color = self._SEVERITY_COLORS.get(d.severity, "#6688aa")
+            icon = self._SEVERITY_ICONS.get(d.severity, "?")
+
+            text.append(f" {icon} ", style=color)
+            text.append(f"{d.name}", style=f"bold {color}")
+            text.append(f"  {d.summary}\n", style=color)
+
+            # Render sparkline per diagnostic type
+            self._render_sparkline(text, d)
+
+            # Detail lines
+            for line in d.detail_lines:
+                text.append(f"    {line}\n", style="dim")
+
+            # Fix preview
+            if d.fix_fn:
+                checkbox = "\u2611" if i in self._selected else "\u2610"
+                text.append(f"  Fix: {d.fix_description}  [{checkbox}]\n", style="bold")
+
+            text.append("\n")
+
+        self.query_one("#doctor-results", Static).update(text)
+
+    def _render_sparkline(self, text: Text, d) -> None:
+        """Append diagnostic-specific sparkline visualization to *text*."""
+        if d.name == "compaction_summaries" and d.sparkline_data:
+            text.append("  ")
+            for _pos, is_summary in d.sparkline_data:
+                if is_summary:
+                    text.append("\u2588", style="#ee4444")
+                else:
+                    text.append("\u2581", style="#333")
+            text.append("\n")
+
+        elif d.name == "parent_chain" and d.sparkline_data:
+            text.append("  ")
+            for _pos, is_broken in d.sparkline_data:
+                text.append(
+                    "\u2588" if is_broken else "\u2581",
+                    style="#ee4444" if is_broken else "#44aa88",
+                )
+            text.append("\n")
+
+        elif d.name == "stale_tokens" and len(d.sparkline_data) >= 2:
+            stale = d.sparkline_data[0][1]
+            est = d.sparkline_data[1][1]
+            max_val = max(stale, est, 1)
+            bar_width = 40
+            stale_w = int(stale / max_val * bar_width)
+            est_w = int(est / max_val * bar_width)
+            text.append(
+                f"  stale: {'\u2588' * stale_w}{'\u2591' * (bar_width - stale_w)}"
+                f" {stale // 1000}k\n"
+            )
+            text.append(
+                f"  real:  {'\u2588' * est_w}{'\u2591' * (bar_width - est_w)}"
+                f" {est // 1000}k (est)\n"
+            )
+
+        elif d.name == "overlapping_files" and d.sparkline_data:
+            for fname, first_ts, last_ts in d.sparkline_data:
+                ts_range = ""
+                if first_ts and last_ts:
+                    ts_range = f" [{first_ts[:19]} .. {last_ts[:19]}]"
+                text.append(f"    {fname}{ts_range}\n", style="dim")
+
+        elif d.name == "unreduced_metadata" and d.sparkline_data:
+            for type_name, count in d.sparkline_data:
+                bar_len = min(count // 10, 30)
+                text.append(
+                    f"  {type_name:<16s} {'\u2588' * bar_len} {count}\n",
+                    style="dim",
+                )
+
+        elif d.name == "reduce_tags" and d.sparkline_data:
+            text.append("  ")
+            for _pos, has_tag in d.sparkline_data:
+                if has_tag:
+                    text.append("\u2588", style="#44aa88")
+                else:
+                    text.append("\u2588", style="#333")
+            text.append("\n")
+
+        elif d.name == "bloated_tur" and d.sparkline_data:
+            max_size = max(s for _, s in d.sparkline_data) if d.sparkline_data else 1
+            spark_chars = " \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+            text.append("  ")
+            for _pos, size in d.sparkline_data:
+                idx = min(
+                    int(size / max(max_size, 1) * (len(spark_chars) - 1)),
+                    len(spark_chars) - 1,
+                )
+                text.append(spark_chars[idx], style="#ee4444")
+            text.append("\n")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "btn-close-doctor":
+            self.dismiss(False)
+        elif event.button.id == "btn-apply-doctor":
+            self._apply_selected()
+
+    def _apply_selected(self) -> None:
+        if not self._selected:
+            self.app.notify("No fixes selected", severity="warning")
+            return
+        self.run_worker(self._do_apply, thread=True)
+
+    def _do_apply(self) -> None:
+        import json
+
+        from reduce_session.doctor import apply_fixes
+        from reduce_session.git_ops import git_init, git_snapshot
+
+        with open(self.session_path) as f:
+            lines = [json.loads(line) for line in f]
+
+        selected_diags = [
+            self._diagnostics[i]
+            for i in sorted(self._selected)
+            if i < len(self._diagnostics)
+        ]
+        stats = apply_fixes(lines, self.session_path, selected_diags)
+
+        # Write back
+        with open(self.session_path, "w") as f:
+            for obj in lines:
+                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+        # Git snapshot
+        from pathlib import Path
+
+        p = Path(self.session_path)
+        project_dir = str(p.parent)
+        basename = p.name
+        short = p.stem[:8]
+        try:
+            git_init(project_dir)
+            git_snapshot(project_dir, basename, None, f"doctor fixes {short}")
+        except Exception:
+            pass  # git optional
+
+        summary = ", ".join(f"{k}={v}" for k, v in stats.items())
+        self.app.call_from_thread(self.app.notify, f"Doctor fixes applied: {summary}")
+        self.app.call_from_thread(self.dismiss, True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    def action_toggle_fix(self) -> None:
+        """Toggle the first fixable diagnostic (for keyboard use)."""
+        for i, d in enumerate(self._diagnostics):
+            if d.fix_fn:
+                if i in self._selected:
+                    self._selected.discard(i)
+                else:
+                    self._selected.add(i)
+        self._render_results()

@@ -219,3 +219,42 @@ HistoryModal {
     overflow-y: auto;
 }
 
+/* Doctor Modal */
+DoctorModal {
+    align-horizontal: center;
+    align-vertical: middle;
+}
+
+#doctor-container {
+    width: 75%;
+    max-width: 90%;
+    height: 90%;
+    border: solid;
+    background: $surface;
+    padding: 1 2;
+    overflow-y: auto;
+}
+
+#doctor-title {
+    text-style: bold;
+    height: 1;
+    padding: 0 0 1 0;
+}
+
+#doctor-results {
+    height: 1fr;
+    overflow-y: auto;
+}
+
+#doctor-actions {
+    height: 3;
+    dock: bottom;
+    align-horizontal: right;
+    padding-top: 1;
+}
+
+#doctor-actions Button {
+    height: 1;
+    margin: 0 0 0 1;
+}
+

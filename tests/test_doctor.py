@@ -553,3 +553,61 @@ class TestApplyFixes:
 
         stats = apply_fixes(lines, str(path), [d_chain])
         assert stats == {}
+
+
+# --- DoctorModal widget tests ---
+
+
+class TestDoctorModalComposes:
+    """Verify DoctorModal composes its widget tree without error."""
+
+    def test_doctor_modal_composes(self, tmp_path):
+        """DoctorModal instantiates and has expected attributes."""
+        session_file = tmp_path / "test-session.jsonl"
+        session_file.write_text(
+            json.dumps(
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {"content": "Hello"},
+                }
+            )
+            + "\n"
+        )
+
+        from reduce_session.widgets import DoctorModal
+
+        modal = DoctorModal(str(session_file))
+        # Verify constructor sets state correctly
+        assert modal.session_path == str(session_file)
+        assert modal._diagnostics == []
+        assert modal._selected == set()
+        # Verify class-level severity maps exist and are complete
+        for sev in ("ok", "critical", "warning", "info"):
+            assert sev in modal._SEVERITY_COLORS
+            assert sev in modal._SEVERITY_ICONS
+
+
+class TestRenderSeverityColors:
+    """Verify _render_results uses the correct color per severity level."""
+
+    def test_severity_color_mapping(self):
+        from reduce_session.widgets import DoctorModal
+
+        expected = {
+            "ok": "#44aa88",
+            "critical": "#ee4444",
+            "warning": "#ddaa22",
+            "info": "#6688aa",
+        }
+        for severity, color in expected.items():
+            assert DoctorModal._SEVERITY_COLORS[severity] == color
+
+    def test_severity_icon_mapping(self):
+        from reduce_session.widgets import DoctorModal
+
+        assert DoctorModal._SEVERITY_ICONS["ok"] == "\u2713"
+        assert DoctorModal._SEVERITY_ICONS["critical"] == "\u2717"
+        assert DoctorModal._SEVERITY_ICONS["warning"] == "\u26a0"
+        assert DoctorModal._SEVERITY_ICONS["info"] == "\u26a0"
