@@ -2499,7 +2499,27 @@ class ConversationBrowserModal(ModalScreen[None]):
             lines = f.readlines()
 
         if 0 <= idx < len(lines):
+            deleted_line = lines[idx]
+            try:
+                deleted_obj = json.loads(deleted_line)
+                deleted_uuid = deleted_obj.get("uuid")
+                deleted_parent = deleted_obj.get("parentUuid")
+            except (json.JSONDecodeError, AttributeError):
+                deleted_uuid = None
+                deleted_parent = None
+
             del lines[idx]
+
+            # Reparent children of deleted message
+            if deleted_uuid:
+                for i, line in enumerate(lines):
+                    try:
+                        obj = json.loads(line)
+                        if obj.get("parentUuid") == deleted_uuid:
+                            obj["parentUuid"] = deleted_parent
+                            lines[i] = json.dumps(obj, ensure_ascii=False) + "\n"
+                    except json.JSONDecodeError:
+                        continue
 
         tmp_fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), suffix=".tmp")
         try:

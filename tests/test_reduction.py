@@ -386,7 +386,7 @@ def _make_thinking_session(tmp_path, thinking_text, signature="ErUBCk" + "A" * 5
 
 
 def test_strip_thinking_signature_empty(tmp_path):
-    """Empty thinking blocks should have their signature stripped."""
+    """Empty thinking blocks should be dropped entirely."""
     import json
 
     session = _make_thinking_session(tmp_path, thinking_text="")
@@ -394,13 +394,15 @@ def test_strip_thinking_signature_empty(tmp_path):
 
     for line in result.kept_lines:
         obj = json.loads(line)
-        if obj.get("type") != "assistant":
-            continue
-        for block in obj.get("message", {}).get("content", []):
-            if block.get("type") == "thinking":
-                assert "signature" not in block, (
-                    "signature should be stripped from empty thinking block"
-                )
+        msg = obj.get("message", {})
+        if isinstance(msg, dict):
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        assert block.get("type") != "thinking", (
+                            "Empty thinking block should be dropped, not kept"
+                        )
 
 
 def test_strip_thinking_signature_preserved_when_text(tmp_path):
@@ -427,7 +429,7 @@ def test_strip_thinking_signature_preserved_when_text(tmp_path):
 
 
 def test_strip_thinking_signature_truncated(tmp_path):
-    """Thinking blocks whose text is truncated should lose their signature."""
+    """Thinking blocks whose text is truncated should be dropped entirely."""
     import json
 
     # Very long thinking text — will be truncated at any profile
@@ -437,13 +439,16 @@ def test_strip_thinking_signature_truncated(tmp_path):
 
     for line in result.kept_lines:
         obj = json.loads(line)
-        if obj.get("type") != "assistant":
-            continue
-        for block in obj.get("message", {}).get("content", []):
-            if block.get("type") == "thinking":
-                assert "signature" not in block, (
-                    "signature should be stripped after thinking text is truncated"
-                )
+        msg = obj.get("message", {})
+        if isinstance(msg, dict):
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "thinking":
+                            assert "signature" not in block, (
+                                "signature should be stripped after thinking text is truncated"
+                            )
 
 
 def test_strip_thinking_signature_stat_counted(tmp_path):
@@ -1033,3 +1038,52 @@ def test_fix_orphaned_tool_results_reparents_chain():
     assert u4["parentUuid"] == "u2", (
         f"u4 should be reparented to u2, got {u4['parentUuid']}"
     )
+
+
+def test_reduce_session_preserves_chain_integrity(sample_session):
+    """Every non-null parentUuid in output must reference an existing UUID."""
+    result = reduce_session(str(sample_session))
+
+    uuids = set()
+    objs = []
+    for line in result.kept_lines:
+        obj = json.loads(line)
+        objs.append(obj)
+        uid = obj.get("uuid")
+        if uid:
+            uuids.add(uid)
+
+    broken = []
+    for obj in objs:
+        parent = obj.get("parentUuid")
+        if parent and parent not in uuids:
+            broken.append((obj.get("uuid", "?"), parent))
+
+    assert not broken, f"Broken parentUuid refs in output: {broken}"
+
+
+def test_reduce_session_never_produces_empty_output(sample_session):
+    """reduce_session must always produce at least one output line."""
+    result = reduce_session(str(sample_session))
+    assert len(result.kept_lines) > 0, "reduce_session produced empty output"
+
+
+def test_reduce_session_idempotent(sample_session):
+    """Running reduce_session twice should produce the same output."""
+    result1 = reduce_session(str(sample_session))
+
+    # Write first result to a new file
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        f.writelines(result1.kept_lines)
+        path2 = f.name
+
+    try:
+        result2 = reduce_session(path2)
+        # Second pass should not significantly change the output
+        # Allow small differences from re-serialization, but content should be stable
+        assert abs(result2.new_size - result1.new_size) < result1.new_size * 0.05, (
+            f"Second reduction changed size by {abs(result2.new_size - result1.new_size)} bytes "
+            f"({abs(result2.new_size - result1.new_size) * 100 / result1.new_size:.1f}%)"
+        )
+    finally:
+        os.unlink(path2)

@@ -318,7 +318,7 @@ class TestStaleTokens:
         assert result.severity == "warning"
         assert result.fix_fn is not None
 
-    def test_fix_strips_usage(self, tmp_path):
+    def test_fix_recalibrates_usage(self, tmp_path):
         lines = _make_lines(
             [
                 {
