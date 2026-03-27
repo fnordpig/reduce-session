@@ -1710,7 +1710,7 @@ class DoctorModal(ModalScreen[bool]):
         import json
 
         from reduce_session.doctor import apply_fixes
-        from reduce_session.git_ops import git_init, git_snapshot
+        from reduce_session.git_ops import ensure_git_repo, git_snapshot
 
         with open(self.session_path) as f:
             lines = [json.loads(line) for line in f]
@@ -1735,7 +1735,7 @@ class DoctorModal(ModalScreen[bool]):
         basename = p.name
         short = p.stem[:8]
         try:
-            git_init(project_dir)
+            ensure_git_repo(project_dir)
             git_snapshot(project_dir, basename, None, f"doctor fixes {short}")
         except Exception:
             pass  # git optional
