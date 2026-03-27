@@ -1878,15 +1878,15 @@ async def _llm_compression_pass(
     stats = {}
     total = len(kept_objs)
 
-    # Identify middle-zone exchanges (aggr > 0.2)
-    # Skip messages that were already LLM-processed at the same or higher aggressiveness
+    # Identify ALL exchanges for classification, but only middle-zone for compression
+    # Classification is cheap (batch API); compression is expensive (token spend)
     middle = []
     reused_classifications = 0
     for pos, obj in enumerate(kept_objs):
         position = pos / max(total - 1, 1)
         aggr = aggr_fn(position)
-        if aggr > 0.2:
-            middle.append((pos, obj, aggr))
+        # Include all messages for classification; aggr determines compression level
+        middle.append((pos, obj, aggr))
 
     if not middle:
         return stats
@@ -1982,7 +1982,7 @@ async def _llm_compression_pass(
                     profile=profile,
                 )
                 route = ROUTING_MAP.get(cat, Route.HEURISTIC)
-                if route == Route.DISTILL:
+                if route == Route.DISTILL and aggr > 0.2:
                     if was_processed(obj, "distilled", profile):
                         continue
                     await distill_queue.put((pos, obj, cat))
