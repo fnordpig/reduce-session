@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "reduce-session": {
+      "command": "uv",
+      "args": ["run", "--directory", "/Users/rwaugh/src/mine/reduce-session", "reduce-session-mcp"]
+    }
+  }
+}

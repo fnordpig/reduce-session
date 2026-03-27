@@ -3,10 +3,15 @@ name = "reduce-session"
 version = "0.3.0"
 description = "Reduce Claude Code session JSONL files while preserving conversation quality"
 requires-python = ">=3.10"
-dependencies = ["textual>=1.0", "huggingface-hub>=0.20"]
+dependencies = [
+    "textual>=1.0",
+    "huggingface-hub>=0.20",
+    "fastmcp>=3.1.1",
+]
 
 [project.scripts]
 reduce-session = "reduce_session.cli:main"
+reduce-session-mcp = "reduce_session.mcp_server:main"
 
 [project.optional-dependencies]
 local-macos = ["mlx-lm>=0.10"]
