@@ -49,6 +49,7 @@ class BrowseExchange:
     token_size: int  # len(json.dumps(obj)) // 4
     is_structural: bool = False  # structural compression applied
     is_distilled: bool = False  # LLM distillation applied
+    output_file: str | None = None  # persisted tool output path (tool-results/)
 
 
 def token_color(tokens: int) -> str:
@@ -1990,6 +1991,14 @@ def parse_browse_exchanges(path: str) -> list[BrowseExchange]:
 
                 token_size = len(json.dumps(obj)) // 4
 
+                # Check for persisted output file
+                output_file = None
+                tur = obj.get("toolUseResult")
+                if isinstance(tur, dict):
+                    pop = tur.get("persistedOutputPath")
+                    if isinstance(pop, str) and pop:
+                        output_file = pop
+
                 exchanges.append(
                     BrowseExchange(
                         index=line_idx,
@@ -2003,6 +2012,7 @@ def parse_browse_exchanges(path: str) -> list[BrowseExchange]:
                         token_size=token_size,
                         is_structural=is_structural,
                         is_distilled=is_distilled,
+                        output_file=output_file,
                     )
                 )
     except (OSError, PermissionError):
@@ -2292,6 +2302,27 @@ def _render_browse_preview(
             text.append("  Processed: classified only\n", style="dim")
         else:
             text.append("  Processed: none (unreduced)\n", style="#ee4444")
+
+        # Output file link
+        if ex.output_file:
+            import os
+
+            text.append("\n── Output File ──\n", style="dim")
+            exists = os.path.exists(ex.output_file)
+            basename = os.path.basename(ex.output_file)
+            if exists:
+                size = os.path.getsize(ex.output_file)
+                size_str = (
+                    f"{size / 1024 / 1024:.1f} MB"
+                    if size > 1024 * 1024
+                    else f"{size / 1024:.0f} KB"
+                )
+                text.append(f"  {basename}", style="bold #6688cc")
+                text.append(f"  ({size_str})\n", style="dim")
+                text.append(f"  {ex.output_file}\n", style="dim italic")
+            else:
+                text.append(f"  {basename}", style="bold #ee4444")
+                text.append("  (missing)\n", style="#ee4444")
 
         text.append("\n── Content ──\n", style="dim")
 
