@@ -96,6 +96,27 @@ def test_structural_compress_indentation():
     assert "println!" in result
 
 
+def test_rle_collapse_unicode_wall():
+    from reduce_session.reduction import _rle_collapse, structural_compress
+
+    # Direct RLE
+    wall = "\u2581" * 1400
+    assert _rle_collapse(wall) == "\u2581*1400"
+
+    # Through structural_compress at aggr=0.0 (head zone — fires unconditionally)
+    result = structural_compress(wall, aggr=0.0)
+    assert len(result) < 20
+
+    # Short runs preserved
+    assert _rle_collapse("===" + "abc") == "===" + "abc"
+
+    # Mixed content
+    mixed = "Hello " + "=" * 50 + " end"
+    result = _rle_collapse(mixed)
+    assert "=*50" in result
+    assert "Hello " in result
+
+
 def test_blank_line_collapse():
     from reduce_session.reduction import structural_compress
 

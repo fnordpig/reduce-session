@@ -562,6 +562,24 @@ def _strip_non_ascii(text: str) -> str:
     return text.encode("ascii", errors="ignore").decode("ascii")
 
 
+_RLE_RE = re.compile(r"(.)\1{9,}")
+
+
+def _rle_collapse(text: str, threshold: int = 10) -> str:
+    """Collapse runs of 10+ identical characters to char*N notation.
+
+    Fires unconditionally — runs this long are never meaningful content.
+    Handles the ▁▁▁▁▁▁▁▁▁▁ sparkline walls and ═══════ box-drawing floods.
+    """
+
+    def _replace(m):
+        char = m.group(1)
+        count = len(m.group(0))
+        return f"{char}*{count}"
+
+    return _RLE_RE.sub(_replace, text)
+
+
 def structural_compress(text: str, aggr: float) -> str:
     """Apply structural compression techniques to text based on aggressiveness.
 
@@ -577,6 +595,14 @@ def structural_compress(text: str, aggr: float) -> str:
         _structural_profile, STRUCTURAL_THRESHOLDS["standard"]
     )
     orig_len = len(text)
+
+    # 0. Run-length encoding: collapse 10+ identical characters to char×N
+    new_text = _rle_collapse(text)
+    if new_text != text:
+        _structural_stats["rle_chars_saved"] = (
+            _structural_stats.get("rle_chars_saved", 0) + len(text) - len(new_text)
+        )
+        text = new_text
 
     # 1. Path shortening
     if aggr > thresholds["paths"]:
@@ -643,7 +669,9 @@ def structural_compress(text: str, aggr: float) -> str:
 
     saved = orig_len - len(text)
     if saved > 0:
-        _structural_stats["chars_saved_structural"] += saved
+        _structural_stats["chars_saved_structural"] = (
+            _structural_stats.get("chars_saved_structural", 0) + saved
+        )
 
     return text
 
