@@ -1437,6 +1437,7 @@ def _replace_dead_persisted_outputs(kept_objs):
         msg = obj.get("message", {})
         if not isinstance(msg, dict):
             continue
+        found_dead = False
         content = msg.get("content")
         if isinstance(content, str):
             for m in _PERSISTED_RE.finditer(content):
@@ -1447,7 +1448,8 @@ def _replace_dead_persisted_outputs(kept_objs):
                         m.group(0), f"[output file removed: {fname}]"
                     )
                     replaced += 1
-            if replaced:
+                    found_dead = True
+            if found_dead:
                 msg["content"] = content
         elif isinstance(content, list):
             for block in content:
@@ -1465,7 +1467,12 @@ def _replace_dead_persisted_outputs(kept_objs):
                                 m.group(0), f"[output file removed: {fname}]"
                             )
                             replaced += 1
+                            found_dead = True
                     block[key] = val
+
+        # Strip the toolUseResult — it carries the same dead output data
+        if found_dead and "toolUseResult" in obj:
+            del obj["toolUseResult"]
 
     return replaced
 
