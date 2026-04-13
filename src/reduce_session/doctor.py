@@ -26,6 +26,23 @@ METADATA_TYPES = frozenset(
 TUR_THRESHOLD = 10 * 1024  # 10 KB
 TUR_TRUNCATE_TO = 2048  # 2 KB
 
+# Fix application order — lower number runs first.
+_FIX_ORDER: dict[str, int] = {
+    "compaction_summaries": 0,
+    "corrupted_tool_use": 1,
+    "corrupted_content_blocks": 2,
+    "unreduced_metadata": 3,
+    "bloated_tur": 4,
+    "orphaned_tool_results": 5,
+    "parent_chain": 6,
+    "cycle_in_parent_chain": 6,
+    "null_parentUuid_at_non_root": 6,
+    "reduce_tags": 7,
+    "overlapping_files": 7,
+    "stale_backups": 8,
+    "stale_tokens": 9,
+}
+
 
 @dataclass
 class DiagnosticResult:
@@ -75,8 +92,12 @@ def _fix_compaction_summaries(lines: list[dict]) -> dict:
     everything before them.  The fix sets their parentUuid to the last real
     message before them, turning them into regular chain members.  Children
     already point at the summary's uuid, so they stay connected.
+
+    If the summary is at position 0 (no predecessors exist), it IS the natural
+    root — parentUuid stays None, which is correct for a root node.
     """
     grafted = 0
+    natural_roots = 0
     for i, obj in enumerate(lines):
         if not _is_summary(obj):
             continue
@@ -84,14 +105,22 @@ def _fix_compaction_summaries(lines: list[dict]) -> dict:
         if obj.get("parentUuid"):
             continue
         # Find previous real message to graft onto
+        found = False
         for j in range(i - 1, -1, -1):
             prev_uuid = lines[j].get("uuid")
             if prev_uuid and lines[j].get("type") in ("user", "assistant"):
                 obj["parentUuid"] = prev_uuid
                 grafted += 1
+                found = True
                 break
+        if not found:
+            # No predecessor — this summary is the natural root of the file.
+            # parentUuid=None is already correct; record it explicitly so the
+            # fix counter reflects that we examined and accepted this case.
+            obj["parentUuid"] = None
+            natural_roots += 1
 
-    return {"summaries_grafted": grafted}
+    return {"summaries_grafted": grafted, "natural_roots": natural_roots}
 
 
 def diagnose_compaction_summaries(
@@ -134,7 +163,13 @@ def diagnose_compaction_summaries(
 
 
 def _fix_parent_chain(lines: list[dict]) -> dict:
-    """Reparent broken refs to the nearest preceding valid UUID."""
+    """Reparent broken refs to the nearest preceding valid UUID.
+
+    When no valid predecessor exists (broken ref at position 0), preserve the
+    original parentUuid value rather than overwriting it with None — the caller
+    may have already set a deliberate root value, and writing None could
+    silently hide a different problem.
+    """
     uuid_set: set[str] = set()
     for obj in lines:
         uid = obj.get("uuid")
@@ -152,9 +187,8 @@ def _fix_parent_chain(lines: list[dict]) -> dict:
                     obj["parentUuid"] = prev_uuid
                     reparented += 1
                     break
-            else:
-                obj["parentUuid"] = None
-                reparented += 1
+            # If no valid predecessor found, leave parentUuid as-is — do NOT
+            # write None, which would silently corrupt a root-level reference.
 
     return {"parent_refs_reparented": reparented}
 
@@ -325,6 +359,47 @@ def diagnose_stale_tokens(lines: list[dict], file_path: str) -> DiagnosticResult
 # ---------------------------------------------------------------------------
 
 
+def _fix_overlapping_files(lines: list[dict], file_path: str = "") -> dict:
+    """Rename old/smaller continuation files to .bak2 so they are skipped.
+
+    The current (largest / most-recent) file is kept.  Continuation files that
+    look like <uuid>.<n>.jsonl and are smaller than the main file are the
+    expected stale duplicates; they get renamed to <name>.bak2.
+    """
+    from reduce_session.session import CONTINUATION_RE, SKIP_SUFFIXES
+
+    p = Path(file_path)
+    directory = p.parent
+    session_uuid = p.stem.split(".")[0]
+    renamed = 0
+
+    try:
+        candidates: list[tuple[int, Path]] = []
+        for f in sorted(directory.iterdir()):
+            if not f.name.endswith(".jsonl"):
+                continue
+            if any(f.name.endswith(sfx) for sfx in SKIP_SUFFIXES):
+                continue
+            if not f.name.startswith(session_uuid):
+                continue
+            # Only rename continuation files (e.g. <uuid>.1.jsonl), not the
+            # primary session file itself.
+            if CONTINUATION_RE.match(f.name):
+                candidates.append((f.stat().st_size, f))
+
+        # Rename all continuation files that are smaller than the primary file
+        primary_size = p.stat().st_size if p.exists() else 0
+        for size, f in candidates:
+            if size <= primary_size:
+                dest = f.with_suffix(".jsonl.bak2")
+                f.rename(dest)
+                renamed += 1
+    except OSError:
+        pass
+
+    return {"continuation_files_renamed": renamed}
+
+
 def diagnose_overlapping_files(lines: list[dict], file_path: str) -> DiagnosticResult:
     p = Path(file_path)
     directory = p.parent
@@ -375,17 +450,21 @@ def diagnose_overlapping_files(lines: list[dict], file_path: str) -> DiagnosticR
     if count > 1:
         severity = "warning"
         summary = f"{count} active session files in directory"
+        fix_fn = lambda lines, fp=file_path: _fix_overlapping_files(lines, fp)
+        fix_desc = "Rename smaller continuation files to .bak2"
     else:
         severity = "ok"
         summary = "Single session file"
+        fix_fn = None
+        fix_desc = ""
 
     return DiagnosticResult(
         name="overlapping_files",
         severity=severity,
         summary=summary,
         sparkline_data=sparkline,
-        fix_description="",
-        fix_fn=None,  # manual action needed
+        fix_description=fix_desc,
+        fix_fn=fix_fn,
     )
 
 
@@ -760,6 +839,466 @@ def diagnose_orphaned_tool_results(
         sparkline_data=sparkline,
         fix_description="Replace dead refs + delete orphaned files",
         fix_fn=lambda lines, fp=file_path: _fix_orphaned_tool_results(lines, fp),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. Corrupted tool_use blocks (overlong names)
+# ---------------------------------------------------------------------------
+
+_TOOL_NAME_MAX = 200
+_INPUT_KEY_RE = re.compile(r'(\w+)="')
+
+
+def _fix_corrupted_tool_use(lines: list[dict]) -> dict:
+    """Fix tool_use blocks with corrupted (>200 char) names.
+
+    Attempts to extract the real tool name from the corrupted string.  If
+    extraction fails, drops the block entirely.
+    """
+    fixed = 0
+    dropped = 0
+    for obj in lines:
+        msg = obj.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        keep: list = []
+        for block in content:
+            if not isinstance(block, dict):
+                keep.append(block)
+                continue
+            if block.get("type") != "tool_use":
+                keep.append(block)
+                continue
+            name = block.get("name", "")
+            if len(name) <= _TOOL_NAME_MAX:
+                keep.append(block)
+                continue
+            # Try to recover: first quoted word before first '"' boundary
+            parts = name.split('"')
+            candidate = parts[0].strip() if parts else ""
+            if candidate and re.match(r"^\w+$", candidate):
+                block = dict(block)
+                block["name"] = candidate
+                keep.append(block)
+                fixed += 1
+            else:
+                dropped += 1
+        msg["content"] = keep
+    return {"corrupted_tool_use_fixed": fixed, "corrupted_tool_use_dropped": dropped}
+
+
+def diagnose_corrupted_tool_use(lines: list[dict], file_path: str) -> DiagnosticResult:
+    total = len(lines)
+    sparkline: list[tuple[float, bool]] = []
+    bad_count = 0
+
+    for i, obj in enumerate(lines):
+        pos = i / max(total - 1, 1)
+        hit = False
+        msg = obj.get("message", {})
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        if len(block.get("name", "")) > _TOOL_NAME_MAX:
+                            hit = True
+                            bad_count += 1
+        sparkline.append((pos, hit))
+
+    if bad_count:
+        return DiagnosticResult(
+            name="corrupted_tool_use",
+            severity="critical",
+            summary=f"{bad_count} tool_use block(s) with corrupted name (>{_TOOL_NAME_MAX} chars)",
+            sparkline_data=sparkline,
+            fix_description="Attempt name extraction; drop block if unparseable",
+            fix_fn=_fix_corrupted_tool_use,
+        )
+    return DiagnosticResult(
+        name="corrupted_tool_use",
+        severity="ok",
+        summary="No corrupted tool_use names",
+        sparkline_data=sparkline,
+        fix_description="",
+        fix_fn=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 10. Corrupted content blocks (missing ids)
+# ---------------------------------------------------------------------------
+
+
+def _fix_corrupted_content_blocks(lines: list[dict]) -> dict:
+    """Drop tool_use blocks with missing id and tool_result blocks with missing
+    tool_use_id.  Records uuids of messages that become content-less.
+    """
+    dropped = 0
+    empty_uuids: list[str] = []
+    for obj in lines:
+        msg = obj.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        keep: list = []
+        for block in content:
+            if not isinstance(block, dict):
+                keep.append(block)
+                continue
+            btype = block.get("type", "")
+            if btype == "tool_use" and not block.get("id"):
+                dropped += 1
+                continue
+            if btype == "tool_result" and not block.get("tool_use_id"):
+                dropped += 1
+                continue
+            keep.append(block)
+        msg["content"] = keep
+        if not keep:
+            uid = obj.get("uuid")
+            if uid:
+                empty_uuids.append(uid)
+    return {"corrupted_blocks_dropped": dropped, "emptied_message_uuids": empty_uuids}
+
+
+def diagnose_corrupted_content_blocks(
+    lines: list[dict], file_path: str
+) -> DiagnosticResult:
+    total = len(lines)
+    sparkline: list[tuple[float, bool]] = []
+    bad_count = 0
+
+    for i, obj in enumerate(lines):
+        pos = i / max(total - 1, 1)
+        hit = False
+        msg = obj.get("message", {})
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type", "")
+                    if btype == "tool_use" and not block.get("id"):
+                        hit = True
+                        bad_count += 1
+                    elif btype == "tool_result" and not block.get("tool_use_id"):
+                        hit = True
+                        bad_count += 1
+        sparkline.append((pos, hit))
+
+    if bad_count:
+        return DiagnosticResult(
+            name="corrupted_content_blocks",
+            severity="critical",
+            summary=f"{bad_count} content block(s) with missing id/tool_use_id",
+            sparkline_data=sparkline,
+            fix_description="Drop corrupted blocks; note messages that become empty",
+            fix_fn=_fix_corrupted_content_blocks,
+        )
+    return DiagnosticResult(
+        name="corrupted_content_blocks",
+        severity="ok",
+        summary="No corrupted content blocks",
+        sparkline_data=sparkline,
+        fix_description="",
+        fix_fn=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 11. Cycle in parent chain
+# ---------------------------------------------------------------------------
+
+
+def _detect_cycles(lines: list[dict]) -> list[list[str]]:
+    """Return list of cycles, each as an ordered list of uuids in the cycle."""
+    parent_map: dict[str, str | None] = {}
+    for obj in lines:
+        uid = obj.get("uuid")
+        if uid:
+            parent_map[uid] = obj.get("parentUuid") or None
+
+    cycles: list[list[str]] = []
+    visited_globally: set[str] = set()
+
+    for start in parent_map:
+        if start in visited_globally:
+            continue
+        path: list[str] = []
+        seen: dict[str, int] = {}
+        cur = start
+        while cur is not None and cur in parent_map:
+            if cur in seen:
+                # Found a cycle
+                cycle = path[seen[cur] :]
+                if tuple(cycle) not in {tuple(c) for c in cycles}:
+                    cycles.append(cycle)
+                visited_globally.update(path)
+                break
+            seen[cur] = len(path)
+            path.append(cur)
+            cur = parent_map.get(cur)
+        visited_globally.update(path)
+
+    return cycles
+
+
+def _fix_cycle_in_parent_chain(lines: list[dict]) -> dict:
+    """Sever cycles by setting the youngest cycle member's parentUuid to the
+    oldest member's original parent (i.e. the node before the cycle entry).
+    """
+    cycles = _detect_cycles(lines)
+    if not cycles:
+        return {"cycles_severed": 0}
+
+    # Build uuid -> obj map for O(1) lookup
+    uuid_map: dict[str, dict] = {}
+    for obj in lines:
+        uid = obj.get("uuid")
+        if uid:
+            uuid_map[uid] = obj
+
+    severed = 0
+    for cycle in cycles:
+        if not cycle:
+            continue
+        # Youngest = last in cycle list (deepest in DFS path from start)
+        youngest = cycle[-1]
+        # Oldest = first in cycle list
+        oldest = cycle[0]
+        # Oldest's original parent is the node before the cycle entry
+        original_parent = uuid_map.get(oldest, {}).get("parentUuid")
+        if oldest == original_parent:
+            # Self-loop — just clear it
+            original_parent = None
+        if youngest in uuid_map:
+            uuid_map[youngest]["parentUuid"] = original_parent
+            severed += 1
+
+    return {"cycles_severed": severed}
+
+
+def diagnose_cycle_in_parent_chain(
+    lines: list[dict], file_path: str
+) -> DiagnosticResult:
+    cycles = _detect_cycles(lines)
+    total = len(lines)
+    sparkline: list[tuple[float, bool]] = []
+
+    # Mark positions that are members of any cycle
+    cycle_members: set[str] = set()
+    for c in cycles:
+        cycle_members.update(c)
+
+    for i, obj in enumerate(lines):
+        pos = i / max(total - 1, 1)
+        sparkline.append((pos, obj.get("uuid", "") in cycle_members))
+
+    if cycles:
+        return DiagnosticResult(
+            name="cycle_in_parent_chain",
+            severity="critical",
+            summary=f"{len(cycles)} cycle(s) detected in parent chain",
+            sparkline_data=sparkline,
+            fix_description="Sever each cycle at youngest member",
+            fix_fn=_fix_cycle_in_parent_chain,
+            detail_lines=[f"Cycle: {' -> '.join(c)}" for c in cycles],
+        )
+    return DiagnosticResult(
+        name="cycle_in_parent_chain",
+        severity="ok",
+        summary="No cycles in parent chain",
+        sparkline_data=sparkline,
+        fix_description="",
+        fix_fn=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 12. Null parentUuid at non-root positions
+# ---------------------------------------------------------------------------
+
+
+def _fix_null_parentUuid_at_non_root(lines: list[dict]) -> dict:
+    """Reparent non-root messages with null parentUuid to nearest preceding message."""
+    reparented = 0
+    for i, obj in enumerate(lines):
+        if i == 0:
+            continue
+        if obj.get("parentUuid") is not None:
+            continue
+        if _is_summary(obj):
+            continue
+        # Walk back to nearest preceding message with a uuid
+        for j in range(i - 1, -1, -1):
+            prev_uuid = lines[j].get("uuid")
+            if prev_uuid:
+                obj["parentUuid"] = prev_uuid
+                reparented += 1
+                break
+    return {"null_parentUuid_reparented": reparented}
+
+
+def diagnose_null_parentUuid_at_non_root(
+    lines: list[dict], file_path: str
+) -> DiagnosticResult:
+    total = len(lines)
+    sparkline: list[tuple[float, bool]] = []
+    bad_count = 0
+    detail: list[str] = []
+
+    for i, obj in enumerate(lines):
+        pos = i / max(total - 1, 1)
+        hit = False
+        if i > 0:
+            parent = obj.get("parentUuid")
+            if parent is None or parent == "":
+                if not _is_summary(obj):
+                    hit = True
+                    bad_count += 1
+                    uid = obj.get("uuid", f"<line {i}>")
+                    detail.append(f"  [{i}] {uid} — parentUuid is null/empty")
+        sparkline.append((pos, hit))
+
+    if bad_count:
+        return DiagnosticResult(
+            name="null_parentUuid_at_non_root",
+            severity="warning",
+            summary=f"{bad_count} non-root message(s) with null/empty parentUuid",
+            sparkline_data=sparkline,
+            fix_description="Reparent to nearest preceding message",
+            fix_fn=_fix_null_parentUuid_at_non_root,
+            detail_lines=detail,
+        )
+    return DiagnosticResult(
+        name="null_parentUuid_at_non_root",
+        severity="ok",
+        summary="No unexpected null parentUuids",
+        sparkline_data=sparkline,
+        fix_description="",
+        fix_fn=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 13. Stale backup files
+# ---------------------------------------------------------------------------
+
+_STALE_BAK_WARN_BYTES = 100 * 1024 * 1024  # 100 MB
+_STALE_BAK_CRIT_BYTES = 500 * 1024 * 1024  # 500 MB
+
+
+def _fix_stale_backups(lines: list[dict], file_path: str = "") -> dict:
+    """Delete *.jsonl.bak and *.bak2 files under the same directory."""
+    p = Path(file_path)
+    directory = p.parent
+    deleted = 0
+    bytes_freed = 0
+    try:
+        for f in directory.iterdir():
+            if f.name.endswith(".jsonl.bak") or f.name.endswith(".bak2"):
+                try:
+                    bytes_freed += f.stat().st_size
+                    f.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return {"stale_backups_deleted": deleted, "bytes_freed": bytes_freed}
+
+
+def diagnose_stale_backups(lines: list[dict], file_path: str) -> DiagnosticResult:
+    p = Path(file_path)
+    directory = p.parent
+    bak_files: list[Path] = []
+    total_bytes = 0
+
+    try:
+        for f in directory.iterdir():
+            if f.name.endswith(".jsonl.bak") or f.name.endswith(".bak2"):
+                bak_files.append(f)
+                try:
+                    total_bytes += f.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+    sparkline: list[tuple[str, int]] = [
+        (f.name, f.stat().st_size if f.exists() else 0) for f in bak_files
+    ]
+
+    if not bak_files:
+        return DiagnosticResult(
+            name="stale_backups",
+            severity="ok",
+            summary="No stale backup files",
+            sparkline_data=sparkline,
+            fix_description="",
+            fix_fn=None,
+        )
+
+    mb = total_bytes / 1024 / 1024
+    if total_bytes >= _STALE_BAK_CRIT_BYTES:
+        severity = "critical"
+    elif total_bytes >= _STALE_BAK_WARN_BYTES:
+        severity = "warning"
+    else:
+        severity = "info"
+
+    return DiagnosticResult(
+        name="stale_backups",
+        severity=severity,
+        summary=f"{len(bak_files)} backup file(s) consuming {mb:.1f} MB",
+        sparkline_data=sparkline,
+        fix_description=f"Delete {len(bak_files)} backup file(s) ({mb:.1f} MB)",
+        fix_fn=lambda lines, fp=file_path: _fix_stale_backups(lines, fp),
+        detail_lines=[f"  {f.name}" for f in sorted(bak_files)],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 14. Oversized session files
+# ---------------------------------------------------------------------------
+
+_OVERSIZED_THRESHOLD = 50 * 1024 * 1024  # 50 MB
+
+
+def diagnose_oversized_sessions(lines: list[dict], file_path: str) -> DiagnosticResult:
+    try:
+        size = Path(file_path).stat().st_size
+    except OSError:
+        size = 0
+
+    mb = size / 1024 / 1024
+    if size > _OVERSIZED_THRESHOLD:
+        return DiagnosticResult(
+            name="oversized_sessions",
+            severity="info",
+            summary=f"Session file is {mb:.1f} MB (>{_OVERSIZED_THRESHOLD // 1024 // 1024} MB threshold)",
+            sparkline_data=[("size_mb", mb)],
+            fix_description="Run reduce-session --apply to compress",
+            fix_fn=None,
+            detail_lines=[
+                f"  {file_path}: {mb:.1f} MB — run: reduce-session --apply {file_path}"
+            ],
+        )
+    return DiagnosticResult(
+        name="oversized_sessions",
+        severity="ok",
+        summary=f"Session file size OK ({mb:.1f} MB)",
+        sparkline_data=[("size_mb", mb)],
+        fix_description="",
+        fix_fn=None,
     )
 
 

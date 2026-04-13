@@ -18,6 +18,7 @@ gentle at start and end (high recall zones), aggressive in the middle.
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -31,6 +32,158 @@ from reduce_session.reduction import (
     CHARS_PER_TOKEN,
     reduce_session,
 )
+
+
+# ---------------------------------------------------------------------------
+# Doctor subcommand
+# ---------------------------------------------------------------------------
+
+# Severity → terminal icon
+_DOCTOR_ICONS = {
+    "ok": "\u2713",  # ✓
+    "warning": "\u26a0",  # ⚠
+    "critical": "\u2717",  # ✗
+    "info": "\u26a0",  # ⚠
+}
+
+# Exit-code contract:
+#   0 = all ok / info only
+#   1 = warnings (no critical)
+#   2 = critical issues present
+#   3 = parse failure
+_EXIT_OK = 0
+_EXIT_WARN = 1
+_EXIT_CRITICAL = 2
+_EXIT_PARSE_FAIL = 3
+
+
+def _load_session_lines(session_path: str) -> list[dict]:
+    """Parse a JSONL session file into a list of dicts."""
+    lines: list[dict] = []
+    with open(session_path, "r", errors="replace") as fh:
+        for raw in fh:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    lines.append(obj)
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return lines
+
+
+def _run_all_checks(lines: list[dict], session_path: str):
+    """Run all diagnostic checks and return results."""
+    from reduce_session.doctor import (
+        diagnose_bloated_tur,
+        diagnose_compaction_summaries,
+        diagnose_corrupted_content_blocks,
+        diagnose_corrupted_tool_use,
+        diagnose_cycle_in_parent_chain,
+        diagnose_null_parentUuid_at_non_root,
+        diagnose_orphaned_tool_results,
+        diagnose_overlapping_files,
+        diagnose_oversized_sessions,
+        diagnose_parent_chain,
+        diagnose_reduce_tags,
+        diagnose_stale_backups,
+        diagnose_stale_tokens,
+        diagnose_unreduced_metadata,
+    )
+
+    checks = [
+        diagnose_compaction_summaries,
+        diagnose_corrupted_tool_use,
+        diagnose_corrupted_content_blocks,
+        diagnose_parent_chain,
+        diagnose_cycle_in_parent_chain,
+        diagnose_null_parentUuid_at_non_root,
+        diagnose_stale_tokens,
+        diagnose_overlapping_files,
+        diagnose_unreduced_metadata,
+        diagnose_reduce_tags,
+        diagnose_bloated_tur,
+        diagnose_orphaned_tool_results,
+        diagnose_stale_backups,
+        diagnose_oversized_sessions,
+    ]
+    return [check(lines, session_path) for check in checks]
+
+
+def _print_doctor_results(results, fixed_names: set[str] | None = None) -> None:
+    """Print one line per check: icon severity name summary [FIXED]."""
+    if fixed_names is None:
+        fixed_names = set()
+    for r in results:
+        icon = _DOCTOR_ICONS.get(r.severity, "?")
+        fixed_marker = "  [FIXED]" if r.name in fixed_names else ""
+        print(f"  {icon} [{r.severity:8s}] {r.name:36s} {r.summary}{fixed_marker}")
+
+
+def _doctor_exit_code(results) -> int:
+    severities = {r.severity for r in results}
+    if "critical" in severities:
+        return _EXIT_CRITICAL
+    if "warning" in severities:
+        return _EXIT_WARN
+    return _EXIT_OK
+
+
+def cmd_doctor(session_path: str, fix: bool) -> int:
+    """Doctor entry point. Returns exit code."""
+    # Parse
+    try:
+        lines = _load_session_lines(session_path)
+    except OSError as e:
+        print(f"Error: cannot read {session_path}: {e}", file=sys.stderr)
+        return _EXIT_PARSE_FAIL
+    except Exception as e:
+        print(f"Error: failed to parse {session_path}: {e}", file=sys.stderr)
+        return _EXIT_PARSE_FAIL
+
+    print(f"Doctor: {session_path}")
+    print()
+
+    results = _run_all_checks(lines, session_path)
+
+    if not fix:
+        _print_doctor_results(results)
+        print()
+        return _doctor_exit_code(results)
+
+    # --fix: run all fixable diagnostics in _FIX_ORDER priority
+    from reduce_session.doctor import _FIX_ORDER, apply_fixes
+
+    fixable = [r for r in results if r.fix_fn is not None]
+    fixable_sorted = sorted(fixable, key=lambda r: _FIX_ORDER.get(r.name, 99))
+
+    if not fixable_sorted:
+        print("No fixable issues found.")
+        _print_doctor_results(results)
+        print()
+        return _doctor_exit_code(results)
+
+    print(f"Applying {len(fixable_sorted)} fix(es)...")
+    apply_fixes(lines, session_path, fixable_sorted)
+
+    # Write fixed lines back to file
+    try:
+        with open(session_path, "w") as fh:
+            for obj in lines:
+                fh.write(json.dumps(obj) + "\n")
+    except OSError as e:
+        print(f"Error: failed to write {session_path}: {e}", file=sys.stderr)
+        return _EXIT_PARSE_FAIL
+
+    fixed_names = {r.name for r in fixable_sorted}
+
+    # Re-run checks on the now-fixed data to show updated state
+    results_after = _run_all_checks(lines, session_path)
+    _print_doctor_results(results_after, fixed_names)
+    print()
+    return _doctor_exit_code(results_after)
 
 
 def parse_args():
@@ -99,6 +252,16 @@ def parse_args():
         "Use 'none' to disable. "
         "Examples: local, ollama:qwen3:4b, anthropic:haiku, openai:gpt-4o-mini, gemini:flash. "
         "Env: REDUCE_SESSION_LLM",
+    )
+    p.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run diagnostic checks on session file",
+    )
+    p.add_argument(
+        "--fix",
+        action="store_true",
+        help="With --doctor: apply all auto-fixable diagnostics in priority order",
     )
     return p.parse_args()
 
@@ -219,6 +382,17 @@ def main():
         except Exception as e:
             print(f"Warning: LLM provider ({llm_spec}) failed: {e}", file=sys.stderr)
             print("Falling back to heuristic-only mode.", file=sys.stderr)
+
+    # Doctor subcommand — dispatch before LLM init (no LLM needed)
+    if args.doctor:
+        if args.input is None:
+            print(
+                "Error: reduce-session --doctor requires a session file path.",
+                file=sys.stderr,
+            )
+            sys.exit(_EXIT_PARSE_FAIL)
+        code = cmd_doctor(args.input, fix=args.fix)
+        sys.exit(code)
 
     # Launch TUI if --browse or no positional arg (and no action flags)
     if args.browse or (

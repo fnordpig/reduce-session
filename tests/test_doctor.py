@@ -698,3 +698,706 @@ class TestOrphanedToolResults:
         assert stats["orphaned_files_deleted"] == 1
         assert not (results_dir / "orphan.txt").exists()
         assert (results_dir / "ref1.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Bug fix regressions
+# ---------------------------------------------------------------------------
+
+
+class TestBugFixes:
+    def test_compaction_summary_at_position_zero_is_natural_root(self, tmp_path):
+        """Bug 1: summary at index 0 must NOT be grafted — it IS the root."""
+        lines = _make_lines(
+            [
+                {
+                    "type": "assistant",
+                    "uuid": "sum-1",
+                    "parentUuid": None,
+                    "message": {
+                        "content": "This conversation is being continued from a previous conversation."
+                    },
+                },
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": "sum-1",
+                    "message": {"content": "Go on"},
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_compaction_summaries(lines, str(path))
+        # Still reported as orphaned (parentUuid=None is what triggers the check)
+        assert result.severity == "critical"
+        stats = result.fix_fn(lines)
+        # Grafted count is 0 — it's a natural root
+        assert stats["summaries_grafted"] == 0
+        assert stats["natural_roots"] == 1
+        # parentUuid must remain None
+        assert lines[0]["parentUuid"] is None
+
+    def test_fix_parent_chain_no_predecessor_preserves_original(self, tmp_path):
+        """Bug 2: broken ref at position 0 should NOT be overwritten with None."""
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": "NONEXISTENT",
+                    "message": {"content": "First"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": "u-1",
+                    "message": {"content": "Reply"},
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_parent_chain(lines, str(path))
+        stats = result.fix_fn(lines)
+        # No valid predecessor for u-1, so it stays as NONEXISTENT (not None)
+        assert lines[0]["parentUuid"] == "NONEXISTENT"
+        # a-1 already points to a valid uuid — nothing changed
+        assert lines[1]["parentUuid"] == "u-1"
+        assert stats["parent_refs_reparented"] == 0
+
+    def test_overlapping_files_has_fix_fn(self, tmp_path):
+        """Bug 3: diagnose_overlapping_files must provide a fix_fn."""
+        from reduce_session.session import CONTINUATION_RE
+
+        session_uuid = "aaaaaaaa-0000-0000-0000-000000000000"
+        primary = tmp_path / f"{session_uuid}.jsonl"
+        primary.write_text(
+            json.dumps({"type": "user", "uuid": "u1", "message": {"content": "hi"}})
+            + "\n" * 100  # larger file
+        )
+        cont = tmp_path / f"{session_uuid}.1.jsonl"
+        cont.write_text(
+            json.dumps({"type": "user", "uuid": "u0", "message": {"content": "old"}})
+        )
+
+        lines = [{"type": "user", "uuid": "u1", "message": {"content": "hi"}}]
+        result = diagnose_overlapping_files(lines, str(primary))
+        assert result.severity == "warning"
+        assert result.fix_fn is not None
+
+        stats = result.fix_fn(lines)
+        assert stats["continuation_files_renamed"] >= 1
+        # .bak2 should exist, original continuation should be gone
+        assert not cont.exists()
+        assert (tmp_path / f"{session_uuid}.1.jsonl.bak2").exists()
+
+
+# ---------------------------------------------------------------------------
+# New checks — A. diagnose_corrupted_tool_use
+# ---------------------------------------------------------------------------
+
+
+class TestCorruptedToolUse:
+    def test_fires_on_long_name(self, tmp_path):
+        from reduce_session.doctor import diagnose_corrupted_tool_use
+
+        long_name = "A" * 201
+        lines = _make_lines(
+            [
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": None,
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tu1",
+                                "name": long_name,
+                                "input": {},
+                            }
+                        ]
+                    },
+                }
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text(json.dumps(lines[0]))
+        result = diagnose_corrupted_tool_use(lines, str(path))
+        assert result.severity == "critical"
+        assert result.fix_fn is not None
+
+    def test_clean_input_is_ok(self, tmp_path):
+        from reduce_session.doctor import diagnose_corrupted_tool_use
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": None,
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tu1",
+                                "name": "Bash",
+                                "input": {},
+                            }
+                        ]
+                    },
+                }
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text(json.dumps(lines[0]))
+        result = diagnose_corrupted_tool_use(lines, str(path))
+        assert result.severity == "ok"
+
+    def test_fix_extracts_name(self, tmp_path):
+        from reduce_session.doctor import diagnose_corrupted_tool_use
+
+        # Name that starts with a valid word before the first quote
+        corrupt_name = 'Bash"some corrupted suffix here' + "X" * 200
+        lines = _make_lines(
+            [
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": None,
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tu1",
+                                "name": corrupt_name,
+                                "input": {},
+                            }
+                        ]
+                    },
+                }
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text(json.dumps(lines[0]))
+        result = diagnose_corrupted_tool_use(lines, str(path))
+        stats = result.fix_fn(lines)
+        assert stats["corrupted_tool_use_fixed"] == 1
+        block = lines[0]["message"]["content"][0]
+        assert block["name"] == "Bash"
+
+    def test_fix_drops_unparseable(self, tmp_path):
+        from reduce_session.doctor import diagnose_corrupted_tool_use
+
+        # Name that can't be parsed: starts with non-word chars
+        corrupt_name = '"garbage' + "X" * 200
+        lines = _make_lines(
+            [
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": None,
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tu1",
+                                "name": corrupt_name,
+                                "input": {},
+                            }
+                        ]
+                    },
+                }
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text(json.dumps(lines[0]))
+        result = diagnose_corrupted_tool_use(lines, str(path))
+        stats = result.fix_fn(lines)
+        assert stats["corrupted_tool_use_dropped"] == 1
+        assert lines[0]["message"]["content"] == []
+
+
+# ---------------------------------------------------------------------------
+# New checks — B. diagnose_corrupted_content_blocks
+# ---------------------------------------------------------------------------
+
+
+class TestCorruptedContentBlocks:
+    def test_fires_on_missing_id(self, tmp_path):
+        from reduce_session.doctor import diagnose_corrupted_content_blocks
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": None,
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "id": "", "name": "Bash", "input": {}}
+                        ]
+                    },
+                }
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text(json.dumps(lines[0]))
+        result = diagnose_corrupted_content_blocks(lines, str(path))
+        assert result.severity == "critical"
+        assert result.fix_fn is not None
+
+    def test_fires_on_missing_tool_use_id(self, tmp_path):
+        from reduce_session.doctor import diagnose_corrupted_content_blocks
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "",
+                                "content": "output",
+                            }
+                        ]
+                    },
+                }
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text(json.dumps(lines[0]))
+        result = diagnose_corrupted_content_blocks(lines, str(path))
+        assert result.severity == "critical"
+
+    def test_clean_input_is_ok(self, tmp_path):
+        from reduce_session.doctor import diagnose_corrupted_content_blocks
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": None,
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "tu1",
+                                "name": "Bash",
+                                "input": {},
+                            }
+                        ]
+                    },
+                }
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text(json.dumps(lines[0]))
+        result = diagnose_corrupted_content_blocks(lines, str(path))
+        assert result.severity == "ok"
+
+    def test_fix_drops_blocks(self, tmp_path):
+        from reduce_session.doctor import diagnose_corrupted_content_blocks
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": None,
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "id": "", "name": "Bash", "input": {}},
+                            {"type": "text", "text": "I did it"},
+                        ]
+                    },
+                }
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text(json.dumps(lines[0]))
+        result = diagnose_corrupted_content_blocks(lines, str(path))
+        stats = result.fix_fn(lines)
+        assert stats["corrupted_blocks_dropped"] == 1
+        # text block remains
+        content = lines[0]["message"]["content"]
+        assert len(content) == 1
+        assert content[0]["type"] == "text"
+
+
+# ---------------------------------------------------------------------------
+# New checks — C. diagnose_cycle_in_parent_chain
+# ---------------------------------------------------------------------------
+
+
+class TestCycleInParentChain:
+    def test_detects_cycle(self, tmp_path):
+        from reduce_session.doctor import diagnose_cycle_in_parent_chain
+
+        # a -> b -> a
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "a",
+                    "parentUuid": "b",
+                    "message": {"content": "x"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "b",
+                    "parentUuid": "a",
+                    "message": {"content": "y"},
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+        result = diagnose_cycle_in_parent_chain(lines, str(path))
+        assert result.severity == "critical"
+        assert result.fix_fn is not None
+
+    def test_clean_input_is_ok(self, tmp_path):
+        from reduce_session.doctor import diagnose_cycle_in_parent_chain
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {"content": "Hello"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": "u-1",
+                    "message": {"content": "Hi"},
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+        result = diagnose_cycle_in_parent_chain(lines, str(path))
+        assert result.severity == "ok"
+
+    def test_fix_severs_cycle(self, tmp_path):
+        from reduce_session.doctor import diagnose_cycle_in_parent_chain
+
+        # a -> b -> a  (simple 2-node cycle)
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "a",
+                    "parentUuid": "b",
+                    "message": {"content": "x"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "b",
+                    "parentUuid": "a",
+                    "message": {"content": "y"},
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+        result = diagnose_cycle_in_parent_chain(lines, str(path))
+        stats = result.fix_fn(lines)
+        assert stats["cycles_severed"] == 1
+        # After fix, neither uuid should point to the other in a cycle
+        uuid_map = {l["uuid"]: l["parentUuid"] for l in lines}
+        a_parent = uuid_map["a"]
+        b_parent = uuid_map["b"]
+        # At least one end of the cycle must have been broken
+        assert not (a_parent == "b" and b_parent == "a")
+
+
+# ---------------------------------------------------------------------------
+# New checks — D. diagnose_null_parentUuid_at_non_root
+# ---------------------------------------------------------------------------
+
+
+class TestNullParentUuidAtNonRoot:
+    def test_fires_on_non_root_null(self, tmp_path):
+        from reduce_session.doctor import diagnose_null_parentUuid_at_non_root
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {"content": "First"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": None,  # bad: non-root with null parent
+                    "message": {"content": "Reply"},
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+        result = diagnose_null_parentUuid_at_non_root(lines, str(path))
+        assert result.severity == "warning"
+        assert result.fix_fn is not None
+
+    def test_excludes_compaction_summaries(self, tmp_path):
+        from reduce_session.doctor import diagnose_null_parentUuid_at_non_root
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {"content": "First"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "sum-1",
+                    "parentUuid": None,
+                    "message": {
+                        "content": "This conversation is being continued from a previous conversation."
+                    },
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+        result = diagnose_null_parentUuid_at_non_root(lines, str(path))
+        # summary at non-root should be excluded from this check
+        assert result.severity == "ok"
+
+    def test_root_null_is_ok(self, tmp_path):
+        from reduce_session.doctor import diagnose_null_parentUuid_at_non_root
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {"content": "First"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": "u-1",
+                    "message": {"content": "Reply"},
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+        result = diagnose_null_parentUuid_at_non_root(lines, str(path))
+        assert result.severity == "ok"
+
+    def test_fix_reparents(self, tmp_path):
+        from reduce_session.doctor import diagnose_null_parentUuid_at_non_root
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {"content": "First"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": None,
+                    "message": {"content": "Reply"},
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+        result = diagnose_null_parentUuid_at_non_root(lines, str(path))
+        stats = result.fix_fn(lines)
+        assert stats["null_parentUuid_reparented"] == 1
+        assert lines[1]["parentUuid"] == "u-1"
+
+
+# ---------------------------------------------------------------------------
+# New checks — E. diagnose_stale_backups
+# ---------------------------------------------------------------------------
+
+
+class TestStaleBackups:
+    def test_no_backups_is_ok(self, tmp_path):
+        from reduce_session.doctor import diagnose_stale_backups
+
+        path = tmp_path / "test.jsonl"
+        path.write_text("{}")
+        result = diagnose_stale_backups([], str(path))
+        assert result.severity == "ok"
+
+    def test_detects_bak_files(self, tmp_path):
+        from reduce_session.doctor import diagnose_stale_backups
+
+        path = tmp_path / "test.jsonl"
+        path.write_text("{}")
+        # Create small backup files
+        (tmp_path / "test.jsonl.bak").write_text("x" * 1000)
+        (tmp_path / "test.jsonl.bak2").write_text("y" * 1000)
+
+        result = diagnose_stale_backups([], str(path))
+        assert result.severity == "info"  # < 100 MB threshold
+        assert result.fix_fn is not None
+        assert "2 backup" in result.summary
+
+    def test_fix_deletes_bak_files(self, tmp_path):
+        from reduce_session.doctor import diagnose_stale_backups
+
+        path = tmp_path / "test.jsonl"
+        path.write_text("{}")
+        bak1 = tmp_path / "test.jsonl.bak"
+        bak2 = tmp_path / "other.jsonl.bak2"
+        bak1.write_text("backup1")
+        bak2.write_text("backup2")
+
+        result = diagnose_stale_backups([], str(path))
+        stats = result.fix_fn([])
+        assert stats["stale_backups_deleted"] == 2
+        assert not bak1.exists()
+        assert not bak2.exists()
+
+    def test_warning_threshold(self, tmp_path):
+        from reduce_session.doctor import diagnose_stale_backups
+
+        path = tmp_path / "test.jsonl"
+        path.write_text("{}")
+        # Create a file that's 150 MB — above warning threshold
+        bak = tmp_path / "big.jsonl.bak"
+        bak.write_bytes(b"x" * (150 * 1024 * 1024))
+
+        result = diagnose_stale_backups([], str(path))
+        assert result.severity == "warning"
+
+
+# ---------------------------------------------------------------------------
+# New checks — F. diagnose_oversized_sessions
+# ---------------------------------------------------------------------------
+
+
+class TestOversizedSessions:
+    def test_small_file_is_ok(self, tmp_path):
+        from reduce_session.doctor import diagnose_oversized_sessions
+
+        path = tmp_path / "test.jsonl"
+        path.write_text("{}")
+        result = diagnose_oversized_sessions([], str(path))
+        assert result.severity == "ok"
+
+    def test_oversized_is_info(self, tmp_path):
+        from reduce_session.doctor import diagnose_oversized_sessions
+
+        path = tmp_path / "test.jsonl"
+        # Write 51 MB
+        path.write_bytes(b"x" * (51 * 1024 * 1024))
+        result = diagnose_oversized_sessions([], str(path))
+        assert result.severity == "info"
+        assert result.fix_fn is None
+
+    def test_no_autofix(self, tmp_path):
+        from reduce_session.doctor import diagnose_oversized_sessions
+
+        path = tmp_path / "test.jsonl"
+        path.write_bytes(b"x" * (51 * 1024 * 1024))
+        result = diagnose_oversized_sessions([], str(path))
+        assert result.fix_fn is None
+
+
+# ---------------------------------------------------------------------------
+# CLI doctor tests
+# ---------------------------------------------------------------------------
+
+
+class TestCliDoctor:
+    def _write_clean_session(self, path):
+        lines = [
+            {
+                "type": "user",
+                "uuid": "u-1",
+                "parentUuid": None,
+                "message": {"content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "a-1",
+                "parentUuid": "u-1",
+                "message": {"content": "Hi"},
+            },
+        ]
+        path.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+
+    def _write_critical_session(self, path):
+        # Has a critical: orphaned compaction summary
+        lines = [
+            {
+                "type": "user",
+                "uuid": "u-1",
+                "parentUuid": None,
+                "message": {"content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "uuid": "sum-1",
+                "parentUuid": None,
+                "message": {
+                    "content": "This conversation is being continued from a previous conversation."
+                },
+            },
+        ]
+        path.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
+
+    def test_exit_code_0_on_clean_session(self, tmp_path):
+        from reduce_session.cli import cmd_doctor
+
+        path = tmp_path / "session.jsonl"
+        self._write_clean_session(path)
+        code = cmd_doctor(str(path), fix=False)
+        assert code == 0
+
+    def test_exit_code_2_on_critical(self, tmp_path):
+        from reduce_session.cli import cmd_doctor
+
+        path = tmp_path / "session.jsonl"
+        self._write_critical_session(path)
+        code = cmd_doctor(str(path), fix=False)
+        assert code == 2
+
+    def test_exit_code_3_on_missing_file(self, tmp_path):
+        from reduce_session.cli import cmd_doctor
+
+        code = cmd_doctor(str(tmp_path / "nonexistent.jsonl"), fix=False)
+        assert code == 3
+
+    def test_fix_rewrites_file(self, tmp_path):
+        from reduce_session.cli import cmd_doctor
+
+        path = tmp_path / "session.jsonl"
+        self._write_critical_session(path)
+
+        code = cmd_doctor(str(path), fix=True)
+        # After fix the critical should be resolved — exit 0
+        assert code == 0
+        # File should have been rewritten with the fix applied
+        content = path.read_text()
+        lines = [json.loads(l) for l in content.strip().splitlines()]
+        # The summary should now have a valid parentUuid or still None (natural root)
+        sum_line = next(l for l in lines if l.get("uuid") == "sum-1")
+        # In this case sum-1 has a predecessor (u-1), so it should be grafted
+        assert sum_line["parentUuid"] == "u-1"
