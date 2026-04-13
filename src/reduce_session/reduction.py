@@ -1688,6 +1688,232 @@ def _replace_dead_persisted_outputs(kept_objs):
     return replaced
 
 
+_PROTECTED_MSG_TYPES = {
+    "content-replacement",
+    "marble-origami-commit",
+    "marble-origami-snapshot",
+    "worktree-state",
+    "task-summary",
+}
+
+_HTTP_TOOL_NAMES = {"WebFetch", "WebSearch", "webfetch", "websearch"}
+
+
+def dedup_document_blocks(kept_objs, min_block_size=1024):
+    """Replace duplicate large content blocks (e.g., re-injected CLAUDE.md) with stubs.
+
+    Scans all content blocks across kept_objs. For each block whose UTF-8 byte
+    length meets min_block_size, hashes the text. Non-first occurrences of a hash
+    are replaced in-place with a stub referencing the first occurrence.
+
+    Protected message types and isCompactSummary/isVisibleInTranscriptOnly messages
+    are skipped entirely. tool_reference blocks are left unchanged.
+
+    Returns stats dict with keys documents_deduped and document_dedup_bytes_saved.
+    """
+    import copy
+
+    # First pass: record the first-seen position for each hash.
+    first_seen = {}  # hash -> position (index into kept_objs)
+    for pos, obj in enumerate(kept_objs):
+        msg_type = obj.get("type", "")
+        if msg_type in _PROTECTED_MSG_TYPES:
+            continue
+        if obj.get("isCompactSummary") or obj.get("isVisibleInTranscriptOnly"):
+            continue
+        for block in get_content_blocks(obj):
+            text = text_of(block)
+            if len(text.encode("utf-8")) < min_block_size:
+                continue
+            h = hashlib.md5(text.encode()).hexdigest()
+            if h not in first_seen:
+                first_seen[h] = pos
+
+    # Second pass: for each block that is a duplicate, mutate it.
+    docs_deduped = 0
+    bytes_saved = 0
+
+    for pos, obj in enumerate(kept_objs):
+        msg_type = obj.get("type", "")
+        if msg_type in _PROTECTED_MSG_TYPES:
+            continue
+        if obj.get("isCompactSummary") or obj.get("isVisibleInTranscriptOnly"):
+            continue
+
+        blocks = get_content_blocks(obj)
+        if not blocks:
+            continue
+
+        # Work on a deep copy of the message so we only commit if we change something.
+        mutated = False
+        new_msg = None
+
+        for i, block in enumerate(blocks):
+            bt = block.get("type", "")
+            if bt == "tool_reference":
+                continue
+
+            text = text_of(block)
+            byte_len = len(text.encode("utf-8"))
+            if byte_len < min_block_size:
+                continue
+
+            h = hashlib.md5(text.encode()).hexdigest()
+            if first_seen.get(h) == pos:
+                # This is the first occurrence — keep as-is.
+                continue
+
+            # Duplicate: replace with stub.
+            if not mutated:
+                # Deep-copy the object now that we know we need to mutate.
+                obj_copy = copy.deepcopy(obj)
+                new_msg = obj_copy.get("message", {})
+                blocks = new_msg.get("content", [])
+                mutated = True
+
+            preview = _strip_non_ascii(text[:80].replace("\n", " "))
+            stub_block = blocks[i]
+            if bt == "text":
+                stub_block["text"] = (
+                    f"[duplicate content removed — first seen earlier: {preview}...]"
+                )
+            elif bt == "tool_result" and isinstance(stub_block.get("content"), str):
+                stub_block["content"] = (
+                    f"[duplicate tool-result removed — first seen earlier: {preview}...]"
+                )
+            else:
+                # Not a type we can stub — leave unchanged.
+                continue
+
+            docs_deduped += 1
+            bytes_saved += byte_len
+
+        if mutated:
+            # Replace the original object in kept_objs with the mutated copy.
+            kept_objs[pos] = obj_copy
+
+    result = {}
+    if docs_deduped:
+        result["documents_deduped"] = docs_deduped
+        result["document_dedup_bytes_saved"] = bytes_saved
+    return result
+
+
+def collapse_http_spam(kept_objs):
+    """Collapse HTTP tool-spam runs by removing progress messages within long runs.
+
+    A run starts at any message containing a tool_use with name in _HTTP_TOOL_NAMES.
+    The run extends forward over:
+      - progress messages (get_msg_type == "progress")
+      - messages containing a tool_result for a tool_use_id seen in the run
+      - more HTTP tool_use messages
+
+    Runs of length > 3 have their progress messages removed. Runs of ≤ 3 are left
+    unchanged. Dropped objects are tracked so callers can reparent children.
+
+    Returns (new_kept, dropped_uuids, stats).
+    dropped_uuids maps {uuid: parentUuid} for all removed objects.
+    """
+    total = len(kept_objs)
+    if total == 0:
+        return kept_objs, {}, {}
+
+    # Pre-compute: for each position, the set of tool_use_ids it introduces (HTTP tools)
+    # and the set of tool_use_ids it closes (tool_result).
+    http_use_ids_at = []  # list of sets
+    result_ids_at = []  # list of sets
+    for obj in kept_objs:
+        http_ids = set()
+        res_ids = set()
+        for block in get_content_blocks(obj):
+            bt = block.get("type", "")
+            if bt == "tool_use" and block.get("name", "") in _HTTP_TOOL_NAMES:
+                uid = block.get("id", "")
+                if uid:
+                    http_ids.add(uid)
+            elif bt == "tool_result":
+                uid = block.get("tool_use_id", "")
+                if uid:
+                    res_ids.add(uid)
+        http_use_ids_at.append(http_ids)
+        result_ids_at.append(res_ids)
+
+    # Find all HTTP-spam runs.
+    # A run_start must be a position with at least one HTTP tool_use.
+    # We scan forward collecting positions into the run.
+    drop_positions = set()  # positions of progress messages inside long runs
+    i = 0
+    while i < total:
+        if not http_use_ids_at[i]:
+            i += 1
+            continue
+
+        # Start of a potential run.
+        run_start = i
+        run_http_ids = set(http_use_ids_at[i])
+        run_positions = [i]
+
+        j = i + 1
+        while j < total:
+            obj_j = kept_objs[j]
+            is_progress = get_msg_type(obj_j) == "progress"
+            has_http = bool(http_use_ids_at[j])
+            is_result_for_run = bool(result_ids_at[j] & run_http_ids)
+
+            if is_progress or has_http or is_result_for_run:
+                run_positions.append(j)
+                run_http_ids |= http_use_ids_at[j]
+                j += 1
+            else:
+                break
+
+        # Only act on runs longer than 3.
+        if len(run_positions) > 3:
+            for rp in run_positions:
+                if get_msg_type(kept_objs[rp]) == "progress":
+                    drop_positions.add(rp)
+
+        i = j if j > i + 1 else i + 1
+
+    if not drop_positions:
+        return kept_objs, {}, {}
+
+    # Build dropped_uuids map and new_kept list.
+    dropped_uuids = {}
+    for pos in drop_positions:
+        obj = kept_objs[pos]
+        uuid = obj.get("uuid")
+        if uuid:
+            dropped_uuids[uuid] = obj.get("parentUuid")
+
+    new_kept = []
+    for pos, obj in enumerate(kept_objs):
+        if pos in drop_positions:
+            continue
+        # Reparent if this object's parent was dropped.
+        parent = obj.get("parentUuid")
+        if parent and parent in dropped_uuids:
+            visited = set()
+            while parent in dropped_uuids and parent not in visited:
+                visited.add(parent)
+                parent = dropped_uuids[parent]
+            obj = dict(obj)
+            obj["parentUuid"] = parent
+        # Also handle logicalParentUuid.
+        lp = obj.get("logicalParentUuid")
+        if lp and lp in dropped_uuids:
+            visited = set()
+            while lp in dropped_uuids and lp not in visited:
+                visited.add(lp)
+                lp = dropped_uuids[lp]
+            obj = dict(obj) if obj is kept_objs[pos] else obj
+            obj["logicalParentUuid"] = lp
+        new_kept.append(obj)
+
+    stats = {"http_spam_progress_dropped": len(drop_positions)}
+    return new_kept, dropped_uuids, stats
+
+
 def nuclear_tool_replace(kept_objs, aggr_fn, tool_id_map):
     """At aggr > 0.8, replace ALL tool content with one-line summaries."""
     total = len(kept_objs)
@@ -2682,6 +2908,12 @@ def reduce_session(
         relink_parent_chains(new_kept, retry_dropped)
         kept_objs = new_kept
 
+    # -- Pass 2.5: HTTP tool-spam run collapse --
+    kept_objs, http_dropped_uuids, http_spam_stats = collapse_http_spam(kept_objs)
+    if http_dropped_uuids:
+        dropped_uuids.update(http_dropped_uuids)
+    stats.update(http_spam_stats)
+
     # -- Read result deduplication --
     read_dedup_stats = dedup_read_results(kept_objs)
     stats.update(read_dedup_stats)
@@ -2772,6 +3004,10 @@ def reduce_session(
     # -- Pass 3.57: Strip old images --
     img_stats = strip_old_images(kept_objs)
     stats.update(img_stats)
+
+    # -- Pass 3.58: Block-level document dedup (re-injected CLAUDE.md etc.) --
+    doc_dedup_stats = dedup_document_blocks(kept_objs)
+    stats.update(doc_dedup_stats)
 
     # -- Pass 3.6: Nuclear tool content replacement (deep middle zone) --
     nuclear_stats = nuclear_tool_replace(kept_objs, aggr_fn, tool_id_map)
