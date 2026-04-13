@@ -183,6 +183,15 @@ PROFILES = {
 
 ENVELOPE_FIELDS = {"cwd", "version", "gitBranch", "slug", "userType"}
 
+# Message types that carry canonical state and must never be mutated by reduction passes.
+PROTECTED_MSG_TYPES = {
+    "content-replacement",
+    "marble-origami-commit",
+    "marble-origami-snapshot",
+    "worktree-state",
+    "task-summary",
+}
+
 # --- Gradient functions ---
 
 

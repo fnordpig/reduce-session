@@ -142,12 +142,22 @@ def detect_error_retries(kept_objs):
 
 
 def detect_constant_envelope_fields(kept_objs):
+    """Detect envelope fields that have a single constant value across the whole session.
+
+    A field is only considered constant if ALL messages that have it carry the same value.
+    Fields present in fewer than 2 messages are excluded (not worth stripping, not truly
+    "constant across the session").
+    """
     field_values = {f: set() for f in ENVELOPE_FIELDS}
+    field_counts = {f: 0 for f in ENVELOPE_FIELDS}
     for obj in kept_objs:
         for f in ENVELOPE_FIELDS:
             if f in obj:
                 field_values[f].add(str(obj[f]))
-    return {f for f, vals in field_values.items() if len(vals) == 1}
+                field_counts[f] += 1
+    return {
+        f for f, vals in field_values.items() if len(vals) == 1 and field_counts[f] >= 2
+    }
 
 
 def dedup_read_results(kept_objs):
