@@ -892,7 +892,7 @@ def is_droppable_line(obj):
     if is_protected(obj):
         return None
     t = obj.get("type", "")
-    if t in ("progress", "file-history-snapshot", "queue-operation", "last-prompt"):
+    if t in ("progress", "queue-operation", "last-prompt"):
         return t
     if t == "user":
         content = obj.get("message", {}).get("content", "")
@@ -917,6 +917,209 @@ def is_droppable_line(obj):
                     if f">{cmd}<" in content:
                         return "local_cmd_noise"
     return None
+
+
+# --- Small-win reduction strategies ---
+
+# Message types that must not have their content touched
+_PROTECTED_MSG_TYPES = frozenset(
+    {
+        "content-replacement",
+        "marble-origami-commit",
+        "marble-origami-snapshot",
+        "worktree-state",
+        "task-summary",
+    }
+)
+
+
+def _is_protected(obj):
+    """Return True if obj should not have content stripped or trimmed."""
+    t = obj.get("type", "")
+    if t in _PROTECTED_MSG_TYPES:
+        return True
+    if obj.get("isCompactSummary"):
+        return True
+    if obj.get("isVisibleInTranscriptOnly"):
+        return True
+    return False
+
+
+def strip_attribution_snapshots(parsed_objs):
+    """Drop all objects with type == "attribution-snapshot".
+
+    Returns (kept, dropped_uuids, stats).
+    dropped_uuids maps uuid -> parentUuid for reparenting.
+    """
+    kept = []
+    dropped_uuids = {}
+    count = 0
+    for obj in parsed_objs:
+        if obj.get("type") == "attribution-snapshot":
+            uuid = obj.get("uuid")
+            if uuid:
+                dropped_uuids[uuid] = obj.get("parentUuid")
+            count += 1
+        else:
+            kept.append(obj)
+    stats = {"attribution_snapshots_stripped": count} if count else {}
+    return kept, dropped_uuids, stats
+
+
+def strip_old_images(kept_objs):
+    """Strip old image content blocks, keeping newest max(1, round(total * 0.20)).
+
+    Mutates kept_objs in-place (rebuilds content lists without old images).
+    Returns stats dict.
+    """
+    import copy
+
+    # Collect all image blocks in order: (obj_index, block_index)
+    image_positions = []
+    for oi, obj in enumerate(kept_objs):
+        if _is_protected(obj):
+            continue
+        for bi, block in enumerate(get_content_blocks(obj)):
+            if isinstance(block, dict) and block.get("type") == "image":
+                image_positions.append((oi, bi))
+
+    total = len(image_positions)
+    if total == 0:
+        return {}
+
+    keep_count = max(1, round(total * 0.20))
+    to_drop = set(image_positions[: total - keep_count])
+
+    if not to_drop:
+        return {}
+
+    # Rebuild content lists, skipping dropped image blocks
+    # Group drops by obj_index
+    drop_by_obj = {}
+    for oi, bi in to_drop:
+        drop_by_obj.setdefault(oi, set()).add(bi)
+
+    for oi, bis in drop_by_obj.items():
+        obj = kept_objs[oi]
+        new_obj = copy.deepcopy(obj)
+        msg = new_obj.get("message", {})
+        content = msg.get("content")
+        if isinstance(content, list):
+            msg["content"] = [b for i, b in enumerate(content) if i not in bis]
+        kept_objs[oi] = new_obj
+
+    stripped = len(to_drop)
+    return {"images_stripped": stripped}
+
+
+def trim_mega_blocks(kept_objs, max_bytes=32768):
+    """Truncate any content block whose UTF-8 byte length exceeds max_bytes.
+
+    Uses head+tail truncation via truncate(). Skips protected messages.
+    Returns stats dict.
+    """
+    trimmed = 0
+    for obj in kept_objs:
+        if _is_protected(obj):
+            continue
+        for block in get_content_blocks(obj):
+            if not isinstance(block, dict):
+                continue
+            bt = block.get("type", "")
+            if bt in ("text", "thinking"):
+                key = "text" if bt == "text" else "thinking"
+                val = block.get(key, "")
+                if isinstance(val, str) and len(val.encode("utf-8")) > max_bytes:
+                    block[key] = truncate(val, max_bytes, f"mega_{bt}")
+                    trimmed += 1
+            elif bt == "tool_result":
+                content = block.get("content")
+                if (
+                    isinstance(content, str)
+                    and len(content.encode("utf-8")) > max_bytes
+                ):
+                    block["content"] = truncate(content, max_bytes, "mega_tool_result")
+                    trimmed += 1
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            text = item.get("text", "")
+                            if (
+                                isinstance(text, str)
+                                and len(text.encode("utf-8")) > max_bytes
+                            ):
+                                item["text"] = truncate(
+                                    text, max_bytes, "mega_tool_result_item"
+                                )
+                                trimmed += 1
+    return {"mega_blocks_trimmed": trimmed} if trimmed else {}
+
+
+def dedup_file_history_snapshots(objs):
+    """Keep only the latest file-history-snapshot per messageId.
+
+    Within each messageId group, also collapse consecutive isSnapshotUpdate=True
+    runs to the last in the run.
+
+    Returns (kept, dropped_uuids, stats).
+    """
+    # Separate snapshots from non-snapshots, preserving order
+    non_snapshots = []
+    snapshots = []  # (index_in_original, obj)
+    for i, obj in enumerate(objs):
+        if obj.get("type") == "file-history-snapshot":
+            snapshots.append((i, obj))
+        else:
+            non_snapshots.append((i, obj))
+
+    if not snapshots:
+        return objs, {}, {}
+
+    # Group by messageId
+    by_message_id = {}
+    for i, obj in snapshots:
+        mid = obj.get("messageId", "")
+        by_message_id.setdefault(mid, []).append((i, obj))
+
+    # For each messageId group: keep only the latest snapshot,
+    # but first collapse consecutive isSnapshotUpdate=True runs to the last in each run.
+    keep_indices = set()
+    for mid, group in by_message_id.items():
+        # group is ordered by original index (preserved from linear scan)
+        # Step 1: collapse consecutive isSnapshotUpdate=True runs
+        collapsed = []
+        run = []
+        for idx, obj in group:
+            if obj.get("isSnapshotUpdate"):
+                run.append((idx, obj))
+            else:
+                if run:
+                    collapsed.append(run[-1])  # keep last of run
+                    run = []
+                collapsed.append((idx, obj))
+        if run:
+            collapsed.append(run[-1])
+        # Step 2: keep only the last entry in this messageId group
+        if collapsed:
+            keep_indices.add(collapsed[-1][0])
+
+    dropped_uuids = {}
+    dropped = 0
+    for i, obj in snapshots:
+        if i not in keep_indices:
+            uuid = obj.get("uuid")
+            if uuid:
+                dropped_uuids[uuid] = obj.get("parentUuid")
+            dropped += 1
+
+    # Rebuild full list in original order
+    keep_set = set(keep_indices)
+    # All non-snapshot positions are always kept
+    non_snap_set = {i for i, _ in non_snapshots}
+    kept = [obj for i, obj in enumerate(objs) if i in non_snap_set or i in keep_set]
+
+    stats = {"file_history_deduped": dropped} if dropped else {}
+    return kept, dropped_uuids, stats
 
 
 # --- Cross-message intelligence ---
@@ -2423,6 +2626,36 @@ def reduce_session(
     if reparented:
         stats["reparented"] = reparented
 
+    # -- Pass 2a: Strip attribution-snapshot objects --
+    kept_objs, attr_dropped_uuids, attr_stats = strip_attribution_snapshots(kept_objs)
+    dropped_uuids.update(attr_dropped_uuids)
+    stats.update(attr_stats)
+    # Reparent children of dropped attribution-snapshot objects
+    if attr_dropped_uuids:
+        for obj in kept_objs:
+            parent = obj.get("parentUuid")
+            if parent and parent in attr_dropped_uuids:
+                visited = set()
+                while parent in dropped_uuids and parent not in visited:
+                    visited.add(parent)
+                    parent = dropped_uuids[parent]
+                obj["parentUuid"] = parent
+
+    # -- Pass 2b: Dedup file-history-snapshot objects --
+    kept_objs, fhs_dropped_uuids, fhs_stats = dedup_file_history_snapshots(kept_objs)
+    dropped_uuids.update(fhs_dropped_uuids)
+    stats.update(fhs_stats)
+    # Reparent children of dropped file-history-snapshot objects
+    if fhs_dropped_uuids:
+        for obj in kept_objs:
+            parent = obj.get("parentUuid")
+            if parent and parent in fhs_dropped_uuids:
+                visited = set()
+                while parent in dropped_uuids and parent not in visited:
+                    visited.add(parent)
+                    parent = dropped_uuids[parent]
+                obj["parentUuid"] = parent
+
     # -- Pass 3: Cross-message intelligence --
     stale_read_ids = detect_stale_reads(kept_objs)
     if stale_read_ids:
@@ -2535,6 +2768,10 @@ def reduce_session(
     dead_output_count = _replace_dead_persisted_outputs(kept_objs)
     if dead_output_count:
         stats["dead_output_refs_replaced"] = dead_output_count
+
+    # -- Pass 3.57: Strip old images --
+    img_stats = strip_old_images(kept_objs)
+    stats.update(img_stats)
 
     # -- Pass 3.6: Nuclear tool content replacement (deep middle zone) --
     nuclear_stats = nuclear_tool_replace(kept_objs, aggr_fn, tool_id_map)
@@ -2836,6 +3073,10 @@ def reduce_session(
     kept_objs, orphan_count = fix_orphaned_tool_results(kept_objs)
     if orphan_count:
         stats["orphaned_tool_results_fixed"] = orphan_count
+
+    # -- Pass 6: Mega-block safety net (last line of defense) --
+    mega_stats = trim_mega_blocks(kept_objs)
+    stats.update(mega_stats)
 
     # -- Token budget (reduced) --
     reduced_budget = None
