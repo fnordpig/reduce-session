@@ -91,6 +91,14 @@ for obj in kept:
 
 This is the difference between "session loads correctly" and "session shows only the last message."
 
+### Problem 6: Compact boundary exploitation
+
+When a session contains a `compact_boundary` system message, everything before that boundary is already summarized — the pre-boundary history is redundant. The `compact-summary-collapse` strategy drops all messages before the boundary and keeps only the summary and everything after it. On sessions that have been compacted once or more, this alone can save 85-95% of the file.
+
+### Problem 7: Block-level content duplication
+
+`CLAUDE.md` and system reminders are re-injected into every API call. This means the same 2-10 KB document block appears in every user message across the session. The `document-dedup` strategy fingerprints content blocks and replaces all but the first occurrence with a short placeholder. Unlike message-level dedup (which drops entire messages), block-level dedup targets repeated blocks within otherwise unique messages.
+
 ### Problem 5: Multiple overlapping files
 
 Claude Code creates continuation files during compaction: `session_id.TIMESTAMP.jsonl`. These can overlap with the main file. Check:
@@ -113,6 +121,10 @@ These are hard-won from breaking Claude Code's parser and session loading:
 6. **Preserve `tool_reference` blocks** — `tool_result.content` lists can contain both `text` and `tool_reference` items. Only modify `text` items.
 6. **Deep-copy before mutating** — `json.loads(json.dumps(obj))` or equivalent.
 7. **Back up before replacing** — always `cp file.jsonl file.jsonl.bak` first.
+8. **Never modify `is_protected()` messages** — compact summaries, boundaries, marble-origami state, task-summary, worktree-state, and `isVisibleInTranscriptOnly` entries must survive every reduction pass unchanged.
+9. **Always relink both `parentUuid` and `logicalParentUuid` when dropping messages** — both chains are followed during tree reconstruction; relinking only one silently breaks the other.
+10. **Use `fsync` before `os.replace`** — atomic rename without fsync can lose data on crash. See `invariants.atomic_write_bytes`.
+11. **Hold a prune lock when writing** — concurrent TUI/CLI/MCP access can race on the same file. Use `invariants.prune_lock` around any write that replaces the session file.
 
 ## Running the Reduction
 
@@ -165,3 +177,15 @@ From our reference session (ripvec, 4-day Rust development):
 | Tool result content | 2,196KB | 1,645KB | 75% |
 
 The 75% tool result retention is from head+tail truncation of long outputs. The model can re-read files from disk if it needs the middle.
+
+> **Note — compacted sessions**: when the session contains a `compact_boundary` marker (Claude Code ran auto-compaction at least once), the `aggressive` profile's `compact-summary-collapse` strategy can achieve **85-95% size reduction** by dropping the entire pre-boundary history. The reference numbers above are for an uncompacted session; compacted sessions compress much further.
+
+## Prescriptions
+
+Each reduction profile is a named tier that activates a different set of strategies. Choose based on how aggressively you want to trade detail for space.
+
+**gentle** — Safe for resuming active sessions. Drops metadata-only lines (`progress`, `file-history-snapshot`, `queue-operation`, `last-prompt`), deduplicates system messages, and recalibrates the stale token counter. No content is truncated; no user or assistant messages are altered. Suitable when you want to fix the `/context` display without touching any conversation content.
+
+**standard** — Adds position-aware trimming of tool-result content (head+tail), stale-read elision, passing-build collapse, and block-level document dedup. Long bash outputs and file-read results are truncated to ~3 KB. Conversation meaning is preserved; bulk of the savings comes from repeated large outputs.
+
+**aggressive** — Activates all strategies including compact-summary-collapse (drops pre-boundary history entirely), superseded-edit summarization, age-based tool-result compaction, and nuclear tool-content replacement in the deep middle zone. Use when context pressure is severe or when the session has been auto-compacted by Claude Code. Protected messages (`isCompactSummary`, boundaries, marble-origami state) are never touched regardless of profile.
