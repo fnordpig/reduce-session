@@ -153,6 +153,15 @@ PROFILES = {
 ENVELOPE_FIELDS = {"cwd", "version", "gitBranch", "slug", "userType"}
 CHARS_PER_TOKEN = 3.7
 
+# Message types that carry canonical state and must never be mutated by reduction passes.
+PROTECTED_MSG_TYPES = {
+    "content-replacement",
+    "marble-origami-commit",
+    "marble-origami-snapshot",
+    "worktree-state",
+    "task-summary",
+}
+
 # Reduction metadata tag — persisted in JSONL objects to track what
 # processing has been applied. Subsequent passes skip already-processed content.
 _REDUCE_TAG_VERSION = 1
@@ -1242,13 +1251,273 @@ def dedup_system_reminders(text):
     return re.sub(r"\n{3,}", "\n\n", result).strip() if seen else text
 
 
+def _is_protected_obj(obj):
+    """Return True for objects that must never be mutated by reduction passes."""
+    t = obj.get("type", "")
+    if t in PROTECTED_MSG_TYPES:
+        return True
+    if obj.get("isCompactSummary"):
+        return True
+    if obj.get("isVisibleInTranscriptOnly"):
+        return True
+    return False
+
+
+def _is_real_user_turn(obj):
+    """True if this is a real user turn, not a tool-result wrapper."""
+    if obj.get("type") != "user":
+        return False
+    content = obj.get("message", {}).get("content", [])
+    if not isinstance(content, list):
+        return True
+    return not any(
+        isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+    )
+
+
 def detect_constant_envelope_fields(kept_objs):
+    """Detect envelope fields that have a single constant value across the whole session.
+
+    A field is only considered constant if ALL messages that have it carry the same value.
+    Fields present in fewer than 2 messages are excluded (not worth stripping, not truly
+    "constant across the session").
+    """
     field_values = {f: set() for f in ENVELOPE_FIELDS}
+    field_counts = {f: 0 for f in ENVELOPE_FIELDS}
     for obj in kept_objs:
         for f in ENVELOPE_FIELDS:
             if f in obj:
                 field_values[f].add(str(obj[f]))
-    return {f for f, vals in field_values.items() if len(vals) == 1}
+                field_counts[f] += 1
+    return {
+        f for f, vals in field_values.items() if len(vals) == 1 and field_counts[f] >= 2
+    }
+
+
+def strip_envelope_fields(kept_objs, constant_fields):
+    """Strip constant envelope fields from all non-first, non-protected messages.
+
+    Never mutates position 0 (canonical source) or protected messages.
+    Returns stats dict.
+    """
+    if not constant_fields:
+        return {}
+
+    fields_stripped = 0
+    bytes_saved = 0
+    for pos, obj in enumerate(kept_objs):
+        if pos == 0:
+            continue
+        if _is_protected_obj(obj):
+            continue
+        for f in constant_fields:
+            if f in obj:
+                bytes_saved += len(f) + len(str(obj[f])) + 4  # ~key+value+json overhead
+                del obj[f]
+                fields_stripped += 1
+
+    stats = {}
+    if fields_stripped:
+        stats["envelope_fields_stripped"] = fields_stripped
+        stats["envelope_bytes_saved"] = bytes_saved
+    return stats
+
+
+def _try_json_minify(text):
+    """If text is valid JSON, return minified version. None if not JSON or savings < 15%."""
+    try:
+        parsed = json.loads(text)
+        minified = json.dumps(parsed, separators=(",", ":"))
+        if len(minified) < len(text) * 0.85:
+            return minified
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
+def _collapse_diff_context(text, max_context=3):
+    """Collapse unified diff context to max_context lines around each hunk."""
+    lines = text.split("\n")
+    out = []
+    # indices of hunk headers
+    hunk_indices = [i for i, ln in enumerate(lines) if ln.startswith("@@")]
+
+    if not hunk_indices:
+        return text
+
+    # Always keep everything before the first hunk header (file headers)
+    if hunk_indices[0] > 0:
+        out.extend(lines[: hunk_indices[0]])
+
+    for hi, hunk_start in enumerate(hunk_indices):
+        hunk_end = hunk_indices[hi + 1] if hi + 1 < len(hunk_indices) else len(lines)
+        # hunk header line
+        out.append(lines[hunk_start])
+        # lines in this hunk
+        hunk_lines = lines[hunk_start + 1 : hunk_end]
+        # Identify changed line indices within hunk_lines
+        changed = [
+            i
+            for i, ln in enumerate(hunk_lines)
+            if ln.startswith("+") or ln.startswith("-")
+        ]
+        if not changed:
+            # no changed lines — keep all context
+            out.extend(hunk_lines)
+            continue
+        # Build set of indices to keep (changed ± max_context)
+        keep = set()
+        for ci in changed:
+            for delta in range(-max_context, max_context + 1):
+                idx = ci + delta
+                if 0 <= idx < len(hunk_lines):
+                    keep.add(idx)
+        # Emit in order, inserting ellipsis for gaps
+        prev_kept = None
+        for i, ln in enumerate(hunk_lines):
+            if i in keep:
+                if prev_kept is not None and i > prev_kept + 1:
+                    out.append("...")
+                out.append(ln)
+                prev_kept = i
+    return "\n".join(out)
+
+
+def age_tool_results(kept_objs, aggr, mid_age=15, old_age=40):
+    """Compact tool_result blocks based on how many real user turns ago they appeared.
+
+    Uses a turn discriminator so tool-result wrapper messages (user messages that
+    contain only tool_result blocks) do NOT count as turns.
+
+    Args:
+        kept_objs: list of parsed JSONL objects (mutated in place via deep copy per msg)
+        aggr: aggressiveness in [0, 1]
+        mid_age: turns threshold for mid-age compaction (modulated by aggr)
+        old_age: turns threshold for old compaction (modulated by aggr)
+
+    Returns:
+        stats dict
+    """
+    import copy
+
+    # Modulate thresholds by aggressiveness
+    effective_mid = int(mid_age - (mid_age - 8) * aggr)
+    effective_old = int(old_age - (old_age - 20) * aggr)
+
+    # Compute turns_ago for each position by counting real user turns from the end
+    total = len(kept_objs)
+    # Build list of positions that are real user turns (in order)
+    real_turn_positions = [
+        i for i, obj in enumerate(kept_objs) if _is_real_user_turn(obj)
+    ]
+
+    # For each position, turns_ago = number of real user turns that come AFTER it
+    # (i.e., how many real turns have elapsed since this message)
+    def _turns_ago(pos):
+        # Count real_turn_positions that are strictly after pos
+        count = 0
+        for rp in real_turn_positions:
+            if rp > pos:
+                count += 1
+        return count
+
+    # Build a reverse lookup: for tool_use_id -> (tool_name, file_path) from preceding messages
+    def _find_tool_use_info(kept_objs, result_pos, tool_use_id, window=10):
+        start = max(0, result_pos - window)
+        for obj in kept_objs[start:result_pos]:
+            for block in get_content_blocks(obj):
+                if block.get("type") == "tool_use" and block.get("id") == tool_use_id:
+                    name = block.get("name", "unknown")
+                    inp = block.get("input", {})
+                    path = inp.get("file_path", "") if isinstance(inp, dict) else ""
+                    return name, path
+        return None, None
+
+    stats_minified = 0
+    stats_diff_collapsed = 0
+    stats_stubbed = 0
+    stats_bytes_saved = 0
+
+    for pos, obj in enumerate(kept_objs):
+        if _is_protected_obj(obj):
+            continue
+        if get_msg_type(obj) != "user":
+            continue
+        content = obj.get("message", {}).get("content")
+        if not isinstance(content, list):
+            continue
+
+        turns = _turns_ago(pos)
+        if turns < effective_mid:
+            continue  # recent — untouched
+
+        mutated = False
+        new_content = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                new_content.append(block)
+                continue
+
+            inner = block.get("content", "")
+            if not isinstance(inner, str) or len(inner) < 100:
+                new_content.append(block)
+                continue
+
+            block = copy.deepcopy(block)
+
+            if turns >= effective_old:
+                # Old: replace with stub
+                tool_use_id = block.get("tool_use_id", "")
+                tool_name, file_path = _find_tool_use_info(kept_objs, pos, tool_use_id)
+                n_lines = inner.count("\n") + 1
+                kb = len(inner) / 1024.0
+                if tool_name and file_path:
+                    stub = f"[{tool_name} {file_path} — {n_lines} lines, {kb:.1f}KB]"
+                elif tool_name:
+                    stub = f"[{tool_name} — {n_lines} lines, {kb:.1f}KB]"
+                else:
+                    stub = f"[tool result — {n_lines} lines, {kb:.1f}KB]"
+                stats_bytes_saved += len(inner) - len(stub)
+                block["content"] = stub
+                stats_stubbed += 1
+                mutated = True
+            else:
+                # Mid-age: try JSON minification first
+                minified = _try_json_minify(inner)
+                if minified is not None:
+                    stats_bytes_saved += len(inner) - len(minified)
+                    block["content"] = minified
+                    stats_minified += 1
+                    mutated = True
+                else:
+                    # Try diff collapse
+                    is_diff = inner.startswith("diff ") or "\n@@" in inner[:500]
+                    if is_diff:
+                        collapsed = _collapse_diff_context(inner)
+                        if len(collapsed) < len(inner):
+                            stats_bytes_saved += len(inner) - len(collapsed)
+                            block["content"] = collapsed
+                            stats_diff_collapsed += 1
+                            mutated = True
+
+            new_content.append(block)
+
+        if mutated:
+            # Deep-copy the message wrapper and replace content
+            new_obj = copy.deepcopy(obj)
+            new_obj["message"]["content"] = new_content
+            kept_objs[pos] = new_obj
+
+    result = {}
+    if stats_minified:
+        result["age_tool_results_minified"] = stats_minified
+    if stats_diff_collapsed:
+        result["age_tool_results_diff_collapsed"] = stats_diff_collapsed
+    if stats_stubbed:
+        result["age_tool_results_stubbed"] = stats_stubbed
+    if stats_bytes_saved:
+        result["age_tool_results_bytes_saved"] = stats_bytes_saved
+    return result
 
 
 def dedup_read_results(kept_objs):
@@ -3001,6 +3270,11 @@ def reduce_session(
     if dead_output_count:
         stats["dead_output_refs_replaced"] = dead_output_count
 
+    # -- Pass 3.56: Age-based tool-result compaction --
+    mid_aggr = aggr_fn(0.5)
+    age_stats = age_tool_results(kept_objs, mid_aggr)
+    stats.update(age_stats)
+
     # -- Pass 3.57: Strip old images --
     img_stats = strip_old_images(kept_objs)
     stats.update(img_stats)
@@ -3026,6 +3300,11 @@ def reduce_session(
 
     total = len(kept_objs)
 
+    # -- Pass 3.9: Envelope field stripping --
+    # Strip constant envelope fields from all non-first, non-protected messages.
+    env_stats = strip_envelope_fields(kept_objs, constant_fields)
+    stats.update(env_stats)
+
     # -- Pass 4: Position-aware trimming --
     bl = lambda key, aggr: blended_limit(key, aggr, agg_lim, gen_lim)
 
@@ -3033,12 +3312,6 @@ def reduce_session(
         position = pos / max(total - 1, 1)
         aggr = aggr_fn(position)
         t = get_msg_type(obj)
-
-        # Envelope stripping (old zone only)
-        if pos > 0 and aggr > 0.3:
-            for f in constant_fields:
-                if f in obj:
-                    del obj[f]
 
         # -- User messages --
         if t == "user":
