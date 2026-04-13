@@ -2196,6 +2196,145 @@ async def _llm_compression_pass(
     return stats
 
 
+# --- Compact summary collapse ---
+
+_PROTECTED_TYPES = frozenset(
+    {
+        "content-replacement",
+        "marble-origami-commit",
+        "marble-origami-snapshot",
+        "worktree-state",
+        "task-summary",
+    }
+)
+
+_METADATA_SINGLETON_TYPES = frozenset(
+    {
+        "last-prompt",
+        "pr-link",
+        "custom-title",
+        "ai-title",
+        "attribution-snapshot",
+    }
+)
+
+
+def _is_compact_protected(obj):
+    """Return True if obj must never be dropped by the compact collapse pass."""
+    t = obj.get("type", "")
+    if t in _PROTECTED_TYPES:
+        return True
+    if t == "user" and obj.get("isCompactSummary"):
+        return True
+    if t == "system":
+        sub = obj.get("subtype") or obj.get("message", {}).get("subtype", "")
+        if sub in ("compact_boundary", "microcompact_boundary"):
+            return True
+    if obj.get("isVisibleInTranscriptOnly"):
+        return True
+    return False
+
+
+def collapse_compact_summary(parsed_objs: list[dict]) -> tuple[list[dict], dict]:
+    """Drop pre-boundary messages already represented in the compact summary.
+
+    Scans for the last system message with subtype compact_boundary or
+    microcompact_boundary. Everything before that boundary is redundant —
+    the summary represents it — so we drop it (with exceptions for protected
+    messages and metadata singletons not present post-boundary).
+
+    Returns (kept_objs, stats) where stats includes:
+    - compact_boundary_found: bool
+    - compact_collapse_drops: int
+    - compact_collapse_bytes: int
+    """
+    stats: dict = {"compact_boundary_found": False}
+
+    # Find the last compact boundary index
+    last_boundary_idx = None
+    for i, obj in enumerate(parsed_objs):
+        if obj.get("type") == "system":
+            sub = obj.get("subtype") or obj.get("message", {}).get("subtype", "")
+            if sub in ("compact_boundary", "microcompact_boundary"):
+                last_boundary_idx = i
+
+    if last_boundary_idx is None:
+        stats["compact_collapse_drops"] = 0
+        stats["compact_collapse_bytes"] = 0
+        return parsed_objs, stats
+
+    # Bail if user explicitly asked to retain this segment
+    boundary_obj = parsed_objs[last_boundary_idx]
+    if boundary_obj.get("hasPreservedSegment"):
+        stats["compact_collapse_drops"] = 0
+        stats["compact_collapse_bytes"] = 0
+        return parsed_objs, stats
+
+    stats["compact_boundary_found"] = True
+
+    # Collect type set at or after the boundary (for singleton check)
+    post_boundary_types: set[str] = set()
+    for obj in parsed_objs[last_boundary_idx:]:
+        t = obj.get("type", "")
+        if t:
+            post_boundary_types.add(t)
+
+    # Classify pre-boundary objects
+    pre_objs = parsed_objs[:last_boundary_idx]
+    post_objs = parsed_objs[last_boundary_idx:]
+
+    dropped_objs = []
+    extra_kept = []  # protected objects from the pre-boundary segment
+
+    for obj in pre_objs:
+        if _is_compact_protected(obj):
+            extra_kept.append(obj)
+            continue
+        t = obj.get("type", "")
+        if t in _METADATA_SINGLETON_TYPES and t not in post_boundary_types:
+            extra_kept.append(obj)
+            continue
+        dropped_objs.append(obj)
+
+    if not dropped_objs:
+        stats["compact_collapse_drops"] = 0
+        stats["compact_collapse_bytes"] = 0
+        return parsed_objs, stats
+
+    # Build UUID chain for reparenting
+    dropped_uuids: dict[str, str | None] = {}
+    for obj in dropped_objs:
+        uuid = obj.get("uuid")
+        if uuid:
+            dropped_uuids[uuid] = obj.get("parentUuid")
+
+    drop_bytes = sum(len(json.dumps(obj)) for obj in dropped_objs)
+
+    kept_objs = extra_kept + post_objs
+
+    # Reparent children whose parent was dropped
+    for obj in kept_objs:
+        parent = obj.get("parentUuid")
+        if parent and parent in dropped_uuids:
+            visited: set[str] = set()
+            while parent in dropped_uuids and parent not in visited:
+                visited.add(parent)
+                parent = dropped_uuids[parent]
+            obj["parentUuid"] = parent
+
+        lparent = obj.get("logicalParentUuid")
+        if lparent and lparent in dropped_uuids:
+            visited = set()
+            while lparent in dropped_uuids and lparent not in visited:
+                visited.add(lparent)
+                lparent = dropped_uuids[lparent]
+            obj["logicalParentUuid"] = lparent
+
+    stats["compact_collapse_drops"] = len(dropped_objs)
+    stats["compact_collapse_bytes"] = drop_bytes
+    return kept_objs, stats
+
+
 def reduce_session(
     path: str,
     profile: str = "standard",
@@ -2249,6 +2388,10 @@ def reduce_session(
     seen_system = set()
 
     parsed = [json.loads(line) for line in lines]
+
+    # -- Compact summary collapse (EARLY: shrinks dataset before noise loop) --
+    parsed, compact_stats = collapse_compact_summary(parsed)
+    stats.update(compact_stats)
 
     # Populate budget from original objects (before any trimming)
     if budget:
