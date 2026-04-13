@@ -13,6 +13,8 @@ import re
 import zlib
 from dataclasses import dataclass, field
 
+from .invariants import is_protected, relink_parent_chains
+
 # --- Limit profiles ---
 
 PROFILES = {
@@ -887,6 +889,8 @@ def strip_constant_metadata(objs, aggressive=False):
 
 
 def is_droppable_line(obj):
+    if is_protected(obj):
+        return None
     t = obj.get("type", "")
     if t in ("progress", "file-history-snapshot", "queue-operation", "last-prompt"):
         return t
@@ -1375,6 +1379,8 @@ def collapse_edit_sequences(kept_objs, aggr_fn):
     file_edits = {}  # file_path -> [(pos, block_index)]
 
     for pos, obj in enumerate(kept_objs):
+        if is_protected(obj):
+            continue
         position = pos / max(total - 1, 1)
         aggr = aggr_fn(position)
         if aggr <= 0.3:
@@ -1434,6 +1440,8 @@ def _replace_dead_persisted_outputs(kept_objs):
     replaced = 0
 
     for obj in kept_objs:
+        if is_protected(obj):
+            continue
         msg = obj.get("message", {})
         if not isinstance(msg, dict):
             continue
@@ -1486,6 +1494,8 @@ def nuclear_tool_replace(kept_objs, aggr_fn, tool_id_map):
     agents = 0
 
     for pos, obj in enumerate(kept_objs):
+        if is_protected(obj):
+            continue
         position = pos / max(total - 1, 1)
         aggr = aggr_fn(position)
         if aggr <= 0.8:
@@ -1562,17 +1572,20 @@ def fix_orphaned_tool_results(kept_objs):
         for block in get_content_blocks(obj):
             if block.get("type") == "tool_use":
                 uid = block.get("id", "")
-                if uid:
+                if uid:  # empty id intentionally excluded — vacuous-key match
                     use_ids.add(uid)
     orphans = 0
     dropped_uuids = {}  # uuid -> parentUuid for reparenting
     result = []
     for obj in kept_objs:
         blocks = get_content_blocks(obj)
+        # A tool_result with an empty tool_use_id is an orphan (vacuous-key
+        # match would otherwise let it slip through the pairing guard).
         has_orphan = any(
             b.get("type") == "tool_result"
-            and b.get("tool_use_id", "") not in use_ids
-            and b.get("tool_use_id", "")
+            and (
+                not b.get("tool_use_id", "") or b.get("tool_use_id", "") not in use_ids
+            )
             for b in blocks
         )
         if not has_orphan:
@@ -1583,8 +1596,10 @@ def fix_orphaned_tool_results(kept_objs):
             for b in blocks
             if not (
                 b.get("type") == "tool_result"
-                and b.get("tool_use_id", "")
-                and b.get("tool_use_id", "") not in use_ids
+                and (
+                    not b.get("tool_use_id", "")
+                    or b.get("tool_use_id", "") not in use_ids
+                )
             )
         ]
         orphans += len(blocks) - len(new_blocks)
@@ -1600,19 +1615,9 @@ def fix_orphaned_tool_results(kept_objs):
                 dropped_uuids[uuid] = obj.get("parentUuid")
             orphans += 1
 
-    # Reparent children of dropped messages
-    if dropped_uuids:
-        reparented = 0
-        for obj in result:
-            parent = obj.get("parentUuid")
-            if parent in dropped_uuids:
-                # Walk the chain to find a non-dropped ancestor
-                visited = set()
-                while parent in dropped_uuids and parent not in visited:
-                    visited.add(parent)
-                    parent = dropped_uuids[parent]
-                obj["parentUuid"] = parent
-                reparented += 1
+    # Reparent children of dropped messages (handles both parentUuid and
+    # logicalParentUuid; preserves original value on chain exhaustion)
+    relink_parent_chains(result, dropped_uuids)
 
     return result, orphans
 
@@ -2271,16 +2276,7 @@ def reduce_session(
         else:
             kept_objs.append(json.loads(json.dumps(obj)))
 
-    reparented = 0
-    for obj in kept_objs:
-        parent = obj.get("parentUuid")
-        if parent and parent in dropped_uuids:
-            visited = set()
-            while parent in dropped_uuids and parent not in visited:
-                visited.add(parent)
-                parent = dropped_uuids[parent]
-            obj["parentUuid"] = parent
-            reparented += 1
+    reparented = relink_parent_chains(kept_objs, dropped_uuids)
     if reparented:
         stats["reparented"] = reparented
 
@@ -2297,23 +2293,17 @@ def reduce_session(
     constant_fields = detect_constant_envelope_fields(kept_objs)
 
     if error_retry_drops:
+        retry_dropped: dict[str, str | None] = {}
         for i in sorted(error_retry_drops):
             obj = kept_objs[i]
             uuid = obj.get("uuid")
             if uuid:
+                retry_dropped[uuid] = obj.get("parentUuid")
                 dropped_uuids[uuid] = obj.get("parentUuid")
-        new_kept = []
-        for i, obj in enumerate(kept_objs):
-            if i in error_retry_drops:
-                continue
-            parent = obj.get("parentUuid")
-            if parent and parent in dropped_uuids:
-                visited = set()
-                while parent in dropped_uuids and parent not in visited:
-                    visited.add(parent)
-                    parent = dropped_uuids[parent]
-                obj["parentUuid"] = parent
-            new_kept.append(obj)
+        new_kept = [
+            obj for i, obj in enumerate(kept_objs) if i not in error_retry_drops
+        ]
+        relink_parent_chains(new_kept, retry_dropped)
         kept_objs = new_kept
 
     # -- Read result deduplication --

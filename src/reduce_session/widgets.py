@@ -8,8 +8,10 @@ Used by the main TUI.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from rich.style import Style
 from rich.text import Text
@@ -27,6 +29,7 @@ from .git_ops import (
     HistoryResult,
     ReductionEntry,
 )
+from .invariants import atomic_write_jsonl, atomic_write_text
 from .reduction import ReductionResult, reduce_session
 from .session import Exchange, SessionInfo
 
@@ -61,6 +64,54 @@ def token_color(tokens: int) -> str:
     if tokens < 800_000:
         return "#ff8c00"
     return "#ff4444"
+
+
+# Age color stops: (seconds_old, (r, g, b))
+# Ramps from bright green (fresh) through amber to dark brown (very old).
+# Luminance drops along the gradient so the ramp itself is the fadeout.
+_AGE_COLOR_STOPS: tuple[tuple[float, tuple[int, int, int]], ...] = (
+    (0, (0, 212, 170)),  # fresh: bright green
+    (3600, (90, 200, 130)),  # 1h: green
+    (86400, (180, 200, 80)),  # 1d: yellow-green
+    (7 * 86400, (170, 130, 60)),  # 1w: amber
+    (30 * 86400, (110, 70, 35)),  # 1mo: brown
+    (90 * 86400, (60, 40, 25)),  # 3mo+: dark brown
+)
+
+
+def age_color(timestamp: datetime | None) -> str:
+    """Return a hex color from green (fresh) to brown (old).
+
+    Interpolates log-linearly between stops so that the perceptually
+    rapid early changes (minutes → hours) read as smoothly as the slower
+    late changes (weeks → months).
+    """
+    if timestamp is None:
+        return "#555555"
+    now = datetime.now(timezone.utc)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    seconds = max(0.0, (now - timestamp).total_seconds())
+
+    last_seconds, last_rgb = _AGE_COLOR_STOPS[-1]
+    if seconds >= last_seconds:
+        r, g, b = last_rgb
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    for (s0, c0), (s1, c1) in zip(_AGE_COLOR_STOPS, _AGE_COLOR_STOPS[1:]):
+        if s0 <= seconds < s1:
+            # Log-interpolate within the segment. log1p handles s0 == 0.
+            t = (math.log1p(seconds) - math.log1p(s0)) / (
+                math.log1p(s1) - math.log1p(s0)
+            )
+            t = max(0.0, min(1.0, t))
+            r = int(round(c0[0] + (c1[0] - c0[0]) * t))
+            g = int(round(c0[1] + (c1[1] - c0[1]) * t))
+            b = int(round(c0[2] + (c1[2] - c0[2]) * t))
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+    r, g, b = _AGE_COLOR_STOPS[0][1]
+    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 def _format_tokens(tokens: int) -> str:
@@ -1754,7 +1805,6 @@ class DoctorModal(ModalScreen[bool]):
     def _do_apply(self) -> None:
         import json
         import os
-        import tempfile
         from pathlib import Path
 
         from reduce_session.doctor import apply_fixes
@@ -1789,18 +1839,8 @@ class DoctorModal(ModalScreen[bool]):
         ]
         stats = apply_fixes(lines, self.session_path, selected_diags)
 
-        # Atomic write — temp file then rename
-        tmp_fd, tmp_path = tempfile.mkstemp(
-            dir=os.path.dirname(self.session_path), suffix=".tmp"
-        )
-        try:
-            with os.fdopen(tmp_fd, "w") as f:
-                for obj in lines:
-                    f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            os.replace(tmp_path, self.session_path)
-        except Exception:
-            os.unlink(tmp_path)
-            raise
+        # Atomic write (fsync before replace)
+        atomic_write_jsonl(Path(self.session_path), lines, create_backup=False)
 
         # Post-fix snapshot
         fix_names = [
@@ -2483,7 +2523,6 @@ class ConversationBrowserModal(ModalScreen[None]):
         self.run_worker(self._do_delete, thread=True)
 
     def _do_delete(self) -> None:
-        import tempfile
         from pathlib import Path
         from reduce_session.git_ops import ensure_git_repo, git_snapshot
 
@@ -2524,14 +2563,8 @@ class ConversationBrowserModal(ModalScreen[None]):
                     except json.JSONDecodeError:
                         continue
 
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), suffix=".tmp")
-        try:
-            with os.fdopen(tmp_fd, "w") as f:
-                f.writelines(lines)
-            os.replace(tmp_path, self.session_path)
-        except Exception:
-            os.unlink(tmp_path)
-            raise
+        # Atomic write (fsync before replace)
+        atomic_write_text(p, "".join(lines))
 
         # Git snapshot after delete
         try:
@@ -2561,7 +2594,6 @@ class ConversationBrowserModal(ModalScreen[None]):
 
     def _do_classify(self) -> None:
         import asyncio
-        import tempfile
         from pathlib import Path
         from reduce_session.reduction import (
             structural_compress,
@@ -2665,14 +2697,8 @@ class ConversationBrowserModal(ModalScreen[None]):
         raw_lines[idx] = json.dumps(obj, ensure_ascii=False) + "\n"
 
         p = Path(self.session_path)
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), suffix=".tmp")
-        try:
-            with os.fdopen(tmp_fd, "w") as f:
-                f.writelines(raw_lines)
-            os.replace(tmp_path, self.session_path)
-        except Exception:
-            os.unlink(tmp_path)
-            raise
+        # Atomic write (fsync before replace)
+        atomic_write_text(p, "".join(raw_lines))
 
         try:
             ensure_git_repo(str(p.parent))
