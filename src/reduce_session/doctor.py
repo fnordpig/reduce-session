@@ -1303,6 +1303,235 @@ def diagnose_oversized_sessions(lines: list[dict], file_path: str) -> Diagnostic
 
 
 # ---------------------------------------------------------------------------
+# 15. Protected-type-survival check
+# ---------------------------------------------------------------------------
+
+
+def _is_protected_obj(obj: dict) -> bool:
+    """Return True when *obj* is a protected message type.
+
+    Mirrors the logic in invariants.is_protected() without importing it here
+    to avoid a circular dependency risk (doctor is imported by many callers).
+    """
+    if obj.get("isVisibleInTranscriptOnly"):
+        return True
+
+    t = obj.get("type")
+
+    _PROT = frozenset(
+        {
+            "content-replacement",
+            "marble-origami-commit",
+            "marble-origami-snapshot",
+            "worktree-state",
+            "task-summary",
+        }
+    )
+    if t in _PROT:
+        return True
+
+    if t == "user" and obj.get("isCompactSummary"):
+        return True
+
+    if t == "system":
+        subtype = obj.get("subtype") or obj.get("message", {}).get("subtype")
+        if subtype in ("compact_boundary", "microcompact_boundary"):
+            return True
+
+    return False
+
+
+def _load_backup(file_path: str) -> list[dict] | None:
+    """Load a .bak file for *file_path*, returning parsed lines or None."""
+    import json
+
+    bak = Path(file_path).with_suffix(".jsonl.bak")
+    # Also accept timestamped bak names: <stem>.jsonl.<ts>.bak
+    if not bak.exists():
+        parent = Path(file_path).parent
+        stem = Path(file_path).name  # e.g. session.jsonl
+        candidates = sorted(
+            (f for f in parent.glob(f"{stem}.*.bak")),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+        if candidates:
+            bak = candidates[0]
+        else:
+            return None
+
+    try:
+        with open(bak, errors="replace") as fh:
+            objs = []
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    objs.append(json.loads(raw))
+                except (ValueError, KeyError):
+                    pass
+        return objs
+    except OSError:
+        return None
+
+
+def _session_was_reduced(lines: list[dict]) -> bool:
+    """Return True if any line carries a _reduce tag (session has been reduced)."""
+    return any("_reduce" in obj for obj in lines)
+
+
+def _fix_protected_type_survival(lines: list[dict], file_path: str = "") -> dict:
+    """Restore missing protected messages from the backup.
+
+    Inserts each missing protected message at its original position determined
+    by UUID lookup in the current file.  After restoration, relinks parent
+    chains to repair any breaks introduced by the re-insertions.
+    """
+    from reduce_session.invariants import relink_parent_chains
+
+    bak_lines = _load_backup(file_path)
+    if not bak_lines:
+        return {"protected_restored": 0, "no_backup": True}
+
+    current_uuids: set[str] = {obj.get("uuid") for obj in lines if obj.get("uuid")}
+    bak_index: dict[str, int] = {
+        obj.get("uuid"): i for i, obj in enumerate(bak_lines) if obj.get("uuid")
+    }
+
+    # Identify missing protected messages
+    missing: list[dict] = [
+        obj
+        for obj in bak_lines
+        if _is_protected_obj(obj)
+        and obj.get("uuid")
+        and obj.get("uuid") not in current_uuids
+    ]
+
+    if not missing:
+        return {"protected_restored": 0}
+
+    # Build uuid → position map for current lines
+    uuid_pos: dict[str, int] = {
+        obj.get("uuid"): i for i, obj in enumerate(lines) if obj.get("uuid")
+    }
+
+    import copy
+
+    restored = 0
+    for obj in missing:
+        uid = obj["uuid"]
+        bak_pos = bak_index[uid]
+
+        # Find the best insertion point: look for the nearest preceding UUID in
+        # the backup that still exists in the current file.
+        insert_after = -1
+        for j in range(bak_pos - 1, -1, -1):
+            prev_uid = bak_lines[j].get("uuid")
+            if prev_uid and prev_uid in uuid_pos:
+                insert_after = uuid_pos[prev_uid]
+                break
+
+        insert_at = insert_after + 1
+        lines.insert(insert_at, copy.deepcopy(obj))
+        restored += 1
+
+        # Update uuid_pos for subsequent insertions
+        uuid_pos = {
+            obj.get("uuid"): i for i, obj in enumerate(lines) if obj.get("uuid")
+        }
+
+    # Relink parent chains after all insertions
+    dropped_uuids: dict[str, str | None] = {}  # nothing was dropped; just repair
+    relink_parent_chains(lines, dropped_uuids)
+
+    return {"protected_restored": restored}
+
+
+def diagnose_protected_type_survival(
+    lines: list[dict], file_path: str
+) -> DiagnosticResult:
+    """Check whether protected messages survived reduction.
+
+    Only meaningful when the session has been reduced (has _reduce tags) AND
+    a backup file exists for comparison.  Without a backup we cannot tell what
+    was originally present, so we report 'ok'.
+    """
+    name = "protected_type_survival"
+
+    if not _session_was_reduced(lines):
+        return DiagnosticResult(
+            name=name,
+            severity="ok",
+            summary="Session has not been reduced — no check needed",
+            sparkline_data=[],
+            fix_description="",
+            fix_fn=None,
+        )
+
+    bak_lines = _load_backup(file_path)
+    if bak_lines is None:
+        return DiagnosticResult(
+            name=name,
+            severity="ok",
+            summary="No backup available — cannot compare protected messages",
+            sparkline_data=[],
+            fix_description="",
+            fix_fn=None,
+        )
+
+    current_uuids: set[str] = {obj.get("uuid") for obj in lines if obj.get("uuid")}
+
+    missing: list[dict] = [
+        obj
+        for obj in bak_lines
+        if _is_protected_obj(obj)
+        and obj.get("uuid")
+        and obj.get("uuid") not in current_uuids
+    ]
+
+    bak_protected = [
+        obj for obj in bak_lines if _is_protected_obj(obj) and obj.get("uuid")
+    ]
+    total_protected = len(bak_protected)
+    lost = len(missing)
+
+    sparkline: list[tuple[str, int]] = [
+        ("backup_protected", total_protected),
+        ("missing", lost),
+        ("present", total_protected - lost),
+    ]
+
+    detail: list[str] = []
+    for obj in missing:
+        uid = obj.get("uuid", "<no-uuid>")
+        t = obj.get("type", "?")
+        subtype = obj.get("subtype") or obj.get("message", {}).get("subtype") or ""
+        label = f"{t}/{subtype}" if subtype else t
+        detail.append(f"  missing: {label} uuid={uid}")
+
+    if missing:
+        return DiagnosticResult(
+            name=name,
+            severity="critical",
+            summary=f"{lost} protected message(s) lost during reduction",
+            sparkline_data=sparkline,
+            fix_description=f"Restore {lost} protected message(s) from backup",
+            fix_fn=lambda ln, fp=file_path: _fix_protected_type_survival(ln, fp),
+            detail_lines=detail,
+        )
+
+    return DiagnosticResult(
+        name=name,
+        severity="ok",
+        summary=f"All {total_protected} protected message(s) survived reduction",
+        sparkline_data=sparkline,
+        fix_description="",
+        fix_fn=None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
@@ -1318,6 +1547,9 @@ _FIX_ORDER = {
     "bloated_tur": 2,
     "orphaned_tool_results": 3,
     "parent_chain": 4,  # after metadata removal
+    "cycle_in_parent_chain": 4,
+    "null_parentUuid_at_non_root": 4,
+    "protected_type_survival": 4,  # restore protected messages, then repair chain
     "reduce_tags": 5,
     "overlapping_files": 6,
     "stale_tokens": 9,  # always last — depends on final content size

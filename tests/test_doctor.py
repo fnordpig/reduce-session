@@ -1401,3 +1401,155 @@ class TestCliDoctor:
         sum_line = next(l for l in lines if l.get("uuid") == "sum-1")
         # In this case sum-1 has a predecessor (u-1), so it should be grafted
         assert sum_line["parentUuid"] == "u-1"
+
+
+# ---------------------------------------------------------------------------
+# Feature 8 — diagnose_protected_type_survival
+# ---------------------------------------------------------------------------
+
+
+class TestProtectedTypeSurvival:
+    """Tests for the protected-type-survival doctor check."""
+
+    def _make_session(self, tmp_path, lines, bak_lines=None, reduced=True):
+        """Write a session file and optional backup, return (path, parsed_lines)."""
+        path = tmp_path / "session.jsonl"
+        # Deep-copy so mutations in tests don't bleed
+        import copy
+
+        objs = [copy.deepcopy(l) for l in lines]
+        if reduced:
+            # Stamp a _reduce tag on at least one line so the check fires
+            if objs:
+                objs[0]["_reduce"] = "metadata"
+        path.write_text("\n".join(json.dumps(o) for o in objs) + "\n")
+        if bak_lines is not None:
+            bak_path = path.with_suffix(".jsonl.bak")
+            bak_path.write_text("\n".join(json.dumps(b) for b in bak_lines) + "\n")
+        return path, objs
+
+    def test_all_protected_present_is_ok(self, tmp_path):
+        """Reduced session with backup — all protected messages still present."""
+        from reduce_session.doctor import diagnose_protected_type_survival
+
+        compact_summary = {
+            "type": "user",
+            "uuid": "cs-1",
+            "parentUuid": None,
+            "isCompactSummary": True,
+            "message": {"content": "Summary of past work."},
+        }
+        boundary = {
+            "type": "system",
+            "uuid": "cb-1",
+            "parentUuid": "cs-1",
+            "subtype": "compact_boundary",
+            "message": {"content": "boundary"},
+        }
+        regular = {
+            "type": "user",
+            "uuid": "u-1",
+            "parentUuid": "cb-1",
+            "message": {"content": "Hello"},
+        }
+
+        bak_lines = [compact_summary, boundary, regular]
+        # current = same messages (all survived)
+        path, objs = self._make_session(tmp_path, bak_lines, bak_lines=bak_lines)
+
+        result = diagnose_protected_type_survival(objs, str(path))
+        assert result.severity == "ok"
+        assert result.fix_fn is None
+
+    def test_missing_compact_summary_is_critical(self, tmp_path):
+        """Reduced session with backup — compact summary was dropped → critical."""
+        from reduce_session.doctor import diagnose_protected_type_survival
+
+        compact_summary = {
+            "type": "user",
+            "uuid": "cs-1",
+            "parentUuid": None,
+            "isCompactSummary": True,
+            "message": {"content": "Summary of past work."},
+        }
+        regular = {
+            "type": "user",
+            "uuid": "u-1",
+            "parentUuid": "cs-1",
+            "message": {"content": "Hello"},
+        }
+
+        bak_lines = [compact_summary, regular]
+        # current = only the regular message (compact summary was lost)
+        path, objs = self._make_session(tmp_path, [regular], bak_lines=bak_lines)
+
+        result = diagnose_protected_type_survival(objs, str(path))
+        assert result.severity == "critical"
+        assert result.fix_fn is not None
+        assert "1 protected" in result.summary
+
+    def test_fix_restores_missing_compact_summary(self, tmp_path):
+        """Fix should restore the missing compact summary into the session."""
+        from reduce_session.doctor import diagnose_protected_type_survival
+
+        compact_summary = {
+            "type": "user",
+            "uuid": "cs-1",
+            "parentUuid": None,
+            "isCompactSummary": True,
+            "message": {"content": "Summary of past work."},
+        }
+        regular = {
+            "type": "user",
+            "uuid": "u-1",
+            "parentUuid": "cs-1",
+            "message": {"content": "Hello"},
+        }
+
+        bak_lines = [compact_summary, regular]
+        path, objs = self._make_session(tmp_path, [regular], bak_lines=bak_lines)
+
+        result = diagnose_protected_type_survival(objs, str(path))
+        assert result.fix_fn is not None
+
+        stats = result.fix_fn(objs)
+        assert stats["protected_restored"] == 1
+
+        # The compact summary must now be present in objs
+        uuids = [o.get("uuid") for o in objs]
+        assert "cs-1" in uuids
+
+    def test_no_backup_is_ok(self, tmp_path):
+        """No backup file → cannot compare, return ok."""
+        from reduce_session.doctor import diagnose_protected_type_survival
+
+        regular = {
+            "type": "user",
+            "uuid": "u-1",
+            "parentUuid": None,
+            "message": {"content": "Hello"},
+        }
+        # reduced=True but no bak_lines → no backup file written
+        path, objs = self._make_session(tmp_path, [regular], bak_lines=None)
+
+        result = diagnose_protected_type_survival(objs, str(path))
+        assert result.severity == "ok"
+        assert result.fix_fn is None
+
+    def test_unreduced_session_skipped(self, tmp_path):
+        """Session without _reduce tags is not checked (hasn't been reduced)."""
+        from reduce_session.doctor import diagnose_protected_type_survival
+
+        regular = {
+            "type": "user",
+            "uuid": "u-1",
+            "parentUuid": None,
+            "message": {"content": "Hello"},
+        }
+        # reduced=False → no _reduce tag
+        path, objs = self._make_session(
+            tmp_path, [regular], bak_lines=[regular], reduced=False
+        )
+
+        result = diagnose_protected_type_survival(objs, str(path))
+        assert result.severity == "ok"
