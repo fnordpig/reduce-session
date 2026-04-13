@@ -12,6 +12,9 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
+
+from .invariants import PruneLockError, atomic_write_bytes, prune_lock
 
 
 GITIGNORE_CONTENT = """\
@@ -347,30 +350,36 @@ def do_apply(input_path, reduced_path, profile_name="standard", cut=50, fade=75)
     basename = os.path.basename(input_path)
     short = session_short_id(input_path)
 
-    # Git: snapshot pre-reduction state
-    newly_init = ensure_git_repo(project_dir)
+    with prune_lock(Path(input_path)):
+        # Git: snapshot pre-reduction state
+        newly_init = ensure_git_repo(project_dir)
 
-    pre_tag, ts = make_tag(input_path, "pre")
-    post_tag = f"reduce/{short}/{ts}/post"
+        pre_tag, ts = make_tag(input_path, "pre")
+        post_tag = f"reduce/{short}/{ts}/post"
 
-    git_snapshot(project_dir, basename, pre_tag, f"pre-reduction {short}")
+        git_snapshot(project_dir, basename, pre_tag, f"pre-reduction {short}")
 
-    # .bak safety net (always, even with git)
-    bak_path = f"{input_path}.{ts}.bak"
-    shutil.copy2(input_path, bak_path)
+        # .bak safety net (always, even with git)
+        bak_path = f"{input_path}.{ts}.bak"
+        shutil.copy2(input_path, bak_path)
 
-    # Apply reduction
-    orig_size = os.path.getsize(input_path)
-    shutil.move(reduced_path, input_path)
-    new_size = os.path.getsize(input_path)
+        # Apply reduction — read reduced content, then atomic write with fsync
+        orig_size = os.path.getsize(input_path)
+        reduced_data = Path(reduced_path).read_bytes()
+        atomic_write_bytes(Path(input_path), reduced_data)
+        try:
+            os.unlink(reduced_path)
+        except OSError:
+            pass
+        new_size = os.path.getsize(input_path)
 
-    # Git: snapshot post-reduction state
-    git_snapshot(
-        project_dir,
-        basename,
-        post_tag,
-        f"reduce {short}: {profile_name} cut={cut} fade={fade}",
-    )
+        # Git: snapshot post-reduction state
+        git_snapshot(
+            project_dir,
+            basename,
+            post_tag,
+            f"reduce {short}: {profile_name} cut={cut} fade={fade}",
+        )
 
     return ApplyResult(
         input_path=input_path,

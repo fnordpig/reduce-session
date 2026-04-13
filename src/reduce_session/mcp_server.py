@@ -11,6 +11,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from .invariants import atomic_write_jsonl, atomic_write_text
+
 from fastmcp import FastMCP
 
 from .session import (
@@ -360,16 +362,8 @@ def doctor_fix(session_path: str, diagnostic_names: list[str]) -> str:
 
     stats = apply_fixes(lines, session_path, selected)
 
-    # Atomic write
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=project_dir, suffix=".tmp")
-    try:
-        with os.fdopen(tmp_fd, "w") as f:
-            for obj in lines:
-                f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        os.replace(tmp_path, session_path)
-    except Exception:
-        os.unlink(tmp_path)
-        raise
+    # Atomic write (fsync before replace)
+    atomic_write_jsonl(Path(session_path), lines, create_backup=False)
 
     # Post-fix snapshot
     try:
@@ -500,15 +494,8 @@ def delete_exchange(session_path: str, index: int) -> str:
             except json.JSONDecodeError:
                 continue
 
-    # Atomic write
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=project_dir, suffix=".tmp")
-    try:
-        with os.fdopen(tmp_fd, "w") as f:
-            f.writelines(lines)
-        os.replace(tmp_path, session_path)
-    except Exception:
-        os.unlink(tmp_path)
-        raise
+    # Atomic write (fsync before replace)
+    atomic_write_text(Path(session_path), "".join(lines))
 
     # Post-delete snapshot
     try:
@@ -589,16 +576,9 @@ def classify_exchange(
 
     raw_lines[index] = json.dumps(obj, ensure_ascii=False) + "\n"
 
-    # Atomic write
+    # Atomic write (fsync before replace)
     p = Path(session_path)
-    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(p.parent), suffix=".tmp")
-    try:
-        with os.fdopen(tmp_fd, "w") as f:
-            f.writelines(raw_lines)
-        os.replace(tmp_path, session_path)
-    except Exception:
-        os.unlink(tmp_path)
-        raise
+    atomic_write_text(p, "".join(raw_lines))
 
     try:
         ensure_git_repo(str(p.parent))
