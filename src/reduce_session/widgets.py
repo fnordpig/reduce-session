@@ -1558,11 +1558,28 @@ class HistoryModal(ModalScreen[bool]):
 
 
 class DoctorModal(ModalScreen[bool]):
-    """Doctor modal -- diagnoses and fixes session health issues."""
+    """Doctor modal -- diagnoses and fixes session health issues.
+
+    Keybindings:
+      j / down  — move cursor to next fixable diagnostic
+      k / up    — move cursor to previous fixable diagnostic
+      space     — toggle selected fix at cursor
+      a         — toggle all fixable diagnostics
+      enter / A — apply selected fixes and re-run
+      escape / q — close
+    """
 
     BINDINGS = [
         ("escape", "cancel", "Close"),
+        ("q", "cancel", "Close"),
+        ("j", "cursor_down", "Down"),
+        ("down", "cursor_down", "Down"),
+        ("k", "cursor_up", "Up"),
+        ("up", "cursor_up", "Up"),
         ("space", "toggle_fix", "Toggle fix"),
+        ("a", "toggle_all", "Toggle all"),
+        ("enter", "apply_fixes", "Apply"),
+        ("A", "apply_fixes", "Apply"),
     ]
 
     _SEVERITY_COLORS = {
@@ -1584,6 +1601,33 @@ class DoctorModal(ModalScreen[bool]):
         self.session_path = session_path
         self._diagnostics: list = []  # list[DiagnosticResult]
         self._selected: set[int] = set()  # indices of checked fixes
+        self._cursor: int = -1  # index into _diagnostics of cursor position (-1 = none)
+
+    # ------------------------------------------------------------------
+    # Helpers for cursor movement (cursor only stops on fixable items)
+    # ------------------------------------------------------------------
+
+    def _fixable_indices(self) -> list[int]:
+        """Return sorted list of diagnostic indices that have a fix_fn."""
+        return [i for i, d in enumerate(self._diagnostics) if d.fix_fn is not None]
+
+    def _advance_cursor(self, direction: int) -> None:
+        """Move cursor by *direction* (+1 or -1) among fixable diagnostics."""
+        fixable = self._fixable_indices()
+        if not fixable:
+            return
+        if self._cursor not in fixable:
+            # Snap to first fixable
+            self._cursor = fixable[0] if direction >= 0 else fixable[-1]
+        else:
+            pos = fixable.index(self._cursor)
+            pos = (pos + direction) % len(fixable)
+            self._cursor = fixable[pos]
+        self._render_results()
+
+    # ------------------------------------------------------------------
+    # Compose / mount
+    # ------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
         with Vertical(id="doctor-container"):
@@ -1603,19 +1647,12 @@ class DoctorModal(ModalScreen[bool]):
         )
         self.run_worker(self._run_diagnostics, thread=True)
 
-    def _run_diagnostics(self) -> None:
-        import json
+    # ------------------------------------------------------------------
+    # Diagnostic running (uses ALL_DIAGNOSTICS — all checks)
+    # ------------------------------------------------------------------
 
-        from reduce_session.doctor import (
-            diagnose_bloated_tur,
-            diagnose_compaction_summaries,
-            diagnose_orphaned_tool_results,
-            diagnose_overlapping_files,
-            diagnose_parent_chain,
-            diagnose_reduce_tags,
-            diagnose_stale_tokens,
-            diagnose_unreduced_metadata,
-        )
+    def _load_lines(self) -> list:
+        import json
 
         with open(self.session_path) as f:
             lines = []
@@ -1626,17 +1663,16 @@ class DoctorModal(ModalScreen[bool]):
                         lines.append(json.loads(line))
                     except json.JSONDecodeError:
                         continue
+        return lines
 
-        diagnostics = [
-            diagnose_compaction_summaries(lines, self.session_path),
-            diagnose_parent_chain(lines, self.session_path),
-            diagnose_stale_tokens(lines, self.session_path),
-            diagnose_overlapping_files(lines, self.session_path),
-            diagnose_unreduced_metadata(lines, self.session_path),
-            diagnose_reduce_tags(lines, self.session_path),
-            diagnose_bloated_tur(lines, self.session_path),
-            diagnose_orphaned_tool_results(lines, self.session_path),
-        ]
+    def _run_all(self, lines: list) -> list:
+        from reduce_session.doctor import ALL_DIAGNOSTICS
+
+        return [fn(lines, self.session_path) for fn in ALL_DIAGNOSTICS]
+
+    def _run_diagnostics(self) -> None:
+        lines = self._load_lines()
+        diagnostics = self._run_all(lines)
         self._diagnostics = diagnostics
 
         # Auto-select all fixable critical/warning items
@@ -1644,7 +1680,16 @@ class DoctorModal(ModalScreen[bool]):
             if d.fix_fn and d.severity in ("critical", "warning"):
                 self._selected.add(i)
 
+        # Place cursor on first fixable item
+        fixable = self._fixable_indices()
+        if fixable:
+            self._cursor = fixable[0]
+
         self.app.call_from_thread(self._render_results)
+
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
 
     def _render_results(self) -> None:
         text = Text()
@@ -1652,9 +1697,13 @@ class DoctorModal(ModalScreen[bool]):
             color = self._SEVERITY_COLORS.get(d.severity, "#6688aa")
             icon = self._SEVERITY_ICONS.get(d.severity, "?")
 
-            text.append(f" {icon} ", style=color)
-            text.append(f"{d.name}", style=f"bold {color}")
-            text.append(f"  {d.summary}\n", style=color)
+            at_cursor = i == self._cursor
+            header_style = f"bold {color} reverse" if at_cursor else f"bold {color}"
+            prefix_style = color if not at_cursor else f"{color} reverse"
+
+            text.append(f" {icon} ", style=prefix_style)
+            text.append(f"{d.name}", style=header_style)
+            text.append(f"  {d.summary}\n", style=prefix_style)
 
             # Render sparkline per diagnostic type
             self._render_sparkline(text, d)
@@ -1663,10 +1712,11 @@ class DoctorModal(ModalScreen[bool]):
             for line in d.detail_lines:
                 text.append(f"    {line}\n", style="dim")
 
-            # Fix preview
+            # Fix preview with checkbox
             if d.fix_fn:
                 checkbox = "\u2611" if i in self._selected else "\u2610"
-                text.append(f"  Fix: {d.fix_description}  [{checkbox}]\n", style="bold")
+                fix_style = "bold" if not at_cursor else "bold reverse"
+                text.append(f"  {checkbox} Fix: {d.fix_description}\n", style=fix_style)
 
             text.append("\n")
 
@@ -1687,31 +1737,36 @@ class DoctorModal(ModalScreen[bool]):
             bins[bi] = (hits + (1 if flag else 0), total + 1)
         return bins
 
+    def _render_bool_sparkline(
+        self, text: Text, data, hit_color: str, ok_color: str
+    ) -> None:
+        """Generic bool sparkline renderer for [(pos, bool)] data."""
+        bins = self._bucket_bool_sparkline(data)
+        text.append("  ")
+        for hits, total in bins:
+            if hits > 0:
+                text.append("\u2588", style=hit_color)
+            elif total > 0:
+                text.append("\u2581", style=ok_color)
+            else:
+                text.append(" ")
+        text.append("\n")
+
     def _render_sparkline(self, text: Text, d) -> None:
         """Append diagnostic-specific sparkline visualization to *text*."""
-        if d.name == "compaction_summaries" and d.sparkline_data:
-            bins = self._bucket_bool_sparkline(d.sparkline_data)
-            text.append("  ")
-            for hits, total in bins:
-                if hits > 0:
-                    text.append("\u2588", style="#ee4444")
-                elif total > 0:
-                    text.append("\u2581", style="#333333")
-                else:
-                    text.append(" ")
-            text.append("\n")
+        bool_sparkline_names = {
+            "compaction_summaries": ("#ee4444", "#333333"),
+            "parent_chain": ("#ee4444", "#44aa88"),
+            "cycle_in_parent_chain": ("#ee4444", "#44aa88"),
+            "null_parentUuid_at_non_root": ("#ee4444", "#44aa88"),
+            "corrupted_tool_use": ("#ee4444", "#333333"),
+            "corrupted_content_blocks": ("#ee4444", "#333333"),
+            "orphaned_tool_results": ("#ee4444", "#44aa88"),
+        }
 
-        elif d.name == "parent_chain" and d.sparkline_data:
-            bins = self._bucket_bool_sparkline(d.sparkline_data)
-            text.append("  ")
-            for hits, total in bins:
-                if hits > 0:
-                    text.append("\u2588", style="#ee4444")
-                elif total > 0:
-                    text.append("\u2581", style="#44aa88")
-                else:
-                    text.append(" ")
-            text.append("\n")
+        if d.name in bool_sparkline_names and d.sparkline_data:
+            hit_color, ok_color = bool_sparkline_names[d.name]
+            self._render_bool_sparkline(text, d.sparkline_data, hit_color, ok_color)
 
         elif d.name == "stale_tokens" and len(d.sparkline_data) >= 2:
             stale = d.sparkline_data[0][1]
@@ -1778,17 +1833,22 @@ class DoctorModal(ModalScreen[bool]):
                 text.append(spark_chars[idx], style="#ee4444")
             text.append("\n")
 
-        elif d.name == "orphaned_tool_results" and d.sparkline_data:
-            bins = self._bucket_bool_sparkline(d.sparkline_data)
-            text.append("  ")
-            for hits, total in bins:
-                if hits > 0:
-                    text.append("\u2588", style="#ee4444")
-                elif total > 0:
-                    text.append("\u2581", style="#44aa88")
-                else:
-                    text.append(" ")
-            text.append("\n")
+        elif d.name == "stale_backups" and d.sparkline_data:
+            for fname, size_bytes in d.sparkline_data:
+                mb = size_bytes / 1024 / 1024
+                text.append(f"    {fname}  ({mb:.1f} MB)\n", style="dim")
+
+        elif d.name == "oversized_sessions" and d.sparkline_data:
+            mb = d.sparkline_data[0][1] if d.sparkline_data else 0
+            text.append(f"  File size: {mb:.1f} MB\n", style="dim")
+
+        elif d.name == "protected_type_survival" and d.sparkline_data:
+            for label, val in d.sparkline_data:
+                text.append(f"    {label}: {val}\n", style="dim")
+
+    # ------------------------------------------------------------------
+    # Button and keyboard actions
+    # ------------------------------------------------------------------
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-close-doctor":
@@ -1822,15 +1882,7 @@ class DoctorModal(ModalScreen[bool]):
         except Exception:
             pass
 
-        with open(self.session_path) as f:
-            lines = []
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        lines.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
+        lines = self._load_lines()
 
         selected_diags = [
             self._diagnostics[i]
@@ -1866,39 +1918,16 @@ class DoctorModal(ModalScreen[bool]):
         self.run_worker(self._rerun_and_render, thread=True)
 
     def _rerun_and_render(self) -> None:
-        import json
+        lines = self._load_lines()
+        self._diagnostics = self._run_all(lines)
 
-        from reduce_session.doctor import (
-            diagnose_bloated_tur,
-            diagnose_compaction_summaries,
-            diagnose_orphaned_tool_results,
-            diagnose_overlapping_files,
-            diagnose_parent_chain,
-            diagnose_reduce_tags,
-            diagnose_stale_tokens,
-            diagnose_unreduced_metadata,
-        )
+        # Reset cursor to first fixable item
+        fixable = self._fixable_indices()
+        if fixable:
+            self._cursor = fixable[0]
+        else:
+            self._cursor = -1
 
-        with open(self.session_path) as f:
-            lines = []
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        lines.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-
-        self._diagnostics = [
-            diagnose_compaction_summaries(lines, self.session_path),
-            diagnose_parent_chain(lines, self.session_path),
-            diagnose_stale_tokens(lines, self.session_path),
-            diagnose_overlapping_files(lines, self.session_path),
-            diagnose_unreduced_metadata(lines, self.session_path),
-            diagnose_reduce_tags(lines, self.session_path),
-            diagnose_bloated_tur(lines, self.session_path),
-            diagnose_orphaned_tool_results(lines, self.session_path),
-        ]
         self.app.call_from_thread(self._render_post_fix)
 
     def _render_post_fix(self) -> None:
@@ -1925,16 +1954,45 @@ class DoctorModal(ModalScreen[bool]):
     def action_cancel(self) -> None:
         self.dismiss(False)
 
+    def action_cursor_down(self) -> None:
+        """Move cursor to the next fixable diagnostic."""
+        self._advance_cursor(+1)
+
+    def action_cursor_up(self) -> None:
+        """Move cursor to the previous fixable diagnostic."""
+        self._advance_cursor(-1)
+
     def action_toggle_fix(self) -> None:
-        """Toggle the next fixable diagnostic (for keyboard use)."""
-        for i, d in enumerate(self._diagnostics):
-            if d.fix_fn:
-                if i in self._selected:
-                    self._selected.discard(i)
-                else:
-                    self._selected.add(i)
-                break
+        """Toggle the fix at the current cursor position."""
+        if self._cursor < 0 or self._cursor >= len(self._diagnostics):
+            return
+        d = self._diagnostics[self._cursor]
+        if d.fix_fn is None:
+            return
+        if self._cursor in self._selected:
+            self._selected.discard(self._cursor)
+        else:
+            self._selected.add(self._cursor)
         self._render_results()
+
+    def action_toggle_all(self) -> None:
+        """Toggle all fixable diagnostics: select all if any unselected, else clear all."""
+        fixable = self._fixable_indices()
+        if not fixable:
+            return
+        if all(i in self._selected for i in fixable):
+            # All selected — deselect all
+            for i in fixable:
+                self._selected.discard(i)
+        else:
+            # Some or none selected — select all
+            for i in fixable:
+                self._selected.add(i)
+        self._render_results()
+
+    def action_apply_fixes(self) -> None:
+        """Apply selected fixes (enter / A)."""
+        self._apply_selected()
 
 
 # --- Conversation Browser ---

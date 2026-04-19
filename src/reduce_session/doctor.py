@@ -1556,6 +1556,27 @@ _FIX_ORDER = {
 }
 
 
+# All diagnostic functions in priority order (matches _FIX_ORDER).
+# Import this list in widgets / mcp_server / anywhere that needs all checks.
+ALL_DIAGNOSTICS = [
+    diagnose_compaction_summaries,
+    diagnose_corrupted_tool_use,
+    diagnose_corrupted_content_blocks,
+    diagnose_parent_chain,
+    diagnose_cycle_in_parent_chain,
+    diagnose_null_parentUuid_at_non_root,
+    diagnose_stale_tokens,
+    diagnose_overlapping_files,
+    diagnose_unreduced_metadata,
+    diagnose_reduce_tags,
+    diagnose_bloated_tur,
+    diagnose_orphaned_tool_results,
+    diagnose_stale_backups,
+    diagnose_oversized_sessions,
+    diagnose_protected_type_survival,
+]
+
+
 def apply_fixes(
     lines: list[dict],
     file_path: str,
