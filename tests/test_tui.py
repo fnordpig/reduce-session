@@ -332,4 +332,196 @@ async def test_doctor_on_no_session(empty_projects_dir):
     app = SessionBrowserApp(projects_dir=empty_projects_dir)
     async with app.run_test() as pilot:
         await pilot.press("D")
-        # Should not crash -- warning notification shown
+
+
+# --- DoctorModal chooser tests ---
+
+
+@pytest.fixture
+def doctor_session(tmp_path):
+    """Create a JSONL session with a few real issues for doctor tests.
+
+    Issues planted:
+    - One orphaned compaction summary (parentUuid=null mid-chain) → fixable
+    - One bloated tool_result (>10KB) → fixable
+    - Parent chain intact otherwise
+    """
+    session_file = tmp_path / "dddddddd-dddd-dddd-dddd-dddddddddddd.jsonl"
+    lines = [
+        {
+            "uuid": "uuid-1",
+            "type": "user",
+            "parentUuid": None,
+            "message": {"content": "Hello"},
+        },
+        {
+            "uuid": "uuid-2",
+            "type": "assistant",
+            "parentUuid": "uuid-1",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Hi there"}],
+            },
+        },
+        # Orphaned compaction summary: parentUuid=null with predecessor
+        {
+            "uuid": "uuid-3",
+            "type": "user",
+            "parentUuid": None,
+            "message": {
+                "content": "This session is being continued from a previous conversation"
+            },
+        },
+        {
+            "uuid": "uuid-4",
+            "type": "user",
+            "parentUuid": "uuid-3",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-abc",
+                        # 15 KB of output — over TUR_THRESHOLD (10 KB)
+                        "content": "x" * 15_000,
+                    }
+                ],
+            },
+        },
+    ]
+    session_file.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+    return str(session_file)
+
+
+def _make_doctor_app(session_path: str):
+    """Return a minimal Textual App that immediately pushes a DoctorModal.
+
+    The app exposes ``modal`` attribute after mount so tests can inspect it
+    directly without relying on CSS-selector querying of a ModalScreen.
+    """
+    from textual.app import App, ComposeResult
+    from textual.widgets import Static
+
+    from reduce_session.widgets import DoctorModal
+
+    class _DoctorTestApp(App):
+        modal: DoctorModal
+
+        def compose(self) -> ComposeResult:
+            yield Static("bg")
+
+        def on_mount(self) -> None:
+            self.modal = DoctorModal(session_path)
+            self.push_screen(self.modal)
+
+    return _DoctorTestApp()
+
+
+@pytest.mark.asyncio
+async def test_doctor_modal_lists_all_checks(doctor_session):
+    """DoctorModal must run all doctor checks (currently 15)."""
+    from reduce_session.doctor import ALL_DIAGNOSTICS
+
+    app = _make_doctor_app(doctor_session)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        modal = app.modal
+        assert len(modal._diagnostics) == len(ALL_DIAGNOSTICS)
+        names = {d.name for d in modal._diagnostics}
+        # Spot-check the 7 previously missing checks
+        assert "corrupted_tool_use" in names
+        assert "corrupted_content_blocks" in names
+        assert "cycle_in_parent_chain" in names
+        assert "null_parentUuid_at_non_root" in names
+        assert "stale_backups" in names
+        assert "oversized_sessions" in names
+        assert "protected_type_survival" in names
+
+
+@pytest.mark.asyncio
+async def test_doctor_modal_cursor_skips_non_fixable(doctor_session):
+    """Cursor movement must stop only on fixable (fix_fn is not None) items."""
+    app = _make_doctor_app(doctor_session)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        modal = app.modal
+        fixable = modal._fixable_indices()
+        # Session has at least compaction_summaries and bloated_tur as fixable
+        assert len(fixable) >= 1
+
+        # Starting cursor must be on a fixable item
+        assert modal._cursor in fixable
+
+        # Press j several times — cursor must always land on a fixable item
+        for _ in range(len(fixable) + 2):
+            await pilot.press("j")
+            assert modal._cursor in fixable
+
+
+@pytest.mark.asyncio
+async def test_doctor_modal_toggle_selects_fix(doctor_session):
+    """space must toggle the fix at cursor; toggling twice returns to original state."""
+    app = _make_doctor_app(doctor_session)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        modal = app.modal
+        assert modal._cursor in modal._fixable_indices()
+
+        cursor = modal._cursor
+        initial_selected = cursor in modal._selected
+
+        # Toggle on
+        await pilot.press("space")
+        assert (cursor in modal._selected) != initial_selected
+
+        # Toggle off
+        await pilot.press("space")
+        assert (cursor in modal._selected) == initial_selected
+
+
+@pytest.mark.asyncio
+async def test_doctor_modal_apply_runs_selected_fixes(doctor_session, monkeypatch):
+    """Applying selected fixes calls apply_fixes with the chosen subset."""
+    from reduce_session import doctor as doctor_module
+
+    called_with: list = []
+
+    original_apply = doctor_module.apply_fixes
+
+    def _patched_apply(lines, file_path, selected_diagnostics):
+        called_with.append([d.name for d in selected_diagnostics])
+        return original_apply(lines, file_path, selected_diagnostics)
+
+    monkeypatch.setattr(doctor_module, "apply_fixes", _patched_apply)
+    # Patch the name that _do_apply resolves at call time (imported inside method)
+    import reduce_session.doctor as _doc
+
+    monkeypatch.setattr(_doc, "apply_fixes", _patched_apply)
+
+    app = _make_doctor_app(doctor_session)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        modal = app.modal
+        # Ensure at least one fix is selected
+        fixable = modal._fixable_indices()
+        assert fixable, "need at least one fixable diagnostic"
+        # Force-select first fixable only
+        modal._selected = {fixable[0]}
+        expected_name = modal._diagnostics[fixable[0]].name
+
+        # Apply via keyboard shortcut
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+        assert called_with, "apply_fixes was never called"
+        applied_names = called_with[0]
+        assert expected_name in applied_names
