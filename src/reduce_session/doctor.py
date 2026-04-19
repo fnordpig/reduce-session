@@ -26,23 +26,6 @@ METADATA_TYPES = frozenset(
 TUR_THRESHOLD = 10 * 1024  # 10 KB
 TUR_TRUNCATE_TO = 2048  # 2 KB
 
-# Fix application order — lower number runs first.
-_FIX_ORDER: dict[str, int] = {
-    "compaction_summaries": 0,
-    "corrupted_tool_use": 1,
-    "corrupted_content_blocks": 2,
-    "unreduced_metadata": 3,
-    "bloated_tur": 4,
-    "orphaned_tool_results": 5,
-    "parent_chain": 6,
-    "cycle_in_parent_chain": 6,
-    "null_parentUuid_at_non_root": 6,
-    "reduce_tags": 7,
-    "overlapping_files": 7,
-    "stale_backups": 8,
-    "stale_tokens": 9,
-}
-
 
 @dataclass
 class DiagnosticResult:
@@ -1532,27 +1515,375 @@ def diagnose_protected_type_survival(
 
 
 # ---------------------------------------------------------------------------
+# 16. Mixed content format (string vs list)
+# ---------------------------------------------------------------------------
+
+_API_ERROR_MARKERS = (
+    "400 invalid_request_error",
+    "tool_use_ids were found without tool_result",
+    "each `assistant` message must be followed",
+    "API Error: 400",
+)
+
+_MERGE_HAZARD_TYPES = frozenset(
+    {
+        "progress",
+        "file-history-snapshot",
+        "queue-operation",
+        "last-prompt",
+        "attribution-snapshot",
+    }
+)
+
+
+def _fix_mixed_content_format(lines: list[dict]) -> dict:
+    """Normalize string-format message.content to the canonical list format."""
+    normalized = 0
+    for obj in lines:
+        if obj.get("type") not in ("user", "assistant"):
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            msg["content"] = [{"type": "text", "text": content}] if content else []
+            normalized += 1
+    return {"content_normalized": normalized}
+
+
+def diagnose_mixed_content_format(
+    lines: list[dict], file_path: str
+) -> DiagnosticResult:
+    """Detect user/assistant messages whose content is a bare string (not a list).
+
+    These can cause API 400 errors during /compact when the API tries to merge
+    string-content messages with adjacent array-content messages.
+    """
+    total = len(lines)
+    sparkline: list[bool] = []
+    bad_count = 0
+
+    for i, obj in enumerate(lines):
+        hit = False
+        if obj.get("type") in ("user", "assistant"):
+            msg = obj.get("message")
+            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+                hit = True
+                bad_count += 1
+        sparkline.append(hit)
+
+    if bad_count:
+        return DiagnosticResult(
+            name="mixed_content_format",
+            severity="warning",
+            summary=f"{bad_count} message(s) with string content (non-canonical format)",
+            sparkline_data=sparkline,
+            fix_description="Normalize string content to [{type: text, text: ...}]",
+            fix_fn=_fix_mixed_content_format,
+        )
+    return DiagnosticResult(
+        name="mixed_content_format",
+        severity="ok",
+        summary="All message content in canonical list format",
+        sparkline_data=sparkline,
+        fix_description="",
+        fix_fn=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 17. Metadata entries between same-role messages
+# ---------------------------------------------------------------------------
+
+
+def _fix_metadata_between_same_role(lines: list[dict]) -> dict:
+    """Drop metadata entries that sit between two consecutive same-role messages.
+
+    Records dropped UUIDs so relink_parent_chains can repair any children.
+    """
+    from .invariants import relink_parent_chains
+
+    # Find metadata indices that create same-role merge hazards
+    drop_indices: set[int] = set()
+    dropped_uuids: dict[str, str | None] = {}
+
+    # Walk forward: find pairs of message entries with same role separated only
+    # by metadata types.
+    msg_positions: list[int] = [
+        i for i, obj in enumerate(lines) if obj.get("type") in ("user", "assistant")
+    ]
+
+    for k in range(len(msg_positions) - 1):
+        i = msg_positions[k]
+        j = msg_positions[k + 1]
+        role_i = (
+            lines[i].get("message", {}).get("role")
+            if isinstance(lines[i].get("message"), dict)
+            else lines[i].get("type")
+        )
+        role_j = (
+            lines[j].get("message", {}).get("role")
+            if isinstance(lines[j].get("message"), dict)
+            else lines[j].get("type")
+        )
+        # Normalize: use the entry's type field as role proxy if message.role missing
+        if role_i is None:
+            role_i = lines[i].get("type")
+        if role_j is None:
+            role_j = lines[j].get("type")
+
+        if role_i != role_j:
+            continue
+
+        # Check that everything between i and j is only metadata
+        between = range(i + 1, j)
+        if not between:
+            continue
+        all_meta = all(lines[m].get("type") in _MERGE_HAZARD_TYPES for m in between)
+        if not all_meta:
+            continue
+
+        # These are hazard-causing metadata entries — mark for removal
+        for m in between:
+            drop_indices.add(m)
+
+    # Build dropped_uuids map: uuid -> best non-dropped predecessor uuid
+    for idx in sorted(drop_indices):
+        uid = lines[idx].get("uuid")
+        parent = lines[idx].get("parentUuid")
+        if uid:
+            # Find nearest non-dropped predecessor
+            for j in range(idx - 1, -1, -1):
+                if j not in drop_indices:
+                    prev_uuid = lines[j].get("uuid")
+                    if prev_uuid:
+                        dropped_uuids[uid] = prev_uuid
+                        break
+            else:
+                dropped_uuids[uid] = parent
+
+    # Relink children before removal
+    relink_parent_chains(lines, dropped_uuids)
+
+    # Remove in reverse order to preserve indices
+    for idx in sorted(drop_indices, reverse=True):
+        lines.pop(idx)
+
+    return {"metadata_between_dropped": len(drop_indices)}
+
+
+def diagnose_metadata_between_same_role(
+    lines: list[dict], file_path: str
+) -> DiagnosticResult:
+    """Detect metadata entries sitting between two consecutive same-role messages.
+
+    The reconstructor fails to merge such pairs, emitting consecutive same-role
+    messages that the API rejects during /compact.
+    """
+    # Walk message positions looking for same-role adjacency separated by metadata
+    msg_positions: list[int] = [
+        i for i, obj in enumerate(lines) if obj.get("type") in ("user", "assistant")
+    ]
+
+    hazard_pairs: list[tuple[int, int]] = []
+    for k in range(len(msg_positions) - 1):
+        i = msg_positions[k]
+        j = msg_positions[k + 1]
+
+        role_i = (
+            lines[i].get("message", {}).get("role")
+            if isinstance(lines[i].get("message"), dict)
+            else lines[i].get("type")
+        )
+        role_j = (
+            lines[j].get("message", {}).get("role")
+            if isinstance(lines[j].get("message"), dict)
+            else lines[j].get("type")
+        )
+        if role_i is None:
+            role_i = lines[i].get("type")
+        if role_j is None:
+            role_j = lines[j].get("type")
+
+        if role_i != role_j:
+            continue
+
+        between = range(i + 1, j)
+        if not between:
+            continue
+        all_meta = all(lines[m].get("type") in _MERGE_HAZARD_TYPES for m in between)
+        if all_meta:
+            hazard_pairs.append((i, j))
+
+    total = len(lines)
+    # Sparkline: bool per line — True if the line is a hazard metadata entry
+    hazard_meta_indices: set[int] = set()
+    for i, j in hazard_pairs:
+        for m in range(i + 1, j):
+            hazard_meta_indices.add(m)
+
+    sparkline: list[bool] = [idx in hazard_meta_indices for idx in range(total)]
+
+    if hazard_pairs:
+        detail: list[str] = []
+        for i, j in hazard_pairs:
+            role = lines[i].get("message", {}).get("role") or lines[i].get("type", "?")
+            between_types = [lines[m].get("type", "?") for m in range(i + 1, j)]
+            detail.append(
+                f"  [{i}] and [{j}] both role={role!r}, separated by: {between_types}"
+            )
+        return DiagnosticResult(
+            name="metadata_between_same_role",
+            severity="warning",
+            summary=f"{len(hazard_pairs)} same-role message pair(s) separated by metadata",
+            sparkline_data=sparkline,
+            fix_description="Drop interrupting metadata entries and relink parent chains",
+            fix_fn=_fix_metadata_between_same_role,
+            detail_lines=detail,
+        )
+    return DiagnosticResult(
+        name="metadata_between_same_role",
+        severity="ok",
+        summary="No metadata-separated same-role message pairs",
+        sparkline_data=sparkline,
+        fix_description="",
+        fix_fn=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 18. API error artifacts from failed /compact cascades
+# ---------------------------------------------------------------------------
+
+
+def _text_contains_api_error(text: str) -> bool:
+    return any(marker in text for marker in _API_ERROR_MARKERS)
+
+
+def _message_is_api_error_artifact(obj: dict) -> bool:
+    """Return True if this assistant message contains a /compact API error."""
+    if obj.get("type") != "assistant":
+        return False
+    msg = obj.get("message")
+    if not isinstance(msg, dict):
+        return False
+    content = msg.get("content")
+    texts: list[str] = []
+    if isinstance(content, str):
+        texts.append(content)
+    elif isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                texts.append(block.get("text", ""))
+    return any(_text_contains_api_error(t) for t in texts)
+
+
+def _fix_api_error_artifacts(lines: list[dict]) -> dict:
+    """Drop assistant messages that are API error artifacts from failed /compact.
+
+    Only scans the last 20 messages (where cascade errors accumulate).
+    Records dropped UUIDs for relink_parent_chains.
+    """
+    from .invariants import relink_parent_chains
+
+    window_start = max(0, len(lines) - 20)
+    drop_indices: set[int] = set()
+
+    for i in range(window_start, len(lines)):
+        if _message_is_api_error_artifact(lines[i]):
+            drop_indices.add(i)
+
+    if not drop_indices:
+        return {"api_errors_dropped": 0}
+
+    dropped_uuids: dict[str, str | None] = {}
+    for idx in sorted(drop_indices):
+        uid = lines[idx].get("uuid")
+        if uid:
+            for j in range(idx - 1, -1, -1):
+                if j not in drop_indices:
+                    prev_uuid = lines[j].get("uuid")
+                    if prev_uuid:
+                        dropped_uuids[uid] = prev_uuid
+                        break
+            else:
+                dropped_uuids[uid] = lines[idx].get("parentUuid")
+
+    relink_parent_chains(lines, dropped_uuids)
+
+    for idx in sorted(drop_indices, reverse=True):
+        lines.pop(idx)
+
+    return {"api_errors_dropped": len(drop_indices)}
+
+
+def diagnose_api_error_artifacts(lines: list[dict], file_path: str) -> DiagnosticResult:
+    """Detect assistant messages that are API error artifacts from failed /compact.
+
+    A failed /compact appends the 400 error as a new assistant message.
+    Repeated retries pile up more entries.  These make the session unresumable.
+    Only the last 20 messages are scanned — that's where the cascade accumulates.
+    """
+    window_start = max(0, len(lines) - 20)
+    total = len(lines)
+    sparkline: list[bool] = [False] * total
+    artifact_indices: list[int] = []
+
+    for i in range(window_start, total):
+        if _message_is_api_error_artifact(lines[i]):
+            artifact_indices.append(i)
+            sparkline[i] = True
+
+    if artifact_indices:
+        return DiagnosticResult(
+            name="api_error_artifacts",
+            severity="critical",
+            summary=f"{len(artifact_indices)} API error artifact message(s) from failed /compact",
+            sparkline_data=sparkline,
+            fix_description="Drop error artifact messages and relink parent chains",
+            fix_fn=_fix_api_error_artifacts,
+            detail_lines=[
+                f"  [{i}] {lines[i].get('uuid', '<no-uuid>')}" for i in artifact_indices
+            ],
+        )
+    return DiagnosticResult(
+        name="api_error_artifacts",
+        severity="ok",
+        summary="No API error artifact messages found",
+        sparkline_data=sparkline,
+        fix_description="",
+        fix_fn=None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
 
 
 # Fix ordering: content-removing fixes first, then chain repair, then token recalibration last.
 # This ensures:
-# 1. bloated_tur/metadata removal happens before token estimate
-# 2. parent_chain repair runs after metadata removal (which can expose hidden breaks)
-# 3. stale_tokens recalibration runs last (after all content changes)
+# 1. api_error_artifacts removed first — they corrupt session headers
+# 2. mixed_content_format / metadata_between_same_role run early (content shaping)
+# 3. bloated_tur/metadata removal happens before token estimate
+# 4. parent_chain repair runs after metadata removal (which can expose hidden breaks)
+# 5. stale_tokens recalibration runs last (after all content changes)
 _FIX_ORDER = {
-    "compaction_summaries": 0,
-    "unreduced_metadata": 1,
-    "bloated_tur": 2,
-    "orphaned_tool_results": 3,
-    "parent_chain": 4,  # after metadata removal
-    "cycle_in_parent_chain": 4,
-    "null_parentUuid_at_non_root": 4,
-    "protected_type_survival": 4,  # restore protected messages, then repair chain
-    "reduce_tags": 5,
-    "overlapping_files": 6,
-    "stale_tokens": 9,  # always last — depends on final content size
+    "api_error_artifacts": 1,  # before everything — removes bad headers
+    "mixed_content_format": 2,  # before tool-use repair
+    "metadata_between_same_role": 2,  # same phase
+    "compaction_summaries": 3,
+    "unreduced_metadata": 4,
+    "bloated_tur": 5,
+    "orphaned_tool_results": 6,
+    "parent_chain": 7,  # after metadata removal
+    "cycle_in_parent_chain": 7,
+    "null_parentUuid_at_non_root": 7,
+    "protected_type_survival": 7,  # restore protected messages, then repair chain
+    "reduce_tags": 8,
+    "overlapping_files": 9,
+    "stale_tokens": 10,  # always last — depends on final content size
 }
 
 
@@ -1598,3 +1929,29 @@ def apply_fixes(
             if isinstance(stats, dict):
                 combined.update(stats)
     return combined
+
+
+# ---------------------------------------------------------------------------
+# Registry — all 17 diagnostic functions in recommended run order
+# ---------------------------------------------------------------------------
+
+ALL_DIAGNOSTICS: list = [
+    diagnose_api_error_artifacts,
+    diagnose_mixed_content_format,
+    diagnose_metadata_between_same_role,
+    diagnose_compaction_summaries,
+    diagnose_corrupted_tool_use,
+    diagnose_corrupted_content_blocks,
+    diagnose_unreduced_metadata,
+    diagnose_bloated_tur,
+    diagnose_orphaned_tool_results,
+    diagnose_parent_chain,
+    diagnose_cycle_in_parent_chain,
+    diagnose_null_parentUuid_at_non_root,
+    diagnose_protected_type_survival,
+    diagnose_reduce_tags,
+    diagnose_overlapping_files,
+    diagnose_stale_backups,
+    diagnose_stale_tokens,
+    diagnose_oversized_sessions,
+]

@@ -1553,3 +1553,632 @@ class TestProtectedTypeSurvival:
 
         result = diagnose_protected_type_survival(objs, str(path))
         assert result.severity == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Compaction-failure checks — G. diagnose_mixed_content_format
+# ---------------------------------------------------------------------------
+
+
+class TestMixedContentFormat:
+    def test_fires_on_string_content(self, tmp_path):
+        from reduce_session.doctor import diagnose_mixed_content_format
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": "Hello from voice dictation",
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": "u-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Hi there"}],
+                    },
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_mixed_content_format(lines, str(path))
+        assert result.severity == "warning"
+        assert result.fix_fn is not None
+        assert "1 message" in result.summary
+
+    def test_no_op_on_clean_session(self, tmp_path):
+        from reduce_session.doctor import diagnose_mixed_content_format
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Hello"}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": "u-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Hi"}],
+                    },
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_mixed_content_format(lines, str(path))
+        assert result.severity == "ok"
+        assert result.fix_fn is None
+
+    def test_fix_normalizes_to_list(self, tmp_path):
+        from reduce_session.doctor import diagnose_mixed_content_format
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {"role": "user", "content": "Spoken text"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": "u-1",
+                    "message": {"role": "assistant", "content": "Reply string"},
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_mixed_content_format(lines, str(path))
+        stats = result.fix_fn(lines)
+        assert stats["content_normalized"] == 2
+
+        # Both messages should now have list content
+        for obj in lines:
+            content = obj["message"]["content"]
+            assert isinstance(content, list)
+            assert content[0]["type"] == "text"
+            assert isinstance(content[0]["text"], str)
+
+    def test_fix_empty_string_becomes_empty_list(self, tmp_path):
+        from reduce_session.doctor import diagnose_mixed_content_format
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {"role": "user", "content": ""},
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text(json.dumps(lines[0]))
+
+        result = diagnose_mixed_content_format(lines, str(path))
+        stats = result.fix_fn(lines)
+        assert stats["content_normalized"] == 1
+        assert lines[0]["message"]["content"] == []
+
+    def test_sparkline_length_matches_lines(self, tmp_path):
+        from reduce_session.doctor import diagnose_mixed_content_format
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {"role": "user", "content": "string format"},
+                },
+                {
+                    "type": "progress",
+                    "uuid": "p-1",
+                    "parentUuid": "u-1",
+                    "data": {},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": "p-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "ok"}],
+                    },
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_mixed_content_format(lines, str(path))
+        assert len(result.sparkline_data) == len(lines)
+        assert result.sparkline_data[0] is True  # user has string content
+        assert result.sparkline_data[1] is False  # progress entry
+        assert result.sparkline_data[2] is False  # assistant has list content
+
+
+# ---------------------------------------------------------------------------
+# Compaction-failure checks — H. diagnose_metadata_between_same_role
+# ---------------------------------------------------------------------------
+
+
+class TestMetadataBetweenSameRole:
+    def test_fires_on_hazard_pattern(self, tmp_path):
+        from reduce_session.doctor import diagnose_metadata_between_same_role
+
+        # Two consecutive assistant messages separated only by a progress entry
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Go"}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": "u-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Step 1"}],
+                    },
+                },
+                {
+                    "type": "progress",
+                    "uuid": "prog-1",
+                    "parentUuid": "a-1",
+                    "data": {"type": "hook_progress"},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-2",
+                    "parentUuid": "prog-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Step 2"}],
+                    },
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_metadata_between_same_role(lines, str(path))
+        assert result.severity == "warning"
+        assert result.fix_fn is not None
+        assert "1 same-role" in result.summary
+
+    def test_no_op_on_clean_session(self, tmp_path):
+        from reduce_session.doctor import diagnose_metadata_between_same_role
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Hi"}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": "u-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Hello"}],
+                    },
+                },
+                {
+                    "type": "progress",
+                    "uuid": "p-1",
+                    "parentUuid": "a-1",
+                    "data": {},
+                },
+                {
+                    "type": "user",
+                    "uuid": "u-2",
+                    "parentUuid": "p-1",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Continue"}],
+                    },
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_metadata_between_same_role(lines, str(path))
+        assert result.severity == "ok"
+        assert result.fix_fn is None
+
+    def test_fix_drops_hazard_metadata(self, tmp_path):
+        from reduce_session.doctor import diagnose_metadata_between_same_role
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Go"}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": "u-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Part 1"}],
+                    },
+                },
+                {
+                    "type": "file-history-snapshot",
+                    "uuid": "fhs-1",
+                    "parentUuid": "a-1",
+                    "data": {},
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-2",
+                    "parentUuid": "fhs-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "Part 2"}],
+                    },
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_metadata_between_same_role(lines, str(path))
+        stats = result.fix_fn(lines)
+        assert stats["metadata_between_dropped"] == 1
+
+        # The file-history-snapshot should be gone
+        types = [obj["type"] for obj in lines]
+        assert "file-history-snapshot" not in types
+
+        # a-2 should be reparented to a-1 (skipping the dropped entry)
+        a2 = next(l for l in lines if l.get("uuid") == "a-2")
+        assert a2["parentUuid"] == "a-1"
+
+    def test_fix_stats_counted_correctly(self, tmp_path):
+        from reduce_session.doctor import diagnose_metadata_between_same_role
+
+        # Two hazard metadata entries between same-role pair
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Start"}],
+                    },
+                },
+                {
+                    "type": "queue-operation",
+                    "uuid": "qop-1",
+                    "parentUuid": "u-1",
+                    "data": {},
+                },
+                {
+                    "type": "progress",
+                    "uuid": "prog-2",
+                    "parentUuid": "qop-1",
+                    "data": {},
+                },
+                {
+                    "type": "user",
+                    "uuid": "u-2",
+                    "parentUuid": "prog-2",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Continue"}],
+                    },
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_metadata_between_same_role(lines, str(path))
+        assert result.severity == "warning"
+        stats = result.fix_fn(lines)
+        assert stats["metadata_between_dropped"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Compaction-failure checks — I. diagnose_api_error_artifacts
+# ---------------------------------------------------------------------------
+
+
+class TestApiErrorArtifacts:
+    def _make_error_message(self, uuid: str, parent, error_text: str) -> dict:
+        return {
+            "type": "assistant",
+            "uuid": uuid,
+            "parentUuid": parent,
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": error_text}],
+            },
+        }
+
+    def test_fires_on_400_invalid_request(self, tmp_path):
+        from reduce_session.doctor import diagnose_api_error_artifacts
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Compact please"}],
+                    },
+                },
+                self._make_error_message(
+                    "a-err",
+                    "u-1",
+                    "Error: 400 invalid_request_error: messages.3: each `assistant` message must be followed by a user message",
+                ),
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_api_error_artifacts(lines, str(path))
+        assert result.severity == "critical"
+        assert result.fix_fn is not None
+        assert "1 API error" in result.summary
+
+    def test_fires_on_tool_use_ids_error(self, tmp_path):
+        from reduce_session.doctor import diagnose_api_error_artifacts
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Hello"}],
+                    },
+                },
+                self._make_error_message(
+                    "a-err",
+                    "u-1",
+                    "API Error: 400 — tool_use_ids were found without tool_result",
+                ),
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_api_error_artifacts(lines, str(path))
+        assert result.severity == "critical"
+
+    def test_no_op_on_clean_session(self, tmp_path):
+        from reduce_session.doctor import diagnose_api_error_artifacts
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Hello"}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "uuid": "a-1",
+                    "parentUuid": "u-1",
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "text", "text": "Hi there, how can I help?"}
+                        ],
+                    },
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_api_error_artifacts(lines, str(path))
+        assert result.severity == "ok"
+        assert result.fix_fn is None
+
+    def test_fix_drops_error_messages(self, tmp_path):
+        from reduce_session.doctor import diagnose_api_error_artifacts
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Compact"}],
+                    },
+                },
+                self._make_error_message(
+                    "a-err-1",
+                    "u-1",
+                    "400 invalid_request_error: messages alternation violated",
+                ),
+                self._make_error_message(
+                    "a-err-2",
+                    "a-err-1",
+                    "API Error: 400 — retry failed",
+                ),
+                {
+                    "type": "user",
+                    "uuid": "u-2",
+                    "parentUuid": "a-err-2",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Try again"}],
+                    },
+                },
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_api_error_artifacts(lines, str(path))
+        stats = result.fix_fn(lines)
+        assert stats["api_errors_dropped"] == 2
+
+        # Error messages should be gone
+        uuids = [obj.get("uuid") for obj in lines]
+        assert "a-err-1" not in uuids
+        assert "a-err-2" not in uuids
+
+        # u-2 should be reparented to u-1 (past both dropped errors)
+        u2 = next(l for l in lines if l.get("uuid") == "u-2")
+        assert u2["parentUuid"] == "u-1"
+
+    def test_only_scans_last_20_messages(self, tmp_path):
+        from reduce_session.doctor import diagnose_api_error_artifacts
+
+        # Place an error message EARLY (position 0 of 25) — should NOT be detected
+        # because the window only covers the last 20
+        early_error = self._make_error_message(
+            "a-early-err",
+            None,
+            "400 invalid_request_error: some old error",
+        )
+        regular_messages = [
+            {
+                "type": "user",
+                "uuid": f"u-{i}",
+                "parentUuid": f"u-{i - 1}" if i > 0 else None,
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": f"message {i}"}],
+                },
+            }
+            for i in range(24)
+        ]
+        lines = _make_lines([early_error] + regular_messages)
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_api_error_artifacts(lines, str(path))
+        # The early error is outside the last-20 window — should not be detected
+        assert result.severity == "ok"
+
+    def test_fix_stats_counted_correctly(self, tmp_path):
+        from reduce_session.doctor import diagnose_api_error_artifacts
+
+        lines = _make_lines(
+            [
+                {
+                    "type": "user",
+                    "uuid": "u-1",
+                    "parentUuid": None,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "Hi"}],
+                    },
+                },
+                self._make_error_message(
+                    "a-err-1", "u-1", "400 invalid_request_error: first failure"
+                ),
+                self._make_error_message(
+                    "a-err-2", "a-err-1", "400 invalid_request_error: second failure"
+                ),
+                self._make_error_message(
+                    "a-err-3", "a-err-2", "400 invalid_request_error: third failure"
+                ),
+            ]
+        )
+        path = tmp_path / "test.jsonl"
+        path.write_text("\n".join(json.dumps(l) for l in lines))
+
+        result = diagnose_api_error_artifacts(lines, str(path))
+        assert result.severity == "critical"
+        assert "3 API error" in result.summary
+        stats = result.fix_fn(lines)
+        assert stats["api_errors_dropped"] == 3
+
+
+# ---------------------------------------------------------------------------
+# ALL_DIAGNOSTICS registry check
+# ---------------------------------------------------------------------------
+
+
+class TestAllDiagnosticsRegistry:
+    def test_all_diagnostics_has_18_entries(self):
+        from reduce_session.doctor import ALL_DIAGNOSTICS
+
+        assert len(ALL_DIAGNOSTICS) == 18
+
+    def test_all_diagnostics_are_callable(self):
+        from reduce_session.doctor import ALL_DIAGNOSTICS
+
+        for fn in ALL_DIAGNOSTICS:
+            assert callable(fn)
+
+    def test_new_checks_present(self):
+        from reduce_session.doctor import (
+            ALL_DIAGNOSTICS,
+            diagnose_api_error_artifacts,
+            diagnose_metadata_between_same_role,
+            diagnose_mixed_content_format,
+        )
+
+        names = [fn.__name__ for fn in ALL_DIAGNOSTICS]
+        assert "diagnose_api_error_artifacts" in names
+        assert "diagnose_mixed_content_format" in names
+        assert "diagnose_metadata_between_same_role" in names
+
+    def test_api_error_artifacts_runs_first(self):
+        """api_error_artifacts must have the lowest _FIX_ORDER priority."""
+        from reduce_session.doctor import _FIX_ORDER
+
+        assert _FIX_ORDER["api_error_artifacts"] < _FIX_ORDER["mixed_content_format"]
+        assert _FIX_ORDER["api_error_artifacts"] < _FIX_ORDER["compaction_summaries"]
+        assert _FIX_ORDER["api_error_artifacts"] < _FIX_ORDER["unreduced_metadata"]
