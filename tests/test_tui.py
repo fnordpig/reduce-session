@@ -16,6 +16,7 @@ from rich.text import Text
 from reduce_session.session import Exchange, SessionInfo
 from reduce_session.tui import SessionBrowserApp, _format_tokens_short, get_projects_dir
 from reduce_session.widgets import (
+    age_color,
     ConversationPreview,
     InfoBar,
     render_exchanges,
@@ -255,7 +256,7 @@ async def test_escape_quits(empty_projects_dir):
 
 
 def test_make_session_label_old_age():
-    """Sessions >7 days old should get extra-dim age text."""
+    """Old sessions render with a brown-end color from the age ramp."""
     app = SessionBrowserApp.__new__(SessionBrowserApp)
     session = SessionInfo(
         path=Path("/fake/path.jsonl"),
@@ -271,10 +272,16 @@ def test_make_session_label_old_age():
     label = app._make_session_label(session)
     assert isinstance(label, Text)
     assert "14d" in label.plain
+    # Old sessions should be styled with a brown-ish hex (red > blue).
+    spans = [s for s in label.spans if "14d" in label.plain[s.start : s.end]]
+    assert spans, "expected a span covering the age text"
+    style = str(spans[0].style)
+    r, g, b = int(style[1:3], 16), int(style[3:5], 16), int(style[5:7], 16)
+    assert r > b, f"old age color should lean warm/brown, got {style}"
 
 
 def test_make_session_label_recent():
-    """Recent sessions should use normal dim style."""
+    """Recent sessions render with a green-end color from the age ramp."""
     app = SessionBrowserApp.__new__(SessionBrowserApp)
     session = SessionInfo(
         path=Path("/fake/path.jsonl"),
@@ -289,6 +296,11 @@ def test_make_session_label_recent():
     )
     label = app._make_session_label(session)
     assert "2h" in label.plain
+    spans = [s for s in label.spans if "2h" in label.plain[s.start : s.end]]
+    assert spans
+    style = str(spans[0].style)
+    r, g, b = int(style[1:3], 16), int(style[3:5], 16), int(style[5:7], 16)
+    assert g > r, f"recent age color should lean green, got {style}"
 
 
 def test_make_session_label_parse_error():
@@ -308,6 +320,75 @@ def test_make_session_label_parse_error():
     )
     label = app._make_session_label(session)
     assert "\u26a0" in label.plain  # warning sign
+
+
+# --- Age color ramp ---
+
+
+def _hex_to_rgb(s: str) -> tuple[int, int, int]:
+    return int(s[1:3], 16), int(s[3:5], 16), int(s[5:7], 16)
+
+
+def test_age_color_fresh_is_green():
+    """A just-now timestamp returns the bright-green stop."""
+    assert age_color(datetime.now(timezone.utc)) == "#00d4aa"
+
+
+def test_age_color_none_is_neutral():
+    """Missing timestamp falls back to a neutral grey."""
+    assert age_color(None) == "#555555"
+
+
+def test_age_color_old_clamps_to_dark_brown():
+    """Sessions past the last stop clamp to dark brown."""
+    very_old = datetime.now(timezone.utc) - timedelta(days=365)
+    assert age_color(very_old) == "#3c2819"
+
+
+def test_age_color_naive_timestamp_handled():
+    """Naive datetimes are treated as UTC, not as raising."""
+    naive = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(tzinfo=None)
+    color = age_color(naive)
+    assert color.startswith("#") and len(color) == 7
+
+
+def test_age_color_ramp_is_monotonic_in_warmth():
+    """As age grows, red/green ratio shifts toward red (warmer/browner)."""
+    now = datetime.now(timezone.utc)
+    samples = [
+        now - timedelta(minutes=1),
+        now - timedelta(hours=6),
+        now - timedelta(days=2),
+        now - timedelta(days=14),
+        now - timedelta(days=60),
+    ]
+    ratios = []
+    for ts in samples:
+        r, g, _ = _hex_to_rgb(age_color(ts))
+        # Higher ratio = warmer (more red relative to green).
+        ratios.append((r + 1) / (g + 1))
+    assert ratios == sorted(ratios), (
+        f"warmth should grow monotonically with age, got {ratios}"
+    )
+
+
+def test_age_color_ramp_is_monotonic_in_luminance():
+    """As age grows, overall luminance drops (the fadeout)."""
+    now = datetime.now(timezone.utc)
+    samples = [
+        now - timedelta(hours=6),
+        now - timedelta(days=2),
+        now - timedelta(days=14),
+        now - timedelta(days=60),
+    ]
+    lums = []
+    for ts in samples:
+        r, g, b = _hex_to_rgb(age_color(ts))
+        # Rec. 709 luma approximation.
+        lums.append(0.2126 * r + 0.7152 * g + 0.0722 * b)
+    assert lums == sorted(lums, reverse=True), (
+        f"luminance should drop monotonically with age, got {lums}"
+    )
 
 
 # --- Doctor keybinding ---

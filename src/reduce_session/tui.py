@@ -18,6 +18,7 @@ from textual.widgets import Footer, Header, Static, Tree
 
 from .session import SessionInfo, scan_projects
 from .widgets import (
+    age_color,
     ConversationBrowserModal,
     ConversationPreview,
     DoctorModal,
@@ -151,16 +152,9 @@ class SessionBrowserApp(App):
         label.append(_format_tokens_short(session.token_estimate), style="dim")
         label.append("  ")
 
-        # Dim age more aggressively for old sessions (>7 days)
-        age_style = "dim"
-        if session.age_display.endswith("d"):
-            try:
-                days = int(session.age_display[:-1])
-                if days > 7:
-                    age_style = "#555555"
-            except ValueError:
-                pass
-        label.append(session.age_display, style=age_style)
+        # Color ramp: bright green (fresh) → amber → brown (old).
+        # Luminance drops along the gradient, so the ramp is itself the fadeout.
+        label.append(session.age_display, style=age_color(session.last_timestamp))
 
         if session.parse_error:
             label.append("  ", style="dim")
