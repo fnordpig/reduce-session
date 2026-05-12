@@ -7,8 +7,6 @@ import os
 from reduce_session.llm.base import Category
 from reduce_session.llm.prompts import (
     CLASSIFY_SYSTEM,
-    DISTILL_SUMMARIZE_SYSTEM,
-    DISTILL_STRIP_SYSTEM,
     format_classify_prompt,
     format_distill_prompt,
     parse_classify_response,

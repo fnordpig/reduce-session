@@ -12,7 +12,9 @@ reduce-session removes the noise with **18 composable strategies** across 3 pres
 
 - **18 reduction strategies** across gentle (5), standard (10), and aggressive (18) tiers
 - **Interactive TUI** — session tree, conversation preview, sparkline density profiles, doctor modal
+- **Provider-aware scanning** — sessions grouped by provider (`claude` / `codex`) and sorted by branch recency
 - **MCP server** — `list_sessions`, `browse_session`, `doctor`, `reduce` callable by Claude
+- **Format-aware codecs** — `--format claude|codex|auto` with optional `--validate-schema`
 - **LLM semantic distillation** — classify exchanges as keep/distill/strip using any provider
 - **14 doctor checks** with auto-fix — diagnose and repair session corruption
 - **Compact-summary exploitation** — 85-95% savings on compacted sessions
@@ -44,6 +46,15 @@ reduce-session --browse
 # Analyze a specific session (dry-run by default)
 reduce-session ~/.claude/projects/-Users-me-myproject/SESSION_ID.jsonl
 
+# Auto-detect (default) preserves legacy Claude mode and supports codex fallback via shape
+reduce-session SESSION_ID.jsonl
+
+# Explicitly force Claude mode for legacy compatibility checks
+reduce-session --format claude SESSION_ID.jsonl
+
+# Analyze Codex session explicitly
+reduce-session --format codex ~/.codex/sessions/SESSION_ID.jsonl
+
 # Apply standard reduction with backup
 reduce-session SESSION.jsonl --apply
 
@@ -64,7 +75,19 @@ reduce-session SESSION.jsonl --history
 
 # Token budget breakdown
 reduce-session SESSION.jsonl --tokens
+
+# Validate and apply schema checks during normalization
+reduce-session --format codex --validate-schema --schema-path schemas/codex_session_schema.json SESSION.jsonl
+
+# Strict schema mode exits non-zero on schema errors
+reduce-session --format claude --validate-schema --validate-schema-strict --schema-path schemas/claude.json SESSION.jsonl
 ```
+
+### Browser and branch ordering
+
+- Provider grouping in the browse tree uses explicit top-level nodes: `claude/` and `codex/`.
+- Branches are sorted by branch-last modification time, so the most recent branch renders first.
+- Within each branch, sessions are ordered by recency to keep likely-active workstreams at top of view.
 
 ## Strategies
 

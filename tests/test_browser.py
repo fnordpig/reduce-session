@@ -202,6 +202,42 @@ class TestBrowseExchangeParsing:
         exchanges = parse_browse_exchanges("/nonexistent/path.jsonl")
         assert exchanges == []
 
+    def test_codex_sessionmeta_event_parsing(self, tmp_path):
+        """Top-level content fields in codex events should be normalized and parsed."""
+        records = [
+            {
+                "type": "SessionMetaLine",
+                "id": "11",
+                "content": "session seed",
+                "timestamp": "2026-04-06T14:27:53.463300",
+            },
+            {
+                "type": "EventMsg",
+                "id": "12",
+                "content": "assistant reply",
+                "timestamp": "2026-04-06T14:27:54.000000",
+            },
+        ]
+        path = _make_jsonl(records, tmp_path / "test.jsonl")
+        exchanges = parse_browse_exchanges(str(path))
+
+        assert len(exchanges) == 2
+        assert exchanges[0].text == "session seed"
+        assert exchanges[1].text == "assistant reply"
+
+    def test_browse_parses_string_blocks_in_content_lists(self, tmp_path):
+        """String items in list content should be rendered instead of ignored."""
+        records = [
+            {
+                "type": "assistant",
+                "message": {"role": "assistant", "content": ["first block", "second block"]},
+            },
+        ]
+        path = _make_jsonl(records, tmp_path / "test.jsonl")
+        exchanges = parse_browse_exchanges(str(path))
+        assert len(exchanges) == 1
+        assert exchanges[0].text == "first block\nsecond block"
+
 
 # --- test_tree_building ---
 

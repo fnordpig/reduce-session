@@ -458,14 +458,17 @@ def test_strip_thinking_signature_stat_counted(tmp_path):
     assert result.stats.get("thinking_signature_stripped", 0) >= 1
 
 
-def test_text_of_list_content():
-    """text_of should extract text from list-content tool_results."""
-    from reduce_session.reduction import text_of
+def test_block_text_list_content():
+    """block_text should extract text from list-content tool_results.
 
-    # String content — existing behavior
-    assert text_of({"type": "tool_result", "content": "hello"}) == "hello"
+    (Renamed from test_text_of_list_content after text_of was removed in
+    favor of block_walk.block_text — the canonical block-text extractor.)"""
+    from reduce_session.block_walk import block_text
 
-    # List content — the fix
+    # String content
+    assert block_text({"type": "tool_result", "content": "hello"}) == "hello"
+
+    # List content
     block = {
         "type": "tool_result",
         "content": [
@@ -473,12 +476,12 @@ def test_text_of_list_content():
             {"type": "text", "text": "line two"},
         ],
     }
-    result = text_of(block)
+    result = block_text(block)
     assert "line one" in result
     assert "line two" in result
 
     # Empty list
-    assert text_of({"type": "tool_result", "content": []}) == ""
+    assert block_text({"type": "tool_result", "content": []}) == ""
 
 
 def test_detect_duplicate_blocks_small():

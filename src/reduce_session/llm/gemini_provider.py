@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import os
+import importlib
+from typing import Any, cast
 
 from reduce_session.llm.base import Category
 from reduce_session.llm.prompts import (
     CLASSIFY_SYSTEM,
-    DISTILL_SUMMARIZE_SYSTEM,
-    DISTILL_STRIP_SYSTEM,
     format_classify_prompt,
     format_distill_prompt,
     parse_classify_response,
@@ -18,10 +18,14 @@ from reduce_session.llm.prompts import (
 class GeminiProvider:
     def __init__(self, model: str) -> None:
         try:
-            from google import genai
+            google_module = importlib.import_module("google")
         except ImportError:
             raise RuntimeError(
                 "google-genai SDK not installed. pip install reduce-session[gemini]"
+            )
+        if not hasattr(google_module, "genai"):
+            raise RuntimeError(
+                "google-genai SDK not available. pip install reduce-session[gemini]"
             )
 
         key = os.environ.get("GEMINI_API_KEY")
@@ -31,6 +35,7 @@ class GeminiProvider:
                 "for the Gemini provider."
             )
 
+        genai = cast(Any, google_module).genai
         self._client = genai.Client(api_key=key)
         self._model = model
 

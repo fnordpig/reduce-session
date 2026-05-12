@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import os
+import importlib
+from typing import Any, cast
 
 from reduce_session.llm.base import Category
 from reduce_session.llm.prompts import (
     CLASSIFY_SYSTEM,
-    DISTILL_SUMMARIZE_SYSTEM,
-    DISTILL_STRIP_SYSTEM,
     format_classify_prompt,
     format_distill_prompt,
     parse_classify_response,
@@ -18,7 +18,7 @@ from reduce_session.llm.prompts import (
 class OpenAIProvider:
     def __init__(self, model: str) -> None:
         try:
-            import openai
+            openai_module = importlib.import_module("openai")
         except ImportError:
             raise RuntimeError(
                 "openai SDK not installed. pip install reduce-session[openai]"
@@ -31,7 +31,8 @@ class OpenAIProvider:
                 "for the OpenAI provider."
             )
 
-        self._client = openai.AsyncOpenAI(api_key=key)
+        openai_client = cast(Any, openai_module)
+        self._client = openai_client.AsyncOpenAI(api_key=key)
         self._model = model
 
     async def classify(self, exchanges: list[dict]) -> list[Category]:

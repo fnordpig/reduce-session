@@ -44,7 +44,10 @@ class TestSingleDuplicateAcrossTwoMessages:
         assert "duplicate content removed" in second
         assert "first seen earlier" in second
         assert stats["documents_deduped"] == 1
-        assert stats["document_dedup_bytes_saved"] >= 2000
+        # bytes_saved now reports actual savings (original - stub), not the
+        # original block size. Stub is ~130 bytes; 2000 - ~130 ≈ 1870.
+        assert stats["document_dedup_bytes_saved"] >= 1800
+        assert stats["document_dedup_bytes_saved"] < 2000
 
     def test_tool_result_block_replaced(self):
         objs = [

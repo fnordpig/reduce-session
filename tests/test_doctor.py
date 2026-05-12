@@ -131,7 +131,7 @@ class TestCompactionSummaries:
         result = diagnose_compaction_summaries(lines, str(path))
         stats = result.fix_fn(lines)
 
-        assert stats["summaries_grafted"] == 1
+        assert stats.summaries_grafted == 1
         # Summary is still present
         summary = next(l for l in lines if l.get("uuid") == "summary-1")
         assert summary["parentUuid"] == "u-1"
@@ -231,7 +231,7 @@ class TestParentChain:
 
         result = diagnose_parent_chain(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["parent_refs_reparented"] == 2
+        assert stats.parent_refs_reparented == 2
         # a-1 should now point to u-1 (nearest valid preceding)
         a1 = next(l for l in lines if l.get("uuid") == "a-1")
         assert a1["parentUuid"] == "u-1"
@@ -343,7 +343,9 @@ class TestStaleTokens:
 
         result = diagnose_stale_tokens(lines, str(path))
         stats = result.fix_fn(lines)
-        assert "usage_recalibrated" in stats
+        # Recalibration branch — only this field should be non-zero
+        assert stats.usage_recalibrated > 0
+        assert stats.usage_added == 0
         # Verify usage was recalibrated (not stripped)
         a1 = next(l for l in lines if l.get("uuid") == "a-1")
         usage = a1["message"]["usage"]
@@ -521,8 +523,8 @@ class TestBloatedTur:
 
         result = diagnose_bloated_tur(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["fields_truncated"] == 1
-        assert stats["bytes_saved"] > 0
+        assert stats.fields_truncated == 1
+        assert stats.bytes_saved > 0
         # Check content is now <= 2KB
         block = lines[0]["message"]["content"][0]
         assert len(block["content"]) <= 2048
@@ -695,7 +697,7 @@ class TestOrphanedToolResults:
 
         result = diagnose_orphaned_tool_results(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["orphaned_files_deleted"] == 1
+        assert stats.orphaned_files_deleted == 1
         assert not (results_dir / "orphan.txt").exists()
         assert (results_dir / "ref1.txt").exists()
 
@@ -734,8 +736,8 @@ class TestBugFixes:
         assert result.severity == "critical"
         stats = result.fix_fn(lines)
         # Grafted count is 0 — it's a natural root
-        assert stats["summaries_grafted"] == 0
-        assert stats["natural_roots"] == 1
+        assert stats.summaries_grafted == 0
+        assert stats.natural_roots == 1
         # parentUuid must remain None
         assert lines[0]["parentUuid"] is None
 
@@ -766,7 +768,7 @@ class TestBugFixes:
         assert lines[0]["parentUuid"] == "NONEXISTENT"
         # a-1 already points to a valid uuid — nothing changed
         assert lines[1]["parentUuid"] == "u-1"
-        assert stats["parent_refs_reparented"] == 0
+        assert stats.parent_refs_reparented == 0
 
     def test_overlapping_files_has_fix_fn(self, tmp_path):
         """Bug 3: diagnose_overlapping_files must provide a fix_fn."""
@@ -789,7 +791,7 @@ class TestBugFixes:
         assert result.fix_fn is not None
 
         stats = result.fix_fn(lines)
-        assert stats["continuation_files_renamed"] >= 1
+        assert stats.continuation_files_renamed >= 1
         # .bak2 should exist, original continuation should be gone
         assert not cont.exists()
         assert (tmp_path / f"{session_uuid}.1.jsonl.bak2").exists()
@@ -885,7 +887,7 @@ class TestCorruptedToolUse:
         path.write_text(json.dumps(lines[0]))
         result = diagnose_corrupted_tool_use(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["corrupted_tool_use_fixed"] == 1
+        assert stats.corrupted_tool_use_fixed == 1
         block = lines[0]["message"]["content"][0]
         assert block["name"] == "Bash"
 
@@ -917,7 +919,7 @@ class TestCorruptedToolUse:
         path.write_text(json.dumps(lines[0]))
         result = diagnose_corrupted_tool_use(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["corrupted_tool_use_dropped"] == 1
+        assert stats.corrupted_tool_use_dropped == 1
         assert lines[0]["message"]["content"] == []
 
 
@@ -1025,7 +1027,7 @@ class TestCorruptedContentBlocks:
         path.write_text(json.dumps(lines[0]))
         result = diagnose_corrupted_content_blocks(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["corrupted_blocks_dropped"] == 1
+        assert stats.corrupted_blocks_dropped == 1
         # text block remains
         content = lines[0]["message"]["content"]
         assert len(content) == 1
@@ -1112,7 +1114,7 @@ class TestCycleInParentChain:
         path.write_text("\n".join(json.dumps(l) for l in lines))
         result = diagnose_cycle_in_parent_chain(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["cycles_severed"] == 1
+        assert stats.cycles_severed == 1
         # After fix, neither uuid should point to the other in a cycle
         uuid_map = {l["uuid"]: l["parentUuid"] for l in lines}
         a_parent = uuid_map["a"]
@@ -1226,7 +1228,7 @@ class TestNullParentUuidAtNonRoot:
         path.write_text("\n".join(json.dumps(l) for l in lines))
         result = diagnose_null_parentUuid_at_non_root(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["null_parentUuid_reparented"] == 1
+        assert stats.null_parentUuid_reparented == 1
         assert lines[1]["parentUuid"] == "u-1"
 
 
@@ -1270,7 +1272,7 @@ class TestStaleBackups:
 
         result = diagnose_stale_backups([], str(path))
         stats = result.fix_fn([])
-        assert stats["stale_backups_deleted"] == 2
+        assert stats.stale_backups_deleted == 2
         assert not bak1.exists()
         assert not bak2.exists()
 
@@ -1327,18 +1329,27 @@ class TestOversizedSessions:
 
 class TestCliDoctor:
     def _write_clean_session(self, path):
+        # Canonical Claude Code shape: content is a list of blocks. The
+        # ``mixed_content_format`` diagnostic legitimately flags bare-string
+        # content (a real corruption signal), so "clean" must mean canonical.
         lines = [
             {
                 "type": "user",
                 "uuid": "u-1",
                 "parentUuid": None,
-                "message": {"content": "Hello"},
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Hello"}],
+                },
             },
             {
                 "type": "assistant",
                 "uuid": "a-1",
                 "parentUuid": "u-1",
-                "message": {"content": "Hi"},
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "Hi"}],
+                },
             },
         ]
         path.write_text("\n".join(json.dumps(l) for l in lines) + "\n")
@@ -1513,7 +1524,7 @@ class TestProtectedTypeSurvival:
         assert result.fix_fn is not None
 
         stats = result.fix_fn(objs)
-        assert stats["protected_restored"] == 1
+        assert stats.protected_restored == 1
 
         # The compact summary must now be present in objs
         uuids = [o.get("uuid") for o in objs]
@@ -1650,7 +1661,7 @@ class TestMixedContentFormat:
 
         result = diagnose_mixed_content_format(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["content_normalized"] == 2
+        assert stats.content_normalized == 2
 
         # Both messages should now have list content
         for obj in lines:
@@ -1677,7 +1688,7 @@ class TestMixedContentFormat:
 
         result = diagnose_mixed_content_format(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["content_normalized"] == 1
+        assert stats.content_normalized == 1
         assert lines[0]["message"]["content"] == []
 
     def test_sparkline_length_matches_lines(self, tmp_path):
@@ -1865,7 +1876,7 @@ class TestMetadataBetweenSameRole:
 
         result = diagnose_metadata_between_same_role(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["metadata_between_dropped"] == 1
+        assert stats.metadata_between_dropped == 1
 
         # The file-history-snapshot should be gone
         types = [obj["type"] for obj in lines]
@@ -1919,7 +1930,7 @@ class TestMetadataBetweenSameRole:
         result = diagnose_metadata_between_same_role(lines, str(path))
         assert result.severity == "warning"
         stats = result.fix_fn(lines)
-        assert stats["metadata_between_dropped"] == 2
+        assert stats.metadata_between_dropped == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2069,7 +2080,7 @@ class TestApiErrorArtifacts:
 
         result = diagnose_api_error_artifacts(lines, str(path))
         stats = result.fix_fn(lines)
-        assert stats["api_errors_dropped"] == 2
+        assert stats.api_errors_dropped == 2
 
         # Error messages should be gone
         uuids = [obj.get("uuid") for obj in lines]
@@ -2142,7 +2153,7 @@ class TestApiErrorArtifacts:
         assert result.severity == "critical"
         assert "3 API error" in result.summary
         stats = result.fix_fn(lines)
-        assert stats["api_errors_dropped"] == 3
+        assert stats.api_errors_dropped == 3
 
 
 # ---------------------------------------------------------------------------
