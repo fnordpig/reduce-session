@@ -8,6 +8,9 @@ Options:
   --cut PCT          Start of gentle-to-aggressive ramp (default: 10)
   --fade PCT         Start of aggressive-to-gentle ramp (default: 75)
   --profile NAME     Preset: gentle, standard (default), aggressive
+  --format NAME      Session format: auto, claude, codex
+  --validate-schema  Validate normalized records against schema
+  --schema-path      Explicit schema path
   --dry-run          Analyze only, don't write output
   --apply            Replace original with reduced (backs up to .bak first)
   --restore          Restore from most recent .bak file
@@ -21,6 +24,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 from reduce_session.git_ops import (
     do_apply,
@@ -75,41 +79,15 @@ def _load_session_lines(session_path: str) -> list[dict]:
 
 
 def _run_all_checks(lines: list[dict], session_path: str):
-    """Run all diagnostic checks and return results."""
-    from reduce_session.doctor import (
-        diagnose_bloated_tur,
-        diagnose_compaction_summaries,
-        diagnose_corrupted_content_blocks,
-        diagnose_corrupted_tool_use,
-        diagnose_cycle_in_parent_chain,
-        diagnose_null_parentUuid_at_non_root,
-        diagnose_orphaned_tool_results,
-        diagnose_overlapping_files,
-        diagnose_oversized_sessions,
-        diagnose_parent_chain,
-        diagnose_reduce_tags,
-        diagnose_stale_backups,
-        diagnose_stale_tokens,
-        diagnose_unreduced_metadata,
-    )
+    """Run all diagnostic checks and return results.
 
-    checks = [
-        diagnose_compaction_summaries,
-        diagnose_corrupted_tool_use,
-        diagnose_corrupted_content_blocks,
-        diagnose_parent_chain,
-        diagnose_cycle_in_parent_chain,
-        diagnose_null_parentUuid_at_non_root,
-        diagnose_stale_tokens,
-        diagnose_overlapping_files,
-        diagnose_unreduced_metadata,
-        diagnose_reduce_tags,
-        diagnose_bloated_tur,
-        diagnose_orphaned_tool_results,
-        diagnose_stale_backups,
-        diagnose_oversized_sessions,
-    ]
-    return [check(lines, session_path) for check in checks]
+    Uses the single canonical registry; previously this had its own
+    hand-rolled list that was missing api_error_artifacts,
+    mixed_content_format, metadata_between_same_role, and
+    protected_type_survival — those checks silently never fired from CLI."""
+    from reduce_session.doctor import ALL_DIAGNOSTICS
+
+    return [check(lines, session_path) for check in ALL_DIAGNOSTICS]
 
 
 def _print_doctor_results(results, fixed_names: set[str] | None = None) -> None:
@@ -123,10 +101,12 @@ def _print_doctor_results(results, fixed_names: set[str] | None = None) -> None:
 
 
 def _doctor_exit_code(results) -> int:
+    from reduce_session.doctor import Severity
+
     severities = {r.severity for r in results}
-    if "critical" in severities:
+    if Severity.CRITICAL in severities:
         return _EXIT_CRITICAL
-    if "warning" in severities:
+    if Severity.WARNING in severities:
         return _EXIT_WARN
     return _EXIT_OK
 
@@ -186,6 +166,19 @@ def cmd_doctor(session_path: str, fix: bool) -> int:
     return _doctor_exit_code(results_after)
 
 
+def _resolve_schema_path(session_format: str | None) -> str | None:
+    """Resolve a default schema path for the given explicit format."""
+    if session_format in (None, "auto"):
+        return None
+    base = Path(__file__).resolve().parent.parent.parent / "schemas"
+    mapping = {"claude": "claude.json", "codex": "codex_session_schema.json"}
+    file_name = mapping.get(session_format)
+    if file_name is None:
+        return None
+    candidate = base / file_name
+    return str(candidate) if candidate.exists() else None
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Reduce Claude Code session JSONL")
     p.add_argument("input", nargs="?", default=None, help="Path to session JSONL file")
@@ -196,6 +189,11 @@ def parse_args():
     )
     p.add_argument(
         "--tokens", action="store_true", help="Print token estimate by category"
+    )
+    p.add_argument(
+        "--compare-formats",
+        action="store_true",
+        help="Compare Claude vs Codex reduction using this same input",
     )
     p.add_argument(
         "--cut",
@@ -214,6 +212,27 @@ def parse_args():
         choices=["gentle", "standard", "aggressive"],
         default="standard",
         help="Limit preset (default: standard)",
+    )
+    p.add_argument(
+        "--format",
+        choices=["auto", "claude", "codex"],
+        default="auto",
+        help="Session format: auto-detect or force claude/codex",
+    )
+    p.add_argument(
+        "--validate-schema",
+        action="store_true",
+        help="Validate normalized records against format schema after parsing",
+    )
+    p.add_argument(
+        "--validate-schema-strict",
+        action="store_true",
+        help="Treat schema issues as hard errors (exit code 1)",
+    )
+    p.add_argument(
+        "--schema-path",
+        default=None,
+        help="JSON schema path to validate against (defaults by format when auto-detect is off)",
     )
     p.add_argument(
         "--dry-run", action="store_true", help="Analyze only, don't write output"
@@ -358,6 +377,200 @@ def _print_history(result):
     )
 
 
+def _token_totals(result, chars_per_token: float) -> tuple[int, int]:
+    orig_tokens = (
+        int(result.orig_budget.context_total)
+        if result.orig_budget is not None
+        else int(result.orig_size / max(chars_per_token, 0.1))
+    )
+    reduced_tokens = (
+        int(result.reduced_budget.context_total)
+        if result.reduced_budget is not None
+        else int(result.new_size / max(chars_per_token, 0.1))
+    )
+    return orig_tokens, reduced_tokens
+
+
+def _print_token_summary(result, chars_per_token: float) -> None:
+    orig_tokens, reduced_tokens = _token_totals(result, chars_per_token)
+    saved_tokens = orig_tokens - reduced_tokens
+    saved_pct = (saved_tokens / orig_tokens * 100.0) if orig_tokens > 0 else 0.0
+
+    print(
+        f"Original: {orig_tokens:>12,} tokens   {result.orig_size / 1024 / 1024:.2f} MB"
+    )
+    print(
+        f"Reduced:  {reduced_tokens:>12,} tokens   {result.new_size / 1024 / 1024:.2f} MB"
+    )
+    print(f"Saved:    {saved_tokens:>12,} tokens  ({saved_pct:5.1f}%)")
+
+
+def _print_strategy_table(stats) -> None:
+    numeric_stats = {
+        k: v
+        for k, v in stats.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+    if not numeric_stats:
+        print("\nStrategies Applied:\n  (no reductions recorded)")
+        return
+
+    structural_keys = {
+        "paths_shortened",
+        "line_numbers_stripped",
+        "indentation_collapsed",
+        "code_minified",
+        "blank_lines_collapsed",
+        "non_ascii_stripped",
+        "document_dedup_chars_saved",
+        "documents_deduped",
+        "chars_dropped_stochastic",
+        "chars_saved_structural",
+        "age_tool_results_minified",
+        "age_tool_results_diff_collapsed",
+        "age_tool_results_stubbed",
+        "age_tool_results_bytes_saved",
+        "rle_chars_saved",
+        "rle_chars_saved",
+    }
+
+    semantic_keys = {
+        "passing_builds_collapsed",
+        "confirmations_removed",
+        "stale_reads_promoted",
+        "superseded_edits_summarized",
+        "blind_edits_detected",
+    }
+
+    llm_keys = {
+        "llm_classified",
+        "llm_classified_keep",
+        "llm_classified_distill",
+        "llm_classified_heuristic",
+        "llm_distilled",
+        "llm_scaffold_stripped",
+        "llm_chars_saved",
+        "llm_tool_results_distilled",
+    }
+
+    message_keys = {
+        "compact_boundary_found",
+        "compact_collapse_drops",
+        "compact_collapse_bytes",
+        "reads_deduped",
+        "dup_system",
+        "error_retries_collapsed",
+        "file_history_snapshots_deduped",
+        "file_history_deduped",
+        "http_spam_collapsed",
+        "images_stripped",
+        "mega_blocks_trimmed",
+        "queue-operation",
+        "queue_operation",
+        "local_cmd_noise",
+        "task_notification",
+        "user_prompt_trimmed",
+        "document_dedup_bytes_saved",
+        "duplicate_blocks_detected",
+        "meta_prompts_removed",
+        "metadata_fields_stripped",
+        "envelope_fields_stripped",
+        "envelope_bytes_saved",
+        "attribution_snapshots_stripped",
+        "reparented",
+        "stale_reads_detected",
+        "age_tool_results_stubbed",
+        "age_tool_results_bytes_saved",
+    }
+
+    def _print_group(title: str, keys: set[str]) -> None:
+        grouped = {
+            name: int(value)
+            for name, value in numeric_stats.items()
+            if name in keys and value > 0
+        }
+        if not grouped:
+            return
+        print(f"\n  {title}:")
+        for name, count in sorted(grouped.items(), key=lambda item: (-item[1], item[0])):
+            print(f"    {name.replace('_', ' '):<33} {count:>10,}")
+
+    print("\nStrategies Applied:")
+    _print_group("Message reduction", message_keys)
+    _print_group("Semantic elision (exchange-level)", semantic_keys)
+    _print_group("Structural compression (middle-out)", structural_keys)
+    _print_group("LLM compression", llm_keys)
+
+    remaining = {
+        name: int(value)
+        for name, value in numeric_stats.items()
+        if name not in structural_keys | semantic_keys | llm_keys | message_keys and value > 0
+    }
+    if remaining:
+        print("\n  Other:")
+        for name, count in sorted(remaining.items(), key=lambda item: (-item[1], item[0])):
+            print(f"    {name.replace('_', ' '):<33} {count:>10,}")
+
+
+def _print_format_comparison(args) -> None:
+    if args.format != "auto":
+        print(
+            "Error: --compare-formats requires --format auto.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    compare_formats = ("claude", "codex")
+    results = {}
+
+    for fmt in compare_formats:
+        results[fmt] = reduce_session(
+            args.input,
+            profile=args.profile,
+            cut=args.cut,
+            fade=args.fade,
+            chars_per_token=args.chars_per_token,
+            estimate_tokens=args.tokens,
+            llm_provider=None,
+            session_format=fmt,
+            validate_records=args.validate_schema,
+            schema_path=(
+                args.schema_path if args.schema_path else _resolve_schema_path(fmt)
+            ),
+            strict_schema_validation=args.validate_schema_strict,
+        )
+
+    print(f"Format comparison: {args.input}")
+    print(f"Profile: {args.profile}, cut={args.cut}%, fade={args.fade}%")
+    print()
+
+    for fmt in compare_formats:
+        result = results[fmt]
+        orig_tokens, reduced_tokens = _token_totals(result, args.chars_per_token)
+        saved_tokens = orig_tokens - reduced_tokens
+        saved_pct = (saved_tokens / orig_tokens * 100.0) if orig_tokens > 0 else 0.0
+        print(
+            f"{fmt:>6}: {result.stats.get('session_format', fmt)}"
+            f" | before {orig_tokens:>10,} | after {reduced_tokens:>10,}"
+            f" | saved {saved_tokens:>10,} ({saved_pct:5.1f}%)"
+        )
+        print(
+            f"  bytes: {result.orig_size / 1024 / 1024:6.2f} MB -> "
+            f"{result.new_size / 1024 / 1024:6.2f} MB"
+        )
+
+    claude_reduced = _token_totals(results["claude"], args.chars_per_token)[1]
+    codex_reduced = _token_totals(results["codex"], args.chars_per_token)[1]
+    delta = codex_reduced - claude_reduced
+    delta_pct = (
+        (delta / claude_reduced * 100.0) if claude_reduced > 0 else 0.0
+    )
+    print()
+    print(
+        f"Cross-format delta: Codex - Claude final tokens = {delta:+10,} ({delta_pct:+.1f}%)"
+    )
+
+
 def main():
     args = parse_args()
 
@@ -437,6 +650,10 @@ def main():
         _print_history(result)
         return
 
+    if args.compare_formats:
+        _print_format_comparison(args)
+        return
+
     result = reduce_session(
         INPUT,
         profile=args.profile,
@@ -445,26 +662,40 @@ def main():
         chars_per_token=args.chars_per_token,
         estimate_tokens=args.tokens,
         llm_provider=llm_provider,
+        session_format=None if args.format == "auto" else args.format,
+        validate_records=args.validate_schema,
+        schema_path=args.schema_path
+        if args.schema_path
+        else _resolve_schema_path(None if args.format == "auto" else args.format),
+        strict_schema_validation=args.validate_schema_strict,
     )
+
+    if args.validate_schema and args.validate_schema_strict and result.stats.get(
+        "schema_errors", 0
+    ):
+        print(
+            f"Schema validation failed in strict mode: "
+            f"{result.stats.get('schema_errors', 0)} error(s).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if not args.dry_run:
         with open(OUTPUT, "w") as f:
             f.writelines(result.kept_lines)
 
-    saved = result.orig_size - result.new_size
-    print(
-        f"Original: {result.orig_count:,} lines, {result.orig_size / 1024 / 1024:.2f} MB"
-    )
-    print(
-        f"Reduced:  {result.new_count:,} lines, {result.new_size / 1024 / 1024:.2f} MB"
-    )
-    print(
-        f"Saved:    {result.orig_count - result.new_count:,} lines, {saved / 1024 / 1024:.2f} MB ({saved / result.orig_size * 100:.1f}%)"
-    )
+    _print_token_summary(result, args.chars_per_token)
     print(f"Profile:  {args.profile}, cut={args.cut}%, fade={args.fade}%")
     print()
-    for reason, count_val in sorted(result.stats.items(), key=lambda x: -x[1]):
+    numeric_items = []
+    for reason, count_val in result.stats.items():
+        if isinstance(count_val, (int, float)):
+            numeric_items.append((reason, count_val))
+
+    for reason, count_val in sorted(numeric_items, key=lambda item: item[1], reverse=True):
         print(f"  {reason}: {count_val}")
+
+    _print_strategy_table(result.stats)
 
     if result.orig_budget and result.reduced_budget:
         print(result.orig_budget.report(reduced_chars=result.reduced_budget._raw_chars))

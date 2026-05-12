@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from reduce_session.llm.base import Category
+from reduce_session.typing_aliases import BlockType
 from reduce_session.llm.prompts import (
     CLASSIFY_SYSTEM,
-    DISTILL_SUMMARIZE_SYSTEM,
-    DISTILL_STRIP_SYSTEM,
     format_classify_prompt,
     format_distill_prompt,
     parse_classify_response,
@@ -16,6 +16,20 @@ from reduce_session.llm.prompts import (
 
 
 class AnthropicProvider:
+    @staticmethod
+    def _extract_text(content: list[Any]) -> str:
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == BlockType.TEXT:
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        return text
+                continue
+            text = getattr(block, "text", None)
+            if isinstance(text, str):
+                return text
+        return ""
+
     def __init__(self, model: str) -> None:
         try:
             import anthropic
@@ -42,7 +56,8 @@ class AnthropicProvider:
             messages=[{"role": "user", "content": user_text}],
             max_tokens=2048,
         )
-        return parse_classify_response(response.content[0].text, len(exchanges))
+        text = self._extract_text(response.content)  # type: ignore[arg-type]
+        return parse_classify_response(text, len(exchanges))
 
     async def distill(self, text: str, mode: str, category: str | None = None, profile: str = "standard") -> str:
         from reduce_session.llm.prompts import get_distill_prompts
@@ -57,7 +72,7 @@ class AnthropicProvider:
             messages=[{"role": "user", "content": user_text}],
             max_tokens=2048,
         )
-        result = response.content[0].text
+        result = self._extract_text(response.content)  # type: ignore[arg-type]
         if not result or len(result) > len(text):
             return text
         return result

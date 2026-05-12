@@ -10,8 +10,11 @@ from __future__ import annotations
 import json
 import math
 import os
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, cast
 
 from rich.style import Style
 from rich.text import Text
@@ -27,11 +30,12 @@ from .git_ops import (
     get_file_tail_at_tag,
     git_restore_from_tag,
     HistoryResult,
-    ReductionEntry,
 )
+from .session_formats import detect_codec
 from .invariants import atomic_write_jsonl, atomic_write_text
 from .reduction import ReductionResult, reduce_session
-from .session import Exchange, SessionInfo
+from .session import Exchange, SessionInfo, _extract_record_message, parse_tail, parse_tail_from_content
+from .typing_aliases import BlockType
 
 
 # --- Conversation Browser data model ---
@@ -55,85 +59,23 @@ class BrowseExchange:
     output_file: str | None = None  # persisted tool output path (tool-results/)
 
 
-def token_color(tokens: int) -> str:
-    """Return a color hex string based on token pressure."""
-    if tokens < 200_000:
-        return "#00d4aa"
-    if tokens < 500_000:
-        return "#ffd700"
-    if tokens < 800_000:
-        return "#ff8c00"
-    return "#ff4444"
-
-
-# Age color stops: (seconds_old, (r, g, b))
-# Ramps from bright green (fresh) through amber to dark brown (very old).
-# Luminance drops along the gradient so the ramp itself is the fadeout.
-_AGE_COLOR_STOPS: tuple[tuple[float, tuple[int, int, int]], ...] = (
-    (0, (0, 212, 170)),  # fresh: bright green
-    (3600, (90, 200, 130)),  # 1h: green
-    (86400, (180, 200, 80)),  # 1d: yellow-green
-    (7 * 86400, (170, 130, 60)),  # 1w: amber
-    (30 * 86400, (110, 70, 35)),  # 1mo: brown
-    (90 * 86400, (60, 40, 25)),  # 3mo+: dark brown
+from .formatting import (
+    age_color,
+    format_bytes as _format_size,
+    format_tokens as _format_tokens,
+    token_color,
 )
 
 
-def age_color(timestamp: datetime | None) -> str:
-    """Return a hex color from green (fresh) to brown (old).
-
-    Interpolates log-linearly between stops so that the perceptually
-    rapid early changes (minutes → hours) read as smoothly as the slower
-    late changes (weeks → months).
-    """
-    if timestamp is None:
-        return "#555555"
-    now = datetime.now(timezone.utc)
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-    seconds = max(0.0, (now - timestamp).total_seconds())
-
-    last_seconds, last_rgb = _AGE_COLOR_STOPS[-1]
-    if seconds >= last_seconds:
-        r, g, b = last_rgb
-        return f"#{r:02x}{g:02x}{b:02x}"
-
-    for (s0, c0), (s1, c1) in zip(_AGE_COLOR_STOPS, _AGE_COLOR_STOPS[1:]):
-        if s0 <= seconds < s1:
-            # Log-interpolate within the segment. log1p handles s0 == 0.
-            t = (math.log1p(seconds) - math.log1p(s0)) / (
-                math.log1p(s1) - math.log1p(s0)
-            )
-            t = max(0.0, min(1.0, t))
-            r = int(round(c0[0] + (c1[0] - c0[0]) * t))
-            g = int(round(c0[1] + (c1[1] - c0[1]) * t))
-            b = int(round(c0[2] + (c1[2] - c0[2]) * t))
-            return f"#{r:02x}{g:02x}{b:02x}"
-
-    r, g, b = _AGE_COLOR_STOPS[0][1]
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
-def _format_tokens(tokens: int) -> str:
-    """Format token count as a compact string like '950k' or '1.2M'."""
-    if tokens >= 1_000_000:
-        val = tokens / 1_000_000
-        return f"{val:.1f}M" if val != int(val) else f"{int(val)}M"
-    if tokens >= 1_000:
-        val = tokens / 1_000
-        return f"{int(val)}k" if val == int(val) else f"{val:.0f}k"
-    return str(tokens)
-
-
-def _format_size(size_bytes: int) -> str:
-    """Format byte size as compact string like '16.5 MB'."""
-    if size_bytes >= 1_000_000_000:
-        return f"{size_bytes / 1_000_000_000:.1f} GB"
-    if size_bytes >= 1_000_000:
-        return f"{size_bytes / 1_000_000:.1f} MB"
-    if size_bytes >= 1_000:
-        return f"{size_bytes / 1_000:.1f} KB"
-    return f"{size_bytes} B"
+def _numeric_stats(stats: dict[str, object] | object) -> dict[str, int]:
+    """Keep only numeric stats to avoid rendering/ordering crashes."""
+    if not isinstance(stats, dict):
+        return {}
+    return {
+        cast(str, k): int(v)
+        for k, v in stats.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
 
 
 def render_token_gauge(
@@ -430,9 +372,27 @@ class ReduceModal(ModalScreen[bool]):
         self._scaffold_reductions: list[
             float
         ] = []  # per-non-DISTILL-exchange reduction ratio
+        self._merged_session_path: str | None = None
         self._phase_start_time: float = 0.0  # monotonic time when current phase started
         self._last_phase: str = ""  # track phase transitions for ETA reset
         self._chars_per_token: float = 3.7  # calibrated from API usage when available
+
+    def _all_session_paths(self) -> list[Path]:
+        return self.session.all_paths(sort_by_mtime=True)
+
+    def _build_merged_session_file(self) -> str | None:
+        return self.session.merged_jsonl_tempfile()
+
+    @staticmethod
+    def _cleanup_merged_file(path: str | None, original: Path) -> None:
+        # Stateless wrapper for back-compat — delegates by reconstructing a
+        # minimal SessionInfo-shaped check (path comparison only).
+        if path is None or path == str(original):
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
     def compose(self) -> ComposeResult:
         title_suffix = " (dry-run)" if self.read_only else ""
@@ -527,9 +487,16 @@ class ReduceModal(ModalScreen[bool]):
         self.query_one("#cut-fade-display", Static).update(f"  cut={cut}% fade={fade}%")
 
         # Capture source mtime for staleness check
-        path = str(self.session.path)
+        path_obj = self.session.path
+        reduced_path = self._build_merged_session_file()
+        if reduced_path is None:
+            path = str(path_obj)
+        else:
+            path = reduced_path
+            self._merged_session_path = reduced_path
+
         try:
-            self.source_mtime = os.path.getmtime(path)
+            self.source_mtime = os.path.getmtime(path_obj)
         except OSError:
             self.source_mtime = None
 
@@ -539,6 +506,7 @@ class ReduceModal(ModalScreen[bool]):
                 path,
                 profile=profile,
                 estimate_tokens=True,
+                session_format=self.session.provider,
             ),
             thread=True,
             exclusive=True,
@@ -550,7 +518,6 @@ class ReduceModal(ModalScreen[bool]):
         self._savings_history = []
         self._distill_reductions = []
         self._scaffold_reductions = []
-        path = str(self.session.path)
 
         def progress_fn(data):
             """Called from worker thread -- post message to main thread."""
@@ -565,6 +532,12 @@ class ReduceModal(ModalScreen[bool]):
                 _llm_compression_pass,
                 make_aggressiveness_fn,
             )
+
+            if self.result is None:
+                return ({}, [])
+
+            if self.llm_spec is None:
+                return (self.result.stats, self.result.kept_lines)
 
             provider = create_provider(self.llm_spec)
 
@@ -638,6 +611,37 @@ class ReduceModal(ModalScreen[bool]):
             int(chars / self._chars_per_token) if self._chars_per_token > 0 else chars
         )
 
+    def _token_count_from_budget_or_size(
+        self,
+        budget: object | None,
+        size_bytes: int,
+        *,
+        prefer_budget: bool = True,
+    ) -> tuple[int, str]:
+        """Resolve token count from budget metadata with robust fallbacks.
+
+        Some session readers can generate empty budgets for atypical message
+        encodings (notably historical codex artifacts); in that case we
+        intentionally fall back to raw-char and byte-based estimates.
+        """
+        if budget is not None and prefer_budget:
+            context_total = getattr(budget, "context_total", None)
+            if isinstance(context_total, int) and context_total > 0:
+                return context_total, "budget"
+
+            raw_chars = int(getattr(budget, "_raw_chars", 0) or 0)
+            if raw_chars > 0:
+                api_tokens = getattr(budget, "api_tokens", None)
+                cpt = self._chars_per_token
+                if isinstance(api_tokens, int) and api_tokens > 0:
+                    cpt = raw_chars / api_tokens if raw_chars > 0 else cpt
+                return (
+                    int(raw_chars / cpt) if cpt > 0 else self._chars_to_tokens(raw_chars),
+                    "raw_chars",
+                )
+
+        return self._chars_to_tokens(size_bytes), "size_estimate"
+
     def _blend_colors(self, items: list[tuple]) -> str:
         """Blend category colors weighted by text size. Returns hex color."""
         if not items:
@@ -702,7 +706,7 @@ class ReduceModal(ModalScreen[bool]):
             results = self._classify_results
             total_exchanges = data.get("total", len(results))
 
-            text.append(f"Classifying ", style="bold")
+            text.append("Classifying ", style="bold")
             text.append(f"{current}/{total} ({pct}%)")
             if tps_str:
                 text.append(tps_str, style="#00d4aa")
@@ -939,7 +943,7 @@ class ReduceModal(ModalScreen[bool]):
 
         if chars:
             tokens = self._chars_to_tokens(chars)
-            text.append(f"\nTokens saved: ", style="bold")
+            text.append("\nTokens saved: ", style="bold")
             text.append(f"~{_format_tokens(tokens)}\n", style="#00d4aa bold")
 
         # Re-enable button
@@ -954,14 +958,29 @@ class ReduceModal(ModalScreen[bool]):
 
     def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         """Handle worker completion or failure."""
+        if event.worker is self._current_worker and event.state in {
+            WorkerState.SUCCESS,
+            WorkerState.ERROR,
+            WorkerState.CANCELLED,
+        }:
+            self._cleanup_merged_file(self._merged_session_path, self.session.path)
+            self._merged_session_path = None
+
         # LLM worker
         if event.worker is self._llm_worker:
             if event.state == WorkerState.SUCCESS:
-                llm_stats, new_lines = event.worker.result
+                llm_result = event.worker.result
+                if not isinstance(llm_result, tuple) or len(llm_result) != 2:
+                    self.query_one("#llm-distill-progress", Static).update(
+                        Text("LLM compression returned unexpected result", style="red")
+                    )
+                    return
+                llm_stats, new_lines = llm_result
                 # Update the result with LLM stats
+            if self.result is not None:
                 self.result.stats.update(llm_stats)
                 self.result.kept_lines = new_lines
-                self.result.new_size = sum(len(l) for l in new_lines)
+                self.result.new_size = sum(len(line) for line in new_lines)
                 self.result.new_count = len(new_lines)
                 self._render_results()  # re-render with LLM stats
                 self._render_llm_complete(llm_stats)
@@ -994,22 +1013,28 @@ class ReduceModal(ModalScreen[bool]):
         if r is None:
             return
 
+        orig_tokens, orig_token_source = self._token_count_from_budget_or_size(
+            r.orig_budget, r.orig_size
+        )
+        reduced_tokens, reduced_token_source = self._token_count_from_budget_or_size(
+            r.reduced_budget, r.new_size
+        )
+
         # -- Dry Run Stats --
-        saved_lines = r.orig_count - r.new_count
-        saved_size = r.orig_size - r.new_size
-        pct = (saved_size / r.orig_size * 100) if r.orig_size > 0 else 0.0
+        saved_tokens = orig_tokens - reduced_tokens
+        saved_pct = (saved_tokens / orig_tokens * 100.0) if orig_tokens > 0 else 0.0
 
         stats_text = Text()
         stats_text.append("── Dry Run Results ──\n", style="bold")
         stats_text.append(
-            f"Original:  {r.orig_count:>8,} lines   {_format_size(r.orig_size)}\n"
+            f"Original:  {orig_tokens:>10,} tokens   {_format_size(r.orig_size)}\n"
         )
         stats_text.append(
-            f"Reduced:   {r.new_count:>8,} lines   {_format_size(r.new_size)}\n"
+            f"Reduced:   {reduced_tokens:>10,} tokens   {_format_size(r.new_size)}\n"
         )
         stats_text.append(
-            f"Saved:     {saved_lines:>8,} lines   {_format_size(saved_size)}  ({pct:.0f}%)",
-            style="bold #00d4aa" if pct > 0 else "",
+            f"Saved:     {saved_tokens:>10,} tokens   ({saved_pct:.0f}%)",
+            style="bold #00d4aa" if saved_pct > 0 else "",
         )
         self.query_one("#dry-run-stats", Static).update(stats_text)
 
@@ -1017,17 +1042,34 @@ class ReduceModal(ModalScreen[bool]):
         token_text = Text()
         token_text.append("── Token Estimate ──\n", style="bold")
 
-        if r.orig_budget is not None and r.reduced_budget is not None:
-            # Calculate token estimates
-            orig_tokens = r.orig_budget.context_total
-            reduced_tokens = r.reduced_budget.context_total
+        if (r.orig_budget is not None or r.reduced_budget is not None):
+            # Recompute once for consistency, especially when budgets are sparse.
+            orig_tokens, orig_token_source = self._token_count_from_budget_or_size(
+                r.orig_budget, r.orig_size
+            )
+            reduced_tokens, reduced_token_source = self._token_count_from_budget_or_size(
+                r.reduced_budget, r.new_size
+            )
 
             # Calibrate if API data available
-            if r.api_tokens and r.orig_budget._raw_chars > 0:
+            if (
+                r.orig_budget is not None
+                and r.api_tokens
+                and getattr(r.orig_budget, "_raw_chars", 0) > 0
+            ):
                 cpt = r.orig_budget._raw_chars / r.api_tokens
                 self._chars_per_token = cpt  # cache for LLM progress display
-                orig_tokens = int(r.orig_budget._raw_chars / cpt)
-                reduced_tokens = int(r.reduced_budget._raw_chars / cpt)
+                if r.orig_budget is not None and getattr(r.orig_budget, "_raw_chars", 0) > 0:
+                    orig_tokens = int(r.orig_budget._raw_chars / cpt)
+                if r.reduced_budget is not None and getattr(r.reduced_budget, "_raw_chars", 0) > 0:
+                    reduced_tokens = int(r.reduced_budget._raw_chars / cpt)
+
+            if orig_token_source in ("budget_zero", "size_estimate"):
+                orig_tokens = self._chars_to_tokens(r.orig_size)
+                orig_token_source = "size_estimate"
+            if reduced_token_source in ("budget_zero", "size_estimate"):
+                reduced_tokens = self._chars_to_tokens(r.new_size)
+                reduced_token_source = "size_estimate"
 
             max_tok = 1_000_000
             before_gauge = render_token_gauge(orig_tokens, max_tok)
@@ -1038,6 +1080,10 @@ class ReduceModal(ModalScreen[bool]):
             token_text.append("\n")
             token_text.append("After:  ")
             token_text.append_text(after_gauge)
+            token_text.append(
+                f"\n  Sources: before={orig_token_source}, after={reduced_token_source}",
+                style="dim",
+            )
 
             if orig_tokens > max_tok and reduced_tokens <= max_tok:
                 token_text.append(
@@ -1075,6 +1121,8 @@ class ReduceModal(ModalScreen[bool]):
                 "code_minified",
                 "blank_lines_collapsed",
                 "non_ascii_stripped",
+                "document_dedup_chars_saved",
+                "documents_deduped",
                 "chars_dropped_stochastic",
                 "chars_saved_structural",
             }
@@ -1094,17 +1142,30 @@ class ReduceModal(ModalScreen[bool]):
                 "llm_chars_saved",
             }
             excluded = structural_keys | semantic_keys | llm_keys
-            msg_stats = {k: v for k, v in r.stats.items() if k not in excluded}
+            msg_stats = {
+                k: v
+                for k, v in _numeric_stats(r.stats).items()
+                if isinstance(k, str) and k not in excluded
+            }
             struct_stats = {
-                k: v for k, v in r.stats.items() if k in structural_keys and v > 0
+                k: v
+                for k, v in _numeric_stats(r.stats).items()
+                if isinstance(k, str) and k in structural_keys and v > 0
             }
             sem_stats = {
-                k: v for k, v in r.stats.items() if k in semantic_keys and v > 0
+                k: v
+                for k, v in _numeric_stats(r.stats).items()
+                if isinstance(k, str) and k in semantic_keys and v > 0
             }
 
             if msg_stats:
                 strat_text.append("\n  Message reduction:\n", style="bold dim")
-                for name, count in sorted(msg_stats.items(), key=lambda x: -x[1]):
+                for name, count in sorted(
+                    msg_stats.items(),
+                    key=lambda item: -int(item[1])
+                    if isinstance(item[1], (int, float)) and not isinstance(item[1], bool)
+                    else 0,
+                ):
                     label = name.replace("_", " ")
                     strat_text.append(f"    {label:<33s} {count:>6,}\n")
 
@@ -1112,11 +1173,20 @@ class ReduceModal(ModalScreen[bool]):
                 strat_text.append(
                     "\n  Semantic elision (exchange-level):\n", style="bold dim"
                 )
-                for name, count in sorted(sem_stats.items(), key=lambda x: -x[1]):
+                for name, count in sorted(
+                    sem_stats.items(),
+                    key=lambda item: -int(item[1])
+                    if isinstance(item[1], (int, float)) and not isinstance(item[1], bool)
+                    else 0,
+                ):
                     label = name.replace("_", " ")
                     strat_text.append(f"    {label:<33s} {count:>6,}\n")
 
-            llm_stats = {k: v for k, v in r.stats.items() if k in llm_keys and v}
+            llm_stats = {
+                k: v
+                for k, v in _numeric_stats(r.stats).items()
+                if k in llm_keys and v
+            }
             if llm_stats:
                 classified = llm_stats.get("llm_classified", 0)
                 keep_n = llm_stats.get("llm_classified_keep", 0)
@@ -1148,7 +1218,7 @@ class ReduceModal(ModalScreen[bool]):
                     strat_text.append(f"    scaffold stripped   {stripped:>6,}\n")
                 if llm_chars_saved:
                     llm_tokens = self._chars_to_tokens(llm_chars_saved)
-                    strat_text.append(f"    tokens saved     ", style="dim")
+                    strat_text.append("    tokens saved     ", style="dim")
                     strat_text.append(
                         f"~{_format_tokens(llm_tokens):>7s}\n", style="#00d4aa bold"
                     )
@@ -1159,14 +1229,22 @@ class ReduceModal(ModalScreen[bool]):
                 )
                 # Show tokens saved prominently
                 chars_saved = struct_stats.pop("chars_saved_structural", 0)
-                for name, count in sorted(struct_stats.items(), key=lambda x: -x[1]):
+                for name, count in sorted(
+                    struct_stats.items(),
+                    key=lambda item: -int(item[1])
+                    if isinstance(item[1], (int, float)) and not isinstance(item[1], bool)
+                    else 0,
+                ):
+                    if not isinstance(count, int):
+                        continue
                     label = name.replace("_", " ")
                     strat_text.append(f"    {label:<33s} {count:>6,}\n")
                 if chars_saved:
                     tokens_saved = self._chars_to_tokens(chars_saved)
                     strat_text.append(f"    {'tokens saved':<33s} ", style="dim")
                     strat_text.append(
-                        f"~{_format_tokens(tokens_saved):>7s}\n", style="#00d4aa bold"
+                        f"~{_format_tokens(tokens_saved):>7s}\n",
+                        style="#00d4aa bold",
                     )
         else:
             strat_text.append("  (no reductions applied)", style="dim")
@@ -1356,6 +1434,21 @@ class HistoryModal(ModalScreen[bool]):
                 yield Button("Restore", variant="warning", id="btn-restore")
                 yield Button("Close", variant="default", id="btn-close")
 
+    def _all_session_paths(self) -> list[Path]:
+        return self.session.all_paths()
+
+    def _build_merged_session_file(self) -> str | None:
+        return self.session.merged_jsonl_tempfile()
+
+    @staticmethod
+    def _cleanup_merged_file(path: str | None, original: Path) -> None:
+        if path is None or path == str(original):
+            return
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
     def on_mount(self) -> None:
         self._load_history()
 
@@ -1363,7 +1456,6 @@ class HistoryModal(ModalScreen[bool]):
         from textual.widgets import OptionList
         from textual.widgets.option_list import Option
 
-        project_dir = str(self.session.path.parent)
         self.history = do_history(str(self.session.path))
         option_list = self.query_one("#version-list", OptionList)
 
@@ -1401,7 +1493,6 @@ class HistoryModal(ModalScreen[bool]):
                         or f"After reduction ({entry.ts_display})",
                     }
                 )
-                size_str = _format_size(entry.post_size) if entry.post_size else "?"
                 saved = ""
                 if entry.saved_pct is not None:
                     saved = f" (-{entry.saved_pct:.0f}%)"
@@ -1481,8 +1572,6 @@ class HistoryModal(ModalScreen[bool]):
 
     def _preview_version(self, idx: int) -> None:
         """Load and display conversation preview for a version."""
-        from .session import parse_tail, parse_tail_from_content
-
         version = self._versions[idx]
         info_widget = self.query_one("#history-info", Static)
         conv_widget = self.query_one("#history-conversation", Static)
@@ -1499,7 +1588,15 @@ class HistoryModal(ModalScreen[bool]):
         # Get conversation preview
         if version.get("is_current"):
             # Read from the actual file
-            exchanges, _, _ = parse_tail(self.session.path)
+            merged_path = self._build_merged_session_file()
+            source_path = str(self.session.path)
+            if merged_path is None:
+                path_for_preview = source_path
+            else:
+                path_for_preview = merged_path
+
+            exchanges, _, _ = parse_tail(Path(path_for_preview))
+            self._cleanup_merged_file(merged_path, self.session.path)
         elif version.get("tag"):
             # Read from git
             project_dir = str(self.session.path.parent)
@@ -1671,13 +1768,15 @@ class DoctorModal(ModalScreen[bool]):
         return [fn(lines, self.session_path) for fn in ALL_DIAGNOSTICS]
 
     def _run_diagnostics(self) -> None:
+        from reduce_session.doctor import Severity
+
         lines = self._load_lines()
         diagnostics = self._run_all(lines)
         self._diagnostics = diagnostics
 
         # Auto-select all fixable critical/warning items
         for i, d in enumerate(diagnostics):
-            if d.fix_fn and d.severity in ("critical", "warning"):
+            if d.fix_fn and d.severity in (Severity.CRITICAL, Severity.WARNING):
                 self._selected.add(i)
 
         # Place cursor on first fixable item
@@ -1863,8 +1962,6 @@ class DoctorModal(ModalScreen[bool]):
         self.run_worker(self._do_apply, thread=True)
 
     def _do_apply(self) -> None:
-        import json
-        import os
         from pathlib import Path
 
         from reduce_session.doctor import apply_fixes
@@ -2003,126 +2100,212 @@ _BROWSER_SKIP_TYPES = frozenset(
 )
 
 
-def parse_browse_exchanges(path: str) -> list[BrowseExchange]:
+from .session import _normalize_session_record  # noqa: E402  — re-export
+
+
+def _extract_text_from_payload_block(block: object) -> str:
+    """Extract plain text from a block used by the browser parser."""
+    if isinstance(block, str):
+        return block.strip()
+    if not isinstance(block, dict):
+        return ""
+    typed_block = cast(dict[str, Any], block)
+    if typed_block.get("type") == BlockType.THINKING:
+        return ""
+
+    for key in ("text", "content", "assistant", "input"):
+        value = typed_block.get(key)
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, dict):
+                    text = _extract_text_from_payload_block(item)
+                    if text:
+                        parts.append(text)
+                elif isinstance(item, str):
+                    parts.append(item.strip())
+            if parts:
+                return "\n".join(parts).strip()
+    return ""
+
+
+def _coerce_text_field(payload: object, key: str) -> str | None:
+    """Safely coerce a string field from arbitrary payload objects."""
+    if not isinstance(payload, dict):
+        return None
+    typed_payload = cast(dict[str, Any], payload)
+    value = typed_payload.get(key)
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped if stripped else None
+    return None
+
+
+def _coerce_bool_field(payload: object, key: str) -> bool:
+    """Safely coerce bool-like values from arbitrary payloads."""
+    if not isinstance(payload, dict):
+        return False
+    typed_payload = cast(dict[str, Any], payload)
+    value = typed_payload.get(key)
+    return bool(value)
+
+
+def parse_browse_exchanges(paths: str | list[str]) -> list[BrowseExchange]:
     """Parse a full JSONL file into BrowseExchange objects.
 
     Runs in a worker thread. Extracts role, text preview, _reduce tags,
     and token size for each meaningful line.
     """
     exchanges: list[BrowseExchange] = []
-    try:
-        with open(path, "r", errors="replace") as f:
-            for line_idx, raw in enumerate(f):
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    obj = json.loads(raw)
-                except (json.JSONDecodeError, ValueError):
-                    continue
+    file_paths = [paths] if isinstance(paths, str) else [str(path) for path in paths]
+    for path in file_paths:
+        try:
+            with open(path, "r", errors="replace") as f:
+                for line_idx, raw in enumerate(f):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
 
-                if not isinstance(obj, dict):
-                    continue
+                    obj = _normalize_session_record(obj)
+                    if not isinstance(obj, dict):
+                        continue
 
-                rtype = obj.get("type", "")
-                if rtype in _BROWSER_SKIP_TYPES:
-                    continue
+                    rtype = obj.get("type", "")
+                    if rtype in _BROWSER_SKIP_TYPES:
+                        continue
 
-                msg = obj.get("message", {})
-                if not isinstance(msg, dict):
-                    continue
+                    msg = _extract_record_message(obj)
+                    if not isinstance(msg, dict) or not msg:
+                        continue
 
-                content = msg.get("content")
-                role = _browser_extract_role(obj, msg)
-                full_text = ""
-                tool_name = None
-                is_error = False
+                    content = msg.get("content")
+                    role = _browser_extract_role(obj, msg)
+                    full_text = ""
+                    tool_name = None
+                    is_error = False
 
-                if isinstance(content, str):
-                    full_text = content.strip()
-                elif isinstance(content, list):
-                    parts: list[str] = []
-                    for block in content:
-                        if not isinstance(block, dict):
-                            continue
-                        btype = block.get("type", "")
-                        if btype == "thinking":
-                            continue
-                        if btype == "text":
-                            parts.append(block.get("text", ""))
-                        elif btype == "tool_use":
-                            name = block.get("name", "unknown")
-                            inp = block.get("input", {})
-                            desc = _browser_tool_use_desc(name, inp)
-                            parts.append(f"[{name}: {desc}]")
-                            tool_name = name
-                        elif btype == "tool_result":
-                            tc = block.get("content", "")
-                            is_error = block.get("is_error", False)
-                            if isinstance(tc, str):
-                                parts.append(tc[:200])
-                            elif isinstance(tc, list):
-                                for item in tc:
-                                    if (
-                                        isinstance(item, dict)
-                                        and item.get("type") == "text"
-                                    ):
-                                        parts.append(item.get("text", "")[:200])
-                    full_text = "\n".join(parts).strip()
+                    if isinstance(content, str):
+                        full_text = content.strip()
+                    elif isinstance(content, list):
+                        parts: list[str] = []
+                        for block in content:
+                            if isinstance(block, str):
+                                text = block.strip()
+                                if text:
+                                    parts.append(text)
+                                continue
+                            if not isinstance(block, dict):
+                                continue
+                            typed_block = cast(dict[str, Any], block)
+                            btype = str(typed_block.get("type", ""))
+                            if btype == "thinking":
+                                continue
+                            if btype == "tool_use":
+                                name = str(typed_block.get("name", "unknown"))
+                                inp = typed_block.get("input", {})
+                                if not isinstance(inp, dict):
+                                    inp = {}
+                                desc = _browser_tool_use_desc(name, inp)
+                                parts.append(f"[{name}: {desc}]")
+                                tool_name = name
+                            elif btype == "tool_result":
+                                tc = typed_block.get("content", "")
+                                is_error = bool(typed_block.get("is_error", False))
+                                if isinstance(tc, str):
+                                    parts.append(tc[:200])
+                                elif isinstance(tc, list):
+                                    for item in tc:
+                                        item_text = _extract_text_from_payload_block(item)
+                                        if item_text:
+                                            parts.append(item_text[:200])
+                                elif isinstance(tc, dict):
+                                    item_text = _extract_text_from_payload_block(tc)
+                                    if item_text:
+                                        parts.append(item_text[:200])
+                            else:
+                                text = _extract_text_from_payload_block(block)
+                                if text:
+                                    parts.append(text)
+                        full_text = "\n".join(parts).strip()
 
-                if not full_text:
-                    continue
+                    elif isinstance(content, dict):
+                        text = _extract_text_from_payload_block(content)
+                        if text:
+                            full_text = text
 
-                text = full_text[:200]
+                    if not full_text:
+                        continue
 
-                # Extract _reduce tag
-                reduce_tag = obj.get("_reduce", {})
-                ontology_class = None
-                reduce_route = None
-                is_structural = False
-                is_distilled = False
-                if isinstance(reduce_tag, dict):
-                    ontology_class = reduce_tag.get("cls")
-                    reduce_route = reduce_tag.get("route")
-                    is_structural = reduce_tag.get("structural", False)
-                    is_distilled = reduce_tag.get("distilled", False)
+                    text = full_text[:200]
 
-                token_size = len(json.dumps(obj)) // 4
+                    # Extract _reduce tag
+                    reduce_tag = obj.get("_reduce", {})
+                    ontology_class = None
+                    reduce_route = None
+                    is_structural = False
+                    is_distilled = False
+                    if isinstance(reduce_tag, dict):
+                        tag_dict: dict[str, Any] = cast(dict[str, Any], reduce_tag)
+                        ontology_class = tag_dict.get("cls")
+                        reduce_route = tag_dict.get("route")
+                        is_structural = tag_dict.get("structural", False)
+                        is_distilled = tag_dict.get("distilled", False)
+                    elif reduce_tag is not None:
+                        # Preserve compatibility with older/future payload shapes.
+                        cls = _coerce_text_field(reduce_tag, "cls")
+                        if cls is not None:
+                            ontology_class = cls
+                        route = _coerce_text_field(reduce_tag, "route")
+                        if route is not None:
+                            reduce_route = route
+                        is_structural = bool(_coerce_bool_field(reduce_tag, "structural"))
+                        is_distilled = bool(_coerce_bool_field(reduce_tag, "distilled"))
 
-                # Check for persisted output file — two sources:
-                # 1. toolUseResult.persistedOutputPath (structured)
-                # 2. <persisted-output> tag in tool_result content text
-                output_file = None
-                tur = obj.get("toolUseResult")
-                if isinstance(tur, dict):
-                    pop = tur.get("persistedOutputPath")
-                    if isinstance(pop, str) and pop:
-                        output_file = pop
-                if not output_file and "persisted-output" in full_text:
-                    import re
+                    token_size = len(json.dumps(obj)) // 4
 
-                    m = re.search(r"saved to:\s*(\S+/tool-results/\S+)", full_text)
-                    if m:
-                        output_file = m.group(1)
+                    # Check for persisted output file — two sources:
+                    # 1. toolUseResult.persistedOutputPath (structured)
+                    # 2. <persisted-output> tag in tool_result content text
+                    output_file = None
+                    tur = obj.get("toolUseResult")
+                    if isinstance(tur, dict):
+                        tur_dict: dict[str, Any] = cast(dict[str, Any], tur)
+                        pop = tur_dict.get("persistedOutputPath")
+                        if isinstance(pop, str) and pop:
+                            output_file = pop
+                    if not output_file and "persisted-output" in full_text:
+                        import re
 
-                exchanges.append(
-                    BrowseExchange(
-                        index=line_idx,
-                        role=role,
-                        text=text,
-                        full_text=full_text,
-                        tool_name=tool_name,
-                        is_error=is_error,
-                        ontology_class=ontology_class,
-                        reduce_route=reduce_route,
-                        token_size=token_size,
-                        is_structural=is_structural,
-                        is_distilled=is_distilled,
-                        output_file=output_file,
+                        m = re.search(
+                            r"saved to:\s*(\S+/tool-results/\S+)", full_text
+                        )
+                        if m:
+                            output_file = m.group(1)
+
+                    exchanges.append(
+                        BrowseExchange(
+                            index=line_idx,
+                            role=role,
+                            text=text,
+                            full_text=full_text,
+                            tool_name=tool_name,
+                            is_error=is_error,
+                            ontology_class=ontology_class,
+                            reduce_route=reduce_route,
+                            token_size=token_size,
+                            is_structural=is_structural,
+                            is_distilled=is_distilled,
+                            output_file=output_file,
+                        )
                     )
-                )
-    except (OSError, PermissionError):
-        pass
+        except (OSError, PermissionError):
+            pass
 
     return exchanges
 
@@ -2130,6 +2313,11 @@ def parse_browse_exchanges(path: str) -> list[BrowseExchange]:
 def _browser_extract_role(obj: dict, msg: dict) -> str:
     """Determine the role of a JSONL record."""
     rtype = obj.get("type", "")
+    msg_role = str(msg.get("role", "")).lower()
+    if msg_role in {"assistant", "tool"}:
+        return msg_role
+    if msg_role == "developer":
+        return "assistant"
     role = msg.get("role", rtype)
     if role in ("user", "assistant", "system", "tool"):
         return role
@@ -2156,15 +2344,7 @@ def _browser_tool_use_desc(name: str, inp: dict) -> str:
     return ""
 
 
-def _format_tok_short(tokens: int) -> str:
-    """Format token count compactly: '42k', '1.2M'."""
-    if tokens >= 1_000_000:
-        val = tokens / 1_000_000
-        return f"{val:.1f}M" if val != int(val) else f"{int(val)}M"
-    if tokens >= 1_000:
-        val = tokens / 1_000
-        return f"{int(val)}k" if val == int(val) else f"{val:.0f}k"
-    return str(tokens)
+_format_tok_short = _format_tokens  # legacy alias; same compact tokens format
 
 
 def _make_token_bar(
@@ -2507,9 +2687,10 @@ class ConversationBrowserModal(ModalScreen[None]):
         ("L", "classify_aggressive", "Classify+"),
     ]
 
-    def __init__(self, session_path: str) -> None:
+    def __init__(self, session_path: str, continuation_paths: list[str] | None = None) -> None:
         super().__init__()
         self.session_path = session_path
+        self.continuation_paths = continuation_paths or []
         self._exchanges: list[BrowseExchange] = []
         self._pending_delete: int = -1
         self._pending_classify: tuple[int, str] = (-1, "standard")
@@ -2528,7 +2709,8 @@ class ConversationBrowserModal(ModalScreen[None]):
 
     def _load_session(self) -> None:
         """Parse JSONL into BrowseExchange list (worker thread)."""
-        self._exchanges = parse_browse_exchanges(self.session_path)
+        paths = [self.session_path] + self.continuation_paths
+        self._exchanges = parse_browse_exchanges(paths)
         self.app.call_from_thread(self._populate_tree)
 
     def _populate_tree(self) -> None:
@@ -2662,7 +2844,7 @@ class ConversationBrowserModal(ModalScreen[None]):
             stamp_reduce_tag,
             get_reduce_tag,
         )
-        from reduce_session.llm.base import ROUTING_MAP, Route, Category
+        from reduce_session.llm.base import ROUTING_MAP, Route
 
         idx, profile = self._pending_classify
 

@@ -8,7 +8,9 @@ viewing history without leaving the browser.
 from __future__ import annotations
 
 import os
+from collections import defaultdict
 from pathlib import Path
+from datetime import datetime, timezone
 
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -16,7 +18,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Header, Static, Tree
 
-from .session import SessionInfo, scan_projects
+from .session import SessionInfo, _ensure_aware_utc, scan_projects
 from .widgets import (
     age_color,
     ConversationBrowserModal,
@@ -33,19 +35,45 @@ def get_projects_dir() -> Path:
     """Return the Claude projects directory, respecting CLAUDE_CONFIG_DIR."""
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     if config_dir:
-        return Path(config_dir) / "projects"
-    return Path.home() / ".claude" / "projects"
+        claude_dir = Path(config_dir) / "projects"
+    else:
+        claude_dir = Path.home() / ".claude" / "projects"
+    return claude_dir
+
+
+def _get_codex_roots() -> list[Path]:
+    """Return possible Codex roots to scan for sessions."""
+    candidates: list[Path] = []
+    code_home = os.environ.get("CODEX_HOME")
+    if code_home:
+        code_home_path = Path(code_home).expanduser()
+        candidates.extend([code_home_path / "sessions", code_home_path / "projects"])
+    candidates.extend([Path.home() / ".codex" / "sessions", Path.home() / ".codex" / "projects"])
+
+    deduped: list[Path] = []
+    for candidate in candidates:
+        expanded = candidate.expanduser()
+        if expanded.exists() and expanded not in deduped:
+            deduped.append(expanded)
+    return deduped
+
+
+def _provider_projects_dirs(claude_dir: Path | None = None) -> dict[str, Path | list[Path]]:
+    root = claude_dir or get_projects_dir()
+    codex_roots = _get_codex_roots()
+    if not codex_roots:
+        return {"claude": root}
+    if len(codex_roots) == 1:
+        return {"claude": root, "codex": codex_roots[0]}
+    return {"claude": root, "codex": codex_roots}
+
+
+from .formatting import format_tokens as _format_tokens_raw  # noqa: E402
 
 
 def _format_tokens_short(tokens: int) -> str:
-    """Format token count compactly: '950k', '1.2M'."""
-    if tokens >= 1_000_000:
-        val = tokens / 1_000_000
-        return f"~{val:.1f}M tok" if val != int(val) else f"~{int(val)}M tok"
-    if tokens >= 1_000:
-        val = tokens / 1_000
-        return f"~{int(val)}k tok" if val == int(val) else f"~{val:.0f}k tok"
-    return f"~{tokens} tok"
+    """TUI-flavored token count: ``~42k tok`` style."""
+    return _format_tokens_raw(tokens, prefix="~", suffix=" tok")
 
 
 class SessionBrowserApp(App):
@@ -61,6 +89,7 @@ class SessionBrowserApp(App):
         Binding("e", "browse", "Browse", show=True),
         Binding("D", "doctor", "Doctor", show=True),
         Binding("h", "history", "History", show=True),
+        Binding("t", "toggle_sort", "Sort: recent"),
         Binding("ctrl+l", "refresh", "Refresh", show=True, key_display="^L"),
         Binding("shift+r", "refresh", "Refresh", show=False),
         Binding("j", "cursor_down", show=False),
@@ -68,13 +97,21 @@ class SessionBrowserApp(App):
     ]
 
     def __init__(
-        self, projects_dir: Path | None = None, llm_spec: str | None = None
+        self,
+        projects_dir: dict[str, Path | list[Path]] | Path | None = None,
+        llm_spec: str | None = None,
     ) -> None:
         super().__init__()
-        self.projects_dir = projects_dir or get_projects_dir()
+        if projects_dir is None:
+            self.projects_dir = _provider_projects_dirs()
+        elif isinstance(projects_dir, dict):
+            self.projects_dir = projects_dir
+        else:
+            self.projects_dir = {"claude": projects_dir}
         self.llm_spec = llm_spec
         self._node_to_session: dict[int, SessionInfo] = {}
         self._sessions: list[SessionInfo] = []
+        self._project_sort_mode: str = "recent"
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -92,7 +129,12 @@ class SessionBrowserApp(App):
 
     def _load_sessions(self) -> None:
         """Scan projects and populate the tree widget."""
-        self._sessions = scan_projects(self.projects_dir)
+        self._sessions = []
+        for provider, root in self.projects_dir.items():
+            roots = [root] if isinstance(root, Path) else root
+            for provider_root in roots:
+                if provider_root.exists():
+                    self._sessions.extend(scan_projects(provider_root, provider=provider))
         self._node_to_session.clear()
 
         tree: Tree = self.query_one("#session-tree", Tree)
@@ -101,35 +143,99 @@ class SessionBrowserApp(App):
 
         if not self._sessions:
             tree.root.add_leaf(Text("No sessions found", style="dim italic"))
+            roots = ", ".join(f"{name}: {root}" for name, root in self.projects_dir.items())
             self.query_one("#aggregate-stats", Static).update(
-                f" 0 sessions  ({self.projects_dir})"
+                f" 0 sessions  ({roots})"
             )
             return
 
-        # Group sessions by project name
-        projects: dict[str, list[SessionInfo]] = {}
+        # Group sessions by provider -> project -> branch
+        providers: dict[str, dict[str, dict[str | None, list[SessionInfo]]]] = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(list))
+        )
         for session in self._sessions:
-            projects.setdefault(session.project_name, []).append(session)
+            providers[session.provider][session.project_name][session.branch].append(session)
 
-        for proj_name, sessions in projects.items():
-            # Show full resolved path, or dangling indicator
-            sample = sessions[0]
-            if sample.is_dangling:
-                proj_label = Text()
-                proj_label.append("? ", style="bold #ee4444")
-                proj_label.append(proj_name, style="#ee4444")
-                proj_label.append(f"  ({sample.project_slug})", style="dim #ee4444")
-            elif sample.resolved_dir:
-                proj_label = Text()
-                proj_label.append(proj_name, style="bold")
-                proj_label.append(f"  {sample.resolved_dir}", style="dim")
+        for provider_name, projects in sorted(
+            providers.items(),
+            key=lambda x: 0 if x[0] == "claude" else 1,
+        ):
+            provider_node = tree.root.add(Text(provider_name, style="bold"))
+
+            project_nodes: list[
+                tuple[datetime, str, dict[str | None, list[SessionInfo]]]
+            ] = []
+            for proj_name, proj_sessions in projects.items():
+                project_last = max(
+                    (
+                        _ensure_aware_utc(s.branch_last_timestamp)
+                        or _ensure_aware_utc(s.last_timestamp)
+                        or datetime.fromtimestamp(0, tz=timezone.utc)
+                        for s in (s for branch in proj_sessions.values() for s in branch)
+                    )
+                )
+                project_nodes.append((project_last, proj_name, proj_sessions))
+
+            if self._project_sort_mode == "alpha":
+                ordered_projects = sorted(project_nodes, key=lambda item: item[1].lower())
             else:
-                proj_label = Text(proj_name, style="bold")
-            proj_node = tree.root.add(proj_label, expand=True)
-            for session in sessions:
-                label = self._make_session_label(session)
-                leaf = proj_node.add_leaf(label)
-                self._node_to_session[id(leaf)] = session
+                ordered_projects = sorted(
+                    project_nodes, key=lambda item: item[0], reverse=True
+                )
+
+            for _project_last, proj_name, sessions in ordered_projects:
+                sessions = providers[provider_name][proj_name]
+                sample = next(iter(next(iter(sessions.values()))), None)
+                if sample is None:
+                    continue
+                if sample.is_dangling:
+                    proj_label = Text()
+                    proj_label.append("? ", style="bold #ee4444")
+                    proj_label.append(proj_name, style="#ee4444")
+                    proj_label.append(
+                        f"  ({sample.project_slug})", style="dim #ee4444"
+                    )
+                elif sample.resolved_dir:
+                    proj_label = Text()
+                    proj_label.append(proj_name, style="bold")
+                    proj_label.append(f"  {sample.resolved_dir}", style="dim")
+                else:
+                    proj_label = Text(proj_name, style="bold")
+
+                proj_node = provider_node.add(proj_label, expand=True)
+
+                branch_nodes = []
+                for branch_name, branch_sessions in sessions.items():
+                    if not branch_sessions:
+                        continue
+                    branch_last = max(
+                        (
+                            _ensure_aware_utc(s.branch_last_timestamp)
+                            or _ensure_aware_utc(s.last_timestamp)
+                            or datetime.fromtimestamp(0, tz=timezone.utc)
+                        )
+                        for s in branch_sessions
+                    )
+                    branch_nodes.append((branch_last, branch_name, branch_sessions))
+                branch_nodes.sort(key=lambda item: item[0], reverse=True)
+
+                for _branch_last, branch_name, branch_sessions in branch_nodes:
+                    branch_label = Text()
+                    branch_node = proj_node
+                    label_text = branch_name or "unresolved"
+                    if branch_name is not None:
+                        branch_label.append(label_text, style="italic")
+                        branch_node = proj_node.add(branch_label, expand=True)
+
+                    for session in sorted(
+                        branch_sessions,
+                        key=lambda s: _ensure_aware_utc(s.last_timestamp)
+                        or datetime.fromtimestamp(0, tz=timezone.utc),
+                        reverse=True,
+                    ):
+                        label = self._make_session_label(session)
+                        leaf = branch_node.add_leaf(label)
+                        self._node_to_session[id(leaf)] = session
 
         # Update aggregate stats
         total_sessions = len(self._sessions)
@@ -147,6 +253,9 @@ class SessionBrowserApp(App):
     def _make_session_label(self, session: SessionInfo) -> Text:
         """Build a Rich Text label for a session tree leaf."""
         label = Text()
+        if session.session_title:
+            label.append(session.session_title, style="bold")
+            label.append("  ", style="dim")
         label.append(session.short_id, style="bold")
         label.append("  ", style="dim")
         label.append(_format_tokens_short(session.token_estimate), style="dim")
@@ -164,6 +273,10 @@ class SessionBrowserApp(App):
             label.append("  ", style="dim")
             label.append("\u25cf", style=color)  # filled circle
 
+        # Provider context is shown in preview list and helps distinguish
+        # sessions with identical short ids from different ecosystems.
+        label.append("  ", style="dim")
+        label.append(f"[{session.provider}]", style="italic")
         return label
 
     def on_tree_node_highlighted(self, event: Tree.NodeHighlighted) -> None:
@@ -215,7 +328,8 @@ class SessionBrowserApp(App):
         """Open conversation browser modal for the highlighted session."""
         session = self.selected_session
         if session:
-            self.push_screen(ConversationBrowserModal(str(session.path)))
+            continuation_paths = [str(p) for p in session.continuation_files]
+            self.push_screen(ConversationBrowserModal(str(session.path), continuation_paths))
         else:
             self.notify("Select a session first", severity="warning")
 
@@ -265,3 +379,14 @@ class SessionBrowserApp(App):
         """Rescan projects and rebuild the tree."""
         self._load_sessions()
         self.notify("Refreshed session list")
+
+    def action_toggle_sort(self) -> None:
+        """Toggle project ordering between recent-first and alphabetical."""
+        self._project_sort_mode = (
+            "alpha" if self._project_sort_mode == "recent" else "recent"
+        )
+        self._load_sessions()
+        self.notify(
+            "Project sort: "
+            + ("most recent" if self._project_sort_mode == "recent" else "alphabetical")
+        )

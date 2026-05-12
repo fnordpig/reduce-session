@@ -19,6 +19,7 @@ from reduce_session.widgets import (
     age_color,
     ConversationPreview,
     InfoBar,
+    _numeric_stats,
     render_exchanges,
     render_token_gauge,
     token_color,
@@ -88,6 +89,18 @@ def test_render_exchanges_tool_error():
     ]
     text = render_exchanges(exchanges)
     assert "Error: command failed" in text.plain
+
+
+def test_numeric_stats_filters_non_numeric():
+    """Only integer-valued stats should be kept for ordered render output."""
+    source = {
+        "kept_bytes": 12,
+        "session_format": "claude",
+        "schema_warnings": 0,
+        "schema_errors": [],
+        "llm_chars_saved": 3,
+    }
+    assert _numeric_stats(source) == {"kept_bytes": 12, "schema_warnings": 0, "llm_chars_saved": 3}
 
 
 def test_get_projects_dir_default(monkeypatch):
@@ -405,6 +418,26 @@ def test_browse_keybinding_exists():
     """Verify 'e' is in SessionBrowserApp.BINDINGS."""
     bindings = [b.key for b in SessionBrowserApp.BINDINGS]
     assert "e" in bindings
+
+
+def test_toggle_sort_keybinding_exists():
+    """Verify 't' is in SessionBrowserApp.BINDINGS."""
+    bindings = [b.key for b in SessionBrowserApp.BINDINGS]
+    assert "t" in bindings
+
+
+def test_toggle_sort_action_switches_mode():
+    """Project sorting mode should cycle between recent and alphabetical."""
+    app = SessionBrowserApp.__new__(SessionBrowserApp)
+    app._project_sort_mode = "recent"
+    app.notify = lambda *_args, **_kwargs: None
+    app._load_sessions = lambda: None  # avoid UI requirements
+
+    app.action_toggle_sort()
+    assert app._project_sort_mode == "alpha"
+
+    app.action_toggle_sort()
+    assert app._project_sort_mode == "recent"
 
 
 @pytest.mark.asyncio

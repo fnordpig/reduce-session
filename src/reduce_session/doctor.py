@@ -8,20 +8,52 @@ missing reduce tags, bloated tool results) and optionally fixes them.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import Callable
+from typing import Callable, cast
+
+from .typing_aliases import BlockType, MessageType
+
+
+class Severity(str, Enum):
+    """Closed set of diagnostic severity levels.
+
+    Stringly-typed before — typos like ``"critiacl"`` silently persisted and
+    skipped the critical-issue gate. With an Enum, invalid values fail at
+    assignment time. ``str`` mixin preserves equality with raw strings
+    (``Severity.OK == "ok"``) so JSON/CLI consumers don't need to change.
+    Uses ``str, Enum`` rather than the 3.11+ ``StrEnum`` for Python 3.10
+    compatibility — project's ``requires-python = ">=3.10"``.
+    """
+
+    CRITICAL = "critical"
+    WARNING = "warning"
+    OK = "ok"
+    INFO = "info"
+
 
 SUMMARY_RE = re.compile(r"being continued from a previous conversation", re.IGNORECASE)
 
-METADATA_TYPES = frozenset(
-    {
-        "progress",
-        "file-history-snapshot",
-        "queue-operation",
-        "last-prompt",
-    }
-)
+class MetadataType(str, Enum):
+    """Closed set of metadata-only message types that reduction passes prune.
+
+    These types carry transient state (progress markers, file snapshots,
+    queue ops, last-prompt records) that has no value once the session is
+    rewound or compacted. ``str`` mixin keeps backward compat:
+    ``MetadataType.PROGRESS == "progress"`` is True, so existing membership
+    tests against the frozenset still pass. Uses ``str, Enum`` rather than
+    the 3.11+ ``StrEnum`` for Python 3.10 compatibility — project's
+    ``requires-python = ">=3.10"``."""
+
+    PROGRESS = "progress"
+    FILE_HISTORY_SNAPSHOT = "file-history-snapshot"
+    QUEUE_OPERATION = "queue-operation"
+    LAST_PROMPT = "last-prompt"
+
+
+# Public frozenset for membership tests (keeps `t in METADATA_TYPES` working).
+METADATA_TYPES: frozenset[str] = frozenset(v.value for v in MetadataType)
 
 TUR_THRESHOLD = 10 * 1024  # 10 KB
 TUR_TRUNCATE_TO = 2048  # 2 KB
@@ -30,12 +62,30 @@ TUR_TRUNCATE_TO = 2048  # 2 KB
 @dataclass
 class DiagnosticResult:
     name: str
-    severity: str  # "critical", "warning", "ok", "info"
+    severity: Severity  # closed set — see Severity above
     summary: str  # one-line human description
     sparkline_data: list  # position-aware data for visualization
     fix_description: str  # preview: what the fix does
     fix_fn: Callable | None  # None = not auto-fixable
     detail_lines: list[str] = field(default_factory=list)
+
+
+def _collect_uuid_index(lines: list[dict]) -> dict[str, int]:
+    index: dict[str, int] = {}
+    for i, obj in enumerate(lines):
+        uuid_value = cast(object, obj.get("uuid"))
+        if isinstance(uuid_value, str):
+            index[uuid_value] = i
+    return index
+
+
+def _collect_uuids(lines: list[dict]) -> set[str]:
+    uuids: set[str] = set()
+    for obj in lines:
+        uuid_value = cast(object, obj.get("uuid"))
+        if isinstance(uuid_value, str):
+            uuids.add(uuid_value)
+    return uuids
 
 
 def _extract_text(obj: dict) -> str:
@@ -50,7 +100,7 @@ def _extract_text(obj: dict) -> str:
         parts = []
         for block in content:
             if isinstance(block, dict):
-                if block.get("type") == "text":
+                if block.get("type") == BlockType.TEXT:
                     parts.append(block.get("text", ""))
                 elif "content" in block and isinstance(block["content"], str):
                     parts.append(block["content"])
@@ -63,12 +113,193 @@ def _is_summary(obj: dict) -> bool:
     return bool(SUMMARY_RE.search(_extract_text(obj)))
 
 
+def _scan(
+    lines: list[dict], predicate: Callable[[dict], bool]
+) -> tuple[list[tuple[float, bool]], int]:
+    """Walk lines, compute (sparkline, hit_count) — the per-diagnostic preamble.
+
+    Consolidates the 14+ instances of:
+        total = len(lines)
+        sparkline = []
+        hits = 0
+        for i, obj in enumerate(lines):
+            pos = i / max(total - 1, 1)
+            hit = <predicate>
+            sparkline.append((pos, hit))
+            if hit: hits += 1
+    """
+    total = len(lines)
+    sparkline: list[tuple[float, bool]] = []
+    hits = 0
+    for i, obj in enumerate(lines):
+        pos = i / max(total - 1, 1)
+        hit = predicate(obj)
+        sparkline.append((pos, hit))
+        if hit:
+            hits += 1
+    return sparkline, hits
+
+
+def _critical_or_ok(
+    *,
+    name: str,
+    sparkline: list,
+    hits: int,
+    hit_summary: Callable[[int], str],
+    ok_summary: str,
+    fix_description: str,
+    fix_fn: Callable | None,
+    detail_lines: list[str] | None = None,
+    severity: Severity = Severity.CRITICAL,
+) -> DiagnosticResult:
+    """Build a DiagnosticResult with hit/ok branches.
+
+    Replaces the verbatim 14-line ``if hits > 0: return critical else: return ok``
+    branch at the end of every diagnose function. ``severity`` selects the
+    non-ok value (CRITICAL, WARNING, or INFO)."""
+    if hits > 0:
+        return DiagnosticResult(
+            name=name,
+            severity=severity,
+            summary=hit_summary(hits),
+            sparkline_data=sparkline,
+            fix_description=fix_description,
+            fix_fn=fix_fn,
+            detail_lines=detail_lines or [],
+        )
+    return DiagnosticResult(
+        name=name,
+        severity=Severity.OK,
+        summary=ok_summary,
+        sparkline_data=sparkline,
+        fix_description="",
+        fix_fn=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix-result dataclasses
+# ---------------------------------------------------------------------------
+#
+# Each ``_fix_*`` function returns a frozen dataclass that names exactly the
+# stats it produces.  ``apply_fixes`` calls ``dataclasses.asdict`` on each
+# result and merges the flat key/value pairs into a single combined dict.
+#
+# Field names MUST match the legacy dict keys used by callers and tests —
+# they're part of the public contract (see ``test_doctor.py`` for the full
+# set of asserted keys).  ``_fix_unreduced_metadata`` is the lone exception:
+# its keys are hyphenated ``MetadataType`` values (e.g. ``file-history-snapshot``)
+# that aren't valid Python identifiers, so it continues to return a plain
+# ``dict[str, int]``.  ``apply_fixes`` accepts both shapes via the
+# ``__dataclass_fields__`` / ``dict`` branch.
+
+
+@dataclass(frozen=True)
+class CompactionSummaryFix:
+    summaries_grafted: int = 0
+    natural_roots: int = 0
+
+
+@dataclass(frozen=True)
+class ParentChainFix:
+    parent_refs_reparented: int = 0
+
+
+@dataclass(frozen=True)
+class StaleTokensFix:
+    """Recalibration result for ``_fix_stale_tokens``.
+
+    Exactly one of ``usage_recalibrated`` / ``usage_added`` is non-zero per
+    invocation depending on whether an existing usage block was updated or a
+    fresh one was inserted.  ``usage_unchanged`` is set when no assistant
+    message was found to attach usage to (defensive no-op).
+    """
+
+    usage_recalibrated: int = 0
+    usage_added: int = 0
+    usage_unchanged: int = 0
+
+
+@dataclass(frozen=True)
+class OverlappingFilesFix:
+    continuation_files_renamed: int = 0
+
+
+@dataclass(frozen=True)
+class BloatedTurFix:
+    fields_truncated: int = 0
+    bytes_saved: int = 0
+
+
+@dataclass(frozen=True)
+class OrphanedToolResultsFix:
+    dead_refs_replaced: int = 0
+    orphaned_files_deleted: int = 0
+    bytes_freed: int = 0
+
+
+@dataclass(frozen=True)
+class CorruptedToolUseFix:
+    corrupted_tool_use_fixed: int = 0
+    corrupted_tool_use_dropped: int = 0
+
+
+@dataclass(frozen=True)
+class CorruptedContentBlocksFix:
+    corrupted_blocks_dropped: int = 0
+    emptied_message_uuids: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CycleInParentChainFix:
+    cycles_severed: int = 0
+
+
+@dataclass(frozen=True)
+class NullParentUuidAtNonRootFix:
+    null_parentUuid_reparented: int = 0
+
+
+@dataclass(frozen=True)
+class StaleBackupsFix:
+    stale_backups_deleted: int = 0
+    bytes_freed: int = 0
+
+
+@dataclass(frozen=True)
+class ProtectedTypeSurvivalFix:
+    """Result of ``_fix_protected_type_survival``.
+
+    ``no_backup`` is True when no .bak file was available to restore from;
+    in that case ``protected_restored`` stays 0.  Boolean field is preserved
+    to match the historical dict shape consumed by status UIs.
+    """
+
+    protected_restored: int = 0
+    no_backup: bool = False
+
+
+@dataclass(frozen=True)
+class MixedContentFormatFix:
+    content_normalized: int = 0
+
+
+@dataclass(frozen=True)
+class MetadataBetweenSameRoleFix:
+    metadata_between_dropped: int = 0
+
+
+@dataclass(frozen=True)
+class ApiErrorArtifactsFix:
+    api_errors_dropped: int = 0
+
+
 # ---------------------------------------------------------------------------
 # 1. Compaction summaries
 # ---------------------------------------------------------------------------
 
 
-def _fix_compaction_summaries(lines: list[dict]) -> dict:
+def _fix_compaction_summaries(lines: list[dict]) -> CompactionSummaryFix:
     """Graft orphaned compaction summaries back into the parentUuid chain.
 
     Summaries have parentUuid=null which makes them tree roots, orphaning
@@ -103,40 +334,25 @@ def _fix_compaction_summaries(lines: list[dict]) -> dict:
             obj["parentUuid"] = None
             natural_roots += 1
 
-    return {"summaries_grafted": grafted, "natural_roots": natural_roots}
+    return CompactionSummaryFix(
+        summaries_grafted=grafted, natural_roots=natural_roots
+    )
 
 
 def diagnose_compaction_summaries(
     lines: list[dict], file_path: str
 ) -> DiagnosticResult:
-    total = len(lines)
-    sparkline: list[tuple[float, bool]] = []
-    summary_count = 0
-
-    orphaned_count = 0
-    for i, obj in enumerate(lines):
-        pos = i / max(total - 1, 1)
-        hit = _is_summary(obj) and not obj.get("parentUuid")
-        sparkline.append((pos, hit))
-        if hit:
-            orphaned_count += 1
-
-    if orphaned_count > 0:
-        return DiagnosticResult(
-            name="compaction_summaries",
-            severity="critical",
-            summary=f"{orphaned_count} orphaned compaction summary(ies) found",
-            sparkline_data=sparkline,
-            fix_description="Graft summaries into chain (set parentUuid to previous message)",
-            fix_fn=_fix_compaction_summaries,
-        )
-    return DiagnosticResult(
+    sparkline, hits = _scan(
+        lines, lambda o: _is_summary(o) and not o.get("parentUuid")
+    )
+    return _critical_or_ok(
         name="compaction_summaries",
-        severity="ok",
-        summary="No compaction summaries",
-        sparkline_data=sparkline,
-        fix_description="",
-        fix_fn=None,
+        sparkline=sparkline,
+        hits=hits,
+        hit_summary=lambda n: f"{n} orphaned compaction summary(ies) found",
+        ok_summary="No compaction summaries",
+        fix_description="Graft summaries into chain (set parentUuid to previous message)",
+        fix_fn=_fix_compaction_summaries,
     )
 
 
@@ -145,7 +361,7 @@ def diagnose_compaction_summaries(
 # ---------------------------------------------------------------------------
 
 
-def _fix_parent_chain(lines: list[dict]) -> dict:
+def _fix_parent_chain(lines: list[dict]) -> ParentChainFix:
     """Reparent broken refs to the nearest preceding valid UUID.
 
     When no valid predecessor exists (broken ref at position 0), preserve the
@@ -173,7 +389,7 @@ def _fix_parent_chain(lines: list[dict]) -> dict:
             # If no valid predecessor found, leave parentUuid as-is — do NOT
             # write None, which would silently corrupt a root-level reference.
 
-    return {"parent_refs_reparented": reparented}
+    return ParentChainFix(parent_refs_reparented=reparented)
 
 
 def diagnose_parent_chain(lines: list[dict], file_path: str) -> DiagnosticResult:
@@ -208,11 +424,11 @@ def diagnose_parent_chain(lines: list[dict], file_path: str) -> DiagnosticResult
             detail.append(f"{broken} breaks from continuation file (pre-existing)")
 
     if not broken:
-        severity = "ok"
+        severity = Severity.OK
     elif is_continuation:
-        severity = "info"
+        severity = Severity.INFO
     else:
-        severity = "critical"
+        severity = Severity.CRITICAL
 
     summary = (
         f"{broken} broken refs (continuation file)"
@@ -249,7 +465,7 @@ def _estimate_content_tokens(lines: list[dict]) -> int:
     return max(total_chars // 4, 1)
 
 
-def _fix_stale_tokens(lines: list[dict]) -> dict:
+def _fix_stale_tokens(lines: list[dict]) -> StaleTokensFix:
     """Recalibrate the last usage block to match estimated content tokens.
 
     Instead of stripping all usage (which makes Claude Code see 0 tokens),
@@ -266,11 +482,11 @@ def _fix_stale_tokens(lines: list[dict]) -> dict:
                 usage["input_tokens"] = estimated
                 usage["cache_read_input_tokens"] = 0
                 usage["cache_creation_input_tokens"] = 0
-                return {"usage_recalibrated": estimated}
+                return StaleTokensFix(usage_recalibrated=estimated)
 
     # No usage block found — add one to the last assistant message
     for obj in reversed(lines):
-        if obj.get("type") == "assistant":
+        if obj.get("type") == MessageType.ASSISTANT:
             msg = obj.get("message")
             if isinstance(msg, dict):
                 msg["usage"] = {
@@ -279,9 +495,9 @@ def _fix_stale_tokens(lines: list[dict]) -> dict:
                     "cache_read_input_tokens": 0,
                     "cache_creation_input_tokens": 0,
                 }
-                return {"usage_added": estimated}
+                return StaleTokensFix(usage_added=estimated)
 
-    return {"usage_unchanged": 0}
+    return StaleTokensFix()
 
 
 def diagnose_stale_tokens(lines: list[dict], file_path: str) -> DiagnosticResult:
@@ -306,22 +522,22 @@ def diagnose_stale_tokens(lines: list[dict], file_path: str) -> DiagnosticResult
     ]
 
     if stale_count == 0 and estimated < 100:
-        severity = "ok"
+        severity = Severity.OK
         summary = "No usage data found"
     elif stale_count == 0 and estimated >= 100:
-        severity = "warning"
+        severity = Severity.WARNING
         summary = f"Usage data missing but session has ~{estimated:,} est tokens"
     elif estimated < 100:
         # Estimate too low to be reliable (non-text content) — don't flag
-        severity = "ok"
+        severity = Severity.OK
         summary = (
             f"Token count ({stale_count:,}), estimate unreliable (too little text)"
         )
     elif abs(stale_count - estimated) / max(stale_count, 1) > 0.10:
-        severity = "warning"
+        severity = Severity.WARNING
         summary = f"Stale tokens ({stale_count:,}) differ from estimate ({estimated:,}) by >{10}%"
     else:
-        severity = "ok"
+        severity = Severity.OK
         summary = f"Token count ({stale_count:,}) within 10% of estimate"
 
     fix_fn = _fix_stale_tokens if severity == "warning" else None
@@ -342,7 +558,9 @@ def diagnose_stale_tokens(lines: list[dict], file_path: str) -> DiagnosticResult
 # ---------------------------------------------------------------------------
 
 
-def _fix_overlapping_files(lines: list[dict], file_path: str = "") -> dict:
+def _fix_overlapping_files(
+    lines: list[dict], file_path: str = ""
+) -> OverlappingFilesFix:
     """Rename old/smaller continuation files to .bak2 so they are skipped.
 
     The current (largest / most-recent) file is kept.  Continuation files that
@@ -380,7 +598,7 @@ def _fix_overlapping_files(lines: list[dict], file_path: str = "") -> dict:
     except OSError:
         pass
 
-    return {"continuation_files_renamed": renamed}
+    return OverlappingFilesFix(continuation_files_renamed=renamed)
 
 
 def diagnose_overlapping_files(lines: list[dict], file_path: str) -> DiagnosticResult:
@@ -431,12 +649,15 @@ def diagnose_overlapping_files(lines: list[dict], file_path: str) -> DiagnosticR
     sparkline = active_files
     count = len(active_files)
     if count > 1:
-        severity = "warning"
+        severity = Severity.WARNING
         summary = f"{count} active session files in directory"
-        fix_fn = lambda lines, fp=file_path: _fix_overlapping_files(lines, fp)
+        def _fix(lines, fp=file_path):
+            return _fix_overlapping_files(lines, fp)
+
+        fix_fn = _fix
         fix_desc = "Rename smaller continuation files to .bak2"
     else:
-        severity = "ok"
+        severity = Severity.OK
         summary = "Single session file"
         fix_fn = None
         fix_desc = ""
@@ -456,7 +677,15 @@ def diagnose_overlapping_files(lines: list[dict], file_path: str) -> DiagnosticR
 # ---------------------------------------------------------------------------
 
 
-def _fix_unreduced_metadata(lines: list[dict]) -> dict:
+def _fix_unreduced_metadata(lines: list[dict]) -> dict[str, int]:
+    """Drop metadata-typed entries and report counts keyed by raw type name.
+
+    Returns a plain dict (rather than a frozen dataclass like the other
+    ``_fix_*`` functions) because the keys are the hyphen-bearing
+    ``MetadataType`` values (``file-history-snapshot``, ``queue-operation``,
+    ``last-prompt``) which are not valid Python identifiers and therefore
+    cannot be dataclass field names.  ``apply_fixes`` keeps a ``dict``
+    branch precisely to accommodate this case."""
     meta_indices = []
     counts: dict[str, int] = {}
     for i, obj in enumerate(lines):
@@ -505,10 +734,10 @@ def diagnose_unreduced_metadata(lines: list[dict], file_path: str) -> Diagnostic
     total_meta = sum(counts.values())
 
     if total_meta > 0:
-        severity = "info"
+        severity = Severity.INFO
         summary = f"{total_meta} unreduced metadata line(s): {', '.join(f'{k}={v}' for k, v in counts.items())}"
     else:
-        severity = "ok"
+        severity = Severity.OK
         summary = "No unreduced metadata"
 
     return DiagnosticResult(
@@ -533,7 +762,7 @@ def diagnose_reduce_tags(lines: list[dict], file_path: str) -> DiagnosticResult:
     if total == 0:
         return DiagnosticResult(
             name="reduce_tags",
-            severity="ok",
+            severity=Severity.OK,
             summary="No lines to check",
             sparkline_data=[],
             fix_description="",
@@ -562,12 +791,12 @@ def diagnose_reduce_tags(lines: list[dict], file_path: str) -> DiagnosticResult:
         untagged_pct = (checked - tagged) / checked
 
     if untagged_pct > 0.30:
-        severity = "info"
+        severity = Severity.INFO
         summary = (
             f"{untagged_pct:.0%} of middle zone untagged — run reduction to process"
         )
     else:
-        severity = "ok"
+        severity = Severity.OK
         summary = f"Reduce tag coverage: {1 - untagged_pct:.0%} in middle zone"
 
     return DiagnosticResult(
@@ -614,7 +843,7 @@ def _find_tur_fields(lines: list[dict]) -> list[tuple[int, float, int, dict, str
     return results
 
 
-def _fix_bloated_tur(lines: list[dict]) -> dict:
+def _fix_bloated_tur(lines: list[dict]) -> BloatedTurFix:
     fields = _find_tur_fields(lines)
     truncated = 0
     bytes_saved = 0
@@ -623,7 +852,7 @@ def _fix_bloated_tur(lines: list[dict]) -> dict:
         block[key] = original[:TUR_TRUNCATE_TO]
         bytes_saved += len(original) - TUR_TRUNCATE_TO
         truncated += 1
-    return {"fields_truncated": truncated, "bytes_saved": bytes_saved}
+    return BloatedTurFix(fields_truncated=truncated, bytes_saved=bytes_saved)
 
 
 def diagnose_bloated_tur(lines: list[dict], file_path: str) -> DiagnosticResult:
@@ -634,12 +863,12 @@ def diagnose_bloated_tur(lines: list[dict], file_path: str) -> DiagnosticResult:
 
     if fields:
         total_bytes = sum(s for _, _, s, _, _ in fields)
-        severity = "info"
+        severity = Severity.INFO
         summary = (
             f"{len(fields)} oversized tool result field(s), {total_bytes:,} bytes total"
         )
     else:
-        severity = "ok"
+        severity = Severity.OK
         summary = "No bloated tool results"
 
     return DiagnosticResult(
@@ -666,7 +895,9 @@ _PERSISTED_OUTPUT_RE = re.compile(
 )
 
 
-def _fix_orphaned_tool_results(lines: list[dict], file_path: str = "") -> dict:
+def _fix_orphaned_tool_results(
+    lines: list[dict], file_path: str = ""
+) -> OrphanedToolResultsFix:
     """Delete orphaned files AND replace dead <persisted-output> refs in JSONL."""
     import json
     import os
@@ -731,11 +962,11 @@ def _fix_orphaned_tool_results(lines: list[dict], file_path: str = "") -> dict:
                 f.unlink()
                 files_deleted += 1
 
-    return {
-        "dead_refs_replaced": refs_replaced,
-        "orphaned_files_deleted": files_deleted,
-        "bytes_freed": bytes_freed,
-    }
+    return OrphanedToolResultsFix(
+        dead_refs_replaced=refs_replaced,
+        orphaned_files_deleted=files_deleted,
+        bytes_freed=bytes_freed,
+    )
 
 
 def diagnose_orphaned_tool_results(
@@ -797,7 +1028,7 @@ def diagnose_orphaned_tool_results(
             summary = "No tool-results directory"
         return DiagnosticResult(
             name="orphaned_tool_results",
-            severity="ok",
+            severity=Severity.OK,
             summary=summary,
             sparkline_data=sparkline,
             fix_description="",
@@ -812,7 +1043,9 @@ def diagnose_orphaned_tool_results(
         parts.append(f"{orphaned_files} orphaned file(s) ({mb:.1f} MB)")
 
     severity = (
-        "warning" if orphaned_bytes > 10 * 1024 * 1024 or dead_refs > 0 else "info"
+        Severity.WARNING
+        if orphaned_bytes > 10 * 1024 * 1024 or dead_refs > 0
+        else Severity.INFO
     )
 
     return DiagnosticResult(
@@ -833,7 +1066,7 @@ _TOOL_NAME_MAX = 200
 _INPUT_KEY_RE = re.compile(r'(\w+)="')
 
 
-def _fix_corrupted_tool_use(lines: list[dict]) -> dict:
+def _fix_corrupted_tool_use(lines: list[dict]) -> CorruptedToolUseFix:
     """Fix tool_use blocks with corrupted (>200 char) names.
 
     Attempts to extract the real tool name from the corrupted string.  If
@@ -871,44 +1104,36 @@ def _fix_corrupted_tool_use(lines: list[dict]) -> dict:
             else:
                 dropped += 1
         msg["content"] = keep
-    return {"corrupted_tool_use_fixed": fixed, "corrupted_tool_use_dropped": dropped}
+    return CorruptedToolUseFix(
+        corrupted_tool_use_fixed=fixed, corrupted_tool_use_dropped=dropped
+    )
+
+
+def _has_corrupted_tool_use(obj: dict) -> bool:
+    msg = obj.get("message", {})
+    if not isinstance(msg, dict):
+        return False
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(b, dict)
+        and b.get("type") == BlockType.TOOL_USE
+        and len(b.get("name", "")) > _TOOL_NAME_MAX
+        for b in content
+    )
 
 
 def diagnose_corrupted_tool_use(lines: list[dict], file_path: str) -> DiagnosticResult:
-    total = len(lines)
-    sparkline: list[tuple[float, bool]] = []
-    bad_count = 0
-
-    for i, obj in enumerate(lines):
-        pos = i / max(total - 1, 1)
-        hit = False
-        msg = obj.get("message", {})
-        if isinstance(msg, dict):
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_use":
-                        if len(block.get("name", "")) > _TOOL_NAME_MAX:
-                            hit = True
-                            bad_count += 1
-        sparkline.append((pos, hit))
-
-    if bad_count:
-        return DiagnosticResult(
-            name="corrupted_tool_use",
-            severity="critical",
-            summary=f"{bad_count} tool_use block(s) with corrupted name (>{_TOOL_NAME_MAX} chars)",
-            sparkline_data=sparkline,
-            fix_description="Attempt name extraction; drop block if unparseable",
-            fix_fn=_fix_corrupted_tool_use,
-        )
-    return DiagnosticResult(
+    sparkline, hits = _scan(lines, _has_corrupted_tool_use)
+    return _critical_or_ok(
         name="corrupted_tool_use",
-        severity="ok",
-        summary="No corrupted tool_use names",
-        sparkline_data=sparkline,
-        fix_description="",
-        fix_fn=None,
+        sparkline=sparkline,
+        hits=hits,
+        hit_summary=lambda n: f"{n} tool_use block(s) with corrupted name (>{_TOOL_NAME_MAX} chars)",
+        ok_summary="No corrupted tool_use names",
+        fix_description="Attempt name extraction; drop block if unparseable",
+        fix_fn=_fix_corrupted_tool_use,
     )
 
 
@@ -917,7 +1142,7 @@ def diagnose_corrupted_tool_use(lines: list[dict], file_path: str) -> Diagnostic
 # ---------------------------------------------------------------------------
 
 
-def _fix_corrupted_content_blocks(lines: list[dict]) -> dict:
+def _fix_corrupted_content_blocks(lines: list[dict]) -> CorruptedContentBlocksFix:
     """Drop tool_use blocks with missing id and tool_result blocks with missing
     tool_use_id.  Records uuids of messages that become content-less.
     """
@@ -948,51 +1173,54 @@ def _fix_corrupted_content_blocks(lines: list[dict]) -> dict:
             uid = obj.get("uuid")
             if uid:
                 empty_uuids.append(uid)
-    return {"corrupted_blocks_dropped": dropped, "emptied_message_uuids": empty_uuids}
+    return CorruptedContentBlocksFix(
+        corrupted_blocks_dropped=dropped, emptied_message_uuids=empty_uuids
+    )
+
+
+def _count_corrupted_content_blocks(obj: dict) -> int:
+    """Count tool_use/tool_result blocks with missing id within a record.
+
+    Returns a count (not just bool) because the original diagnostic counts
+    *blocks* across the whole file, not hit-records."""
+    msg = obj.get("message", {})
+    if not isinstance(msg, dict):
+        return 0
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return 0
+    n = 0
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type", "")
+        if (btype == "tool_use" and not block.get("id")) or (
+            btype == "tool_result" and not block.get("tool_use_id")
+        ):
+            n += 1
+    return n
 
 
 def diagnose_corrupted_content_blocks(
     lines: list[dict], file_path: str
 ) -> DiagnosticResult:
+    # Two-axis scan: sparkline marks any-hit per record; bad_count sums blocks.
     total = len(lines)
     sparkline: list[tuple[float, bool]] = []
     bad_count = 0
-
     for i, obj in enumerate(lines):
         pos = i / max(total - 1, 1)
-        hit = False
-        msg = obj.get("message", {})
-        if isinstance(msg, dict):
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    btype = block.get("type", "")
-                    if btype == "tool_use" and not block.get("id"):
-                        hit = True
-                        bad_count += 1
-                    elif btype == "tool_result" and not block.get("tool_use_id"):
-                        hit = True
-                        bad_count += 1
-        sparkline.append((pos, hit))
-
-    if bad_count:
-        return DiagnosticResult(
-            name="corrupted_content_blocks",
-            severity="critical",
-            summary=f"{bad_count} content block(s) with missing id/tool_use_id",
-            sparkline_data=sparkline,
-            fix_description="Drop corrupted blocks; note messages that become empty",
-            fix_fn=_fix_corrupted_content_blocks,
-        )
-    return DiagnosticResult(
+        per_record = _count_corrupted_content_blocks(obj)
+        sparkline.append((pos, per_record > 0))
+        bad_count += per_record
+    return _critical_or_ok(
         name="corrupted_content_blocks",
-        severity="ok",
-        summary="No corrupted content blocks",
-        sparkline_data=sparkline,
-        fix_description="",
-        fix_fn=None,
+        sparkline=sparkline,
+        hits=bad_count,
+        hit_summary=lambda n: f"{n} content block(s) with missing id/tool_use_id",
+        ok_summary="No corrupted content blocks",
+        fix_description="Drop corrupted blocks; note messages that become empty",
+        fix_fn=_fix_corrupted_content_blocks,
     )
 
 
@@ -1034,13 +1262,13 @@ def _detect_cycles(lines: list[dict]) -> list[list[str]]:
     return cycles
 
 
-def _fix_cycle_in_parent_chain(lines: list[dict]) -> dict:
+def _fix_cycle_in_parent_chain(lines: list[dict]) -> CycleInParentChainFix:
     """Sever cycles by setting the youngest cycle member's parentUuid to the
     oldest member's original parent (i.e. the node before the cycle entry).
     """
     cycles = _detect_cycles(lines)
     if not cycles:
-        return {"cycles_severed": 0}
+        return CycleInParentChainFix(cycles_severed=0)
 
     # Build uuid -> obj map for O(1) lookup
     uuid_map: dict[str, dict] = {}
@@ -1066,42 +1294,24 @@ def _fix_cycle_in_parent_chain(lines: list[dict]) -> dict:
             uuid_map[youngest]["parentUuid"] = original_parent
             severed += 1
 
-    return {"cycles_severed": severed}
+    return CycleInParentChainFix(cycles_severed=severed)
 
 
 def diagnose_cycle_in_parent_chain(
     lines: list[dict], file_path: str
 ) -> DiagnosticResult:
     cycles = _detect_cycles(lines)
-    total = len(lines)
-    sparkline: list[tuple[float, bool]] = []
-
-    # Mark positions that are members of any cycle
-    cycle_members: set[str] = set()
-    for c in cycles:
-        cycle_members.update(c)
-
-    for i, obj in enumerate(lines):
-        pos = i / max(total - 1, 1)
-        sparkline.append((pos, obj.get("uuid", "") in cycle_members))
-
-    if cycles:
-        return DiagnosticResult(
-            name="cycle_in_parent_chain",
-            severity="critical",
-            summary=f"{len(cycles)} cycle(s) detected in parent chain",
-            sparkline_data=sparkline,
-            fix_description="Sever each cycle at youngest member",
-            fix_fn=_fix_cycle_in_parent_chain,
-            detail_lines=[f"Cycle: {' -> '.join(c)}" for c in cycles],
-        )
-    return DiagnosticResult(
+    cycle_members: set[str] = {u for c in cycles for u in c}
+    sparkline, _ = _scan(lines, lambda o: o.get("uuid", "") in cycle_members)
+    return _critical_or_ok(
         name="cycle_in_parent_chain",
-        severity="ok",
-        summary="No cycles in parent chain",
-        sparkline_data=sparkline,
-        fix_description="",
-        fix_fn=None,
+        sparkline=sparkline,
+        hits=len(cycles),
+        hit_summary=lambda n: f"{n} cycle(s) detected in parent chain",
+        ok_summary="No cycles in parent chain",
+        fix_description="Sever each cycle at youngest member",
+        fix_fn=_fix_cycle_in_parent_chain,
+        detail_lines=[f"Cycle: {' -> '.join(c)}" for c in cycles],
     )
 
 
@@ -1110,7 +1320,9 @@ def diagnose_cycle_in_parent_chain(
 # ---------------------------------------------------------------------------
 
 
-def _fix_null_parentUuid_at_non_root(lines: list[dict]) -> dict:
+def _fix_null_parentUuid_at_non_root(
+    lines: list[dict],
+) -> NullParentUuidAtNonRootFix:
     """Reparent non-root messages with null parentUuid to nearest preceding message."""
     reparented = 0
     for i, obj in enumerate(lines):
@@ -1127,7 +1339,7 @@ def _fix_null_parentUuid_at_non_root(lines: list[dict]) -> dict:
                 obj["parentUuid"] = prev_uuid
                 reparented += 1
                 break
-    return {"null_parentUuid_reparented": reparented}
+    return NullParentUuidAtNonRootFix(null_parentUuid_reparented=reparented)
 
 
 def diagnose_null_parentUuid_at_non_root(
@@ -1135,39 +1347,30 @@ def diagnose_null_parentUuid_at_non_root(
 ) -> DiagnosticResult:
     total = len(lines)
     sparkline: list[tuple[float, bool]] = []
-    bad_count = 0
     detail: list[str] = []
-
+    bad_count = 0
     for i, obj in enumerate(lines):
         pos = i / max(total - 1, 1)
-        hit = False
-        if i > 0:
-            parent = obj.get("parentUuid")
-            if parent is None or parent == "":
-                if not _is_summary(obj):
-                    hit = True
-                    bad_count += 1
-                    uid = obj.get("uuid", f"<line {i}>")
-                    detail.append(f"  [{i}] {uid} — parentUuid is null/empty")
-        sparkline.append((pos, hit))
-
-    if bad_count:
-        return DiagnosticResult(
-            name="null_parentUuid_at_non_root",
-            severity="warning",
-            summary=f"{bad_count} non-root message(s) with null/empty parentUuid",
-            sparkline_data=sparkline,
-            fix_description="Reparent to nearest preceding message",
-            fix_fn=_fix_null_parentUuid_at_non_root,
-            detail_lines=detail,
+        hit = (
+            i > 0
+            and not obj.get("parentUuid")  # None or empty string
+            and not _is_summary(obj)
         )
-    return DiagnosticResult(
+        if hit:
+            bad_count += 1
+            uid = obj.get("uuid", f"<line {i}>")
+            detail.append(f"  [{i}] {uid} — parentUuid is null/empty")
+        sparkline.append((pos, hit))
+    return _critical_or_ok(
         name="null_parentUuid_at_non_root",
-        severity="ok",
-        summary="No unexpected null parentUuids",
-        sparkline_data=sparkline,
-        fix_description="",
-        fix_fn=None,
+        sparkline=sparkline,
+        hits=bad_count,
+        hit_summary=lambda n: f"{n} non-root message(s) with null/empty parentUuid",
+        ok_summary="No unexpected null parentUuids",
+        fix_description="Reparent to nearest preceding message",
+        fix_fn=_fix_null_parentUuid_at_non_root,
+        detail_lines=detail,
+        severity=Severity.WARNING,
     )
 
 
@@ -1179,7 +1382,9 @@ _STALE_BAK_WARN_BYTES = 100 * 1024 * 1024  # 100 MB
 _STALE_BAK_CRIT_BYTES = 500 * 1024 * 1024  # 500 MB
 
 
-def _fix_stale_backups(lines: list[dict], file_path: str = "") -> dict:
+def _fix_stale_backups(
+    lines: list[dict], file_path: str = ""
+) -> StaleBackupsFix:
     """Delete *.jsonl.bak and *.bak2 files under the same directory."""
     p = Path(file_path)
     directory = p.parent
@@ -1196,7 +1401,7 @@ def _fix_stale_backups(lines: list[dict], file_path: str = "") -> dict:
                     pass
     except OSError:
         pass
-    return {"stale_backups_deleted": deleted, "bytes_freed": bytes_freed}
+    return StaleBackupsFix(stale_backups_deleted=deleted, bytes_freed=bytes_freed)
 
 
 def diagnose_stale_backups(lines: list[dict], file_path: str) -> DiagnosticResult:
@@ -1223,7 +1428,7 @@ def diagnose_stale_backups(lines: list[dict], file_path: str) -> DiagnosticResul
     if not bak_files:
         return DiagnosticResult(
             name="stale_backups",
-            severity="ok",
+            severity=Severity.OK,
             summary="No stale backup files",
             sparkline_data=sparkline,
             fix_description="",
@@ -1232,11 +1437,11 @@ def diagnose_stale_backups(lines: list[dict], file_path: str) -> DiagnosticResul
 
     mb = total_bytes / 1024 / 1024
     if total_bytes >= _STALE_BAK_CRIT_BYTES:
-        severity = "critical"
+        severity = Severity.CRITICAL
     elif total_bytes >= _STALE_BAK_WARN_BYTES:
-        severity = "warning"
+        severity = Severity.WARNING
     else:
-        severity = "info"
+        severity = Severity.INFO
 
     return DiagnosticResult(
         name="stale_backups",
@@ -1266,7 +1471,7 @@ def diagnose_oversized_sessions(lines: list[dict], file_path: str) -> Diagnostic
     if size > _OVERSIZED_THRESHOLD:
         return DiagnosticResult(
             name="oversized_sessions",
-            severity="info",
+            severity=Severity.INFO,
             summary=f"Session file is {mb:.1f} MB (>{_OVERSIZED_THRESHOLD // 1024 // 1024} MB threshold)",
             sparkline_data=[("size_mb", mb)],
             fix_description="Run reduce-session --apply to compress",
@@ -1277,7 +1482,7 @@ def diagnose_oversized_sessions(lines: list[dict], file_path: str) -> Diagnostic
         )
     return DiagnosticResult(
         name="oversized_sessions",
-        severity="ok",
+        severity=Severity.OK,
         summary=f"Session file size OK ({mb:.1f} MB)",
         sparkline_data=[("size_mb", mb)],
         fix_description="",
@@ -1364,7 +1569,9 @@ def _session_was_reduced(lines: list[dict]) -> bool:
     return any("_reduce" in obj for obj in lines)
 
 
-def _fix_protected_type_survival(lines: list[dict], file_path: str = "") -> dict:
+def _fix_protected_type_survival(
+    lines: list[dict], file_path: str = ""
+) -> ProtectedTypeSurvivalFix:
     """Restore missing protected messages from the backup.
 
     Inserts each missing protected message at its original position determined
@@ -1375,12 +1582,10 @@ def _fix_protected_type_survival(lines: list[dict], file_path: str = "") -> dict
 
     bak_lines = _load_backup(file_path)
     if not bak_lines:
-        return {"protected_restored": 0, "no_backup": True}
+        return ProtectedTypeSurvivalFix(protected_restored=0, no_backup=True)
 
-    current_uuids: set[str] = {obj.get("uuid") for obj in lines if obj.get("uuid")}
-    bak_index: dict[str, int] = {
-        obj.get("uuid"): i for i, obj in enumerate(bak_lines) if obj.get("uuid")
-    }
+    current_uuids = _collect_uuids(lines)
+    bak_index: dict[str, int] = _collect_uuid_index(bak_lines)
 
     # Identify missing protected messages
     missing: list[dict] = [
@@ -1392,12 +1597,10 @@ def _fix_protected_type_survival(lines: list[dict], file_path: str = "") -> dict
     ]
 
     if not missing:
-        return {"protected_restored": 0}
+        return ProtectedTypeSurvivalFix(protected_restored=0)
 
     # Build uuid → position map for current lines
-    uuid_pos: dict[str, int] = {
-        obj.get("uuid"): i for i, obj in enumerate(lines) if obj.get("uuid")
-    }
+    uuid_pos: dict[str, int] = _collect_uuid_index(lines)
 
     import copy
 
@@ -1420,15 +1623,13 @@ def _fix_protected_type_survival(lines: list[dict], file_path: str = "") -> dict
         restored += 1
 
         # Update uuid_pos for subsequent insertions
-        uuid_pos = {
-            obj.get("uuid"): i for i, obj in enumerate(lines) if obj.get("uuid")
-        }
+        uuid_pos = _collect_uuid_index(lines)
 
     # Relink parent chains after all insertions
     dropped_uuids: dict[str, str | None] = {}  # nothing was dropped; just repair
     relink_parent_chains(lines, dropped_uuids)
 
-    return {"protected_restored": restored}
+    return ProtectedTypeSurvivalFix(protected_restored=restored)
 
 
 def diagnose_protected_type_survival(
@@ -1445,7 +1646,7 @@ def diagnose_protected_type_survival(
     if not _session_was_reduced(lines):
         return DiagnosticResult(
             name=name,
-            severity="ok",
+            severity=Severity.OK,
             summary="Session has not been reduced — no check needed",
             sparkline_data=[],
             fix_description="",
@@ -1456,14 +1657,14 @@ def diagnose_protected_type_survival(
     if bak_lines is None:
         return DiagnosticResult(
             name=name,
-            severity="ok",
+            severity=Severity.OK,
             summary="No backup available — cannot compare protected messages",
             sparkline_data=[],
             fix_description="",
             fix_fn=None,
         )
 
-    current_uuids: set[str] = {obj.get("uuid") for obj in lines if obj.get("uuid")}
+    current_uuids = _collect_uuids(lines)
 
     missing: list[dict] = [
         obj
@@ -1496,7 +1697,7 @@ def diagnose_protected_type_survival(
     if missing:
         return DiagnosticResult(
             name=name,
-            severity="critical",
+            severity=Severity.CRITICAL,
             summary=f"{lost} protected message(s) lost during reduction",
             sparkline_data=sparkline,
             fix_description=f"Restore {lost} protected message(s) from backup",
@@ -1506,7 +1707,7 @@ def diagnose_protected_type_survival(
 
     return DiagnosticResult(
         name=name,
-        severity="ok",
+        severity=Severity.OK,
         summary=f"All {total_protected} protected message(s) survived reduction",
         sparkline_data=sparkline,
         fix_description="",
@@ -1536,7 +1737,7 @@ _MERGE_HAZARD_TYPES = frozenset(
 )
 
 
-def _fix_mixed_content_format(lines: list[dict]) -> dict:
+def _fix_mixed_content_format(lines: list[dict]) -> MixedContentFormatFix:
     """Normalize string-format message.content to the canonical list format."""
     normalized = 0
     for obj in lines:
@@ -1549,7 +1750,14 @@ def _fix_mixed_content_format(lines: list[dict]) -> dict:
         if isinstance(content, str):
             msg["content"] = [{"type": "text", "text": content}] if content else []
             normalized += 1
-    return {"content_normalized": normalized}
+    return MixedContentFormatFix(content_normalized=normalized)
+
+
+def _is_string_content_user_assistant(obj: dict) -> bool:
+    if obj.get("type") not in ("user", "assistant"):
+        return False
+    msg = obj.get("message")
+    return isinstance(msg, dict) and isinstance(msg.get("content"), str)
 
 
 def diagnose_mixed_content_format(
@@ -1558,37 +1766,17 @@ def diagnose_mixed_content_format(
     """Detect user/assistant messages whose content is a bare string (not a list).
 
     These can cause API 400 errors during /compact when the API tries to merge
-    string-content messages with adjacent array-content messages.
-    """
-    total = len(lines)
-    sparkline: list[bool] = []
-    bad_count = 0
-
-    for i, obj in enumerate(lines):
-        hit = False
-        if obj.get("type") in ("user", "assistant"):
-            msg = obj.get("message")
-            if isinstance(msg, dict) and isinstance(msg.get("content"), str):
-                hit = True
-                bad_count += 1
-        sparkline.append(hit)
-
-    if bad_count:
-        return DiagnosticResult(
-            name="mixed_content_format",
-            severity="warning",
-            summary=f"{bad_count} message(s) with string content (non-canonical format)",
-            sparkline_data=sparkline,
-            fix_description="Normalize string content to [{type: text, text: ...}]",
-            fix_fn=_fix_mixed_content_format,
-        )
-    return DiagnosticResult(
+    string-content messages with adjacent array-content messages."""
+    sparkline, hits = _scan(lines, _is_string_content_user_assistant)
+    return _critical_or_ok(
         name="mixed_content_format",
-        severity="ok",
-        summary="All message content in canonical list format",
-        sparkline_data=sparkline,
-        fix_description="",
-        fix_fn=None,
+        sparkline=[hit for _, hit in sparkline],  # legacy bool-only sparkline
+        hits=hits,
+        hit_summary=lambda n: f"{n} message(s) with string content (non-canonical format)",
+        ok_summary="All message content in canonical list format",
+        fix_description="Normalize string content to [{type: text, text: ...}]",
+        fix_fn=_fix_mixed_content_format,
+        severity=Severity.WARNING,
     )
 
 
@@ -1597,7 +1785,9 @@ def diagnose_mixed_content_format(
 # ---------------------------------------------------------------------------
 
 
-def _fix_metadata_between_same_role(lines: list[dict]) -> dict:
+def _fix_metadata_between_same_role(
+    lines: list[dict],
+) -> MetadataBetweenSameRoleFix:
     """Drop metadata entries that sit between two consecutive same-role messages.
 
     Records dropped UUIDs so relink_parent_chains can repair any children.
@@ -1670,7 +1860,7 @@ def _fix_metadata_between_same_role(lines: list[dict]) -> dict:
     for idx in sorted(drop_indices, reverse=True):
         lines.pop(idx)
 
-    return {"metadata_between_dropped": len(drop_indices)}
+    return MetadataBetweenSameRoleFix(metadata_between_dropped=len(drop_indices))
 
 
 def diagnose_metadata_between_same_role(
@@ -1716,39 +1906,30 @@ def diagnose_metadata_between_same_role(
         if all_meta:
             hazard_pairs.append((i, j))
 
-    total = len(lines)
-    # Sparkline: bool per line — True if the line is a hazard metadata entry
-    hazard_meta_indices: set[int] = set()
-    for i, j in hazard_pairs:
-        for m in range(i + 1, j):
-            hazard_meta_indices.add(m)
-
-    sparkline: list[bool] = [idx in hazard_meta_indices for idx in range(total)]
-
-    if hazard_pairs:
-        detail: list[str] = []
-        for i, j in hazard_pairs:
-            role = lines[i].get("message", {}).get("role") or lines[i].get("type", "?")
-            between_types = [lines[m].get("type", "?") for m in range(i + 1, j)]
-            detail.append(
-                f"  [{i}] and [{j}] both role={role!r}, separated by: {between_types}"
-            )
-        return DiagnosticResult(
-            name="metadata_between_same_role",
-            severity="warning",
-            summary=f"{len(hazard_pairs)} same-role message pair(s) separated by metadata",
-            sparkline_data=sparkline,
-            fix_description="Drop interrupting metadata entries and relink parent chains",
-            fix_fn=_fix_metadata_between_same_role,
-            detail_lines=detail,
+    hazard_meta_indices: set[int] = {
+        m for i, j in hazard_pairs for m in range(i + 1, j)
+    }
+    sparkline: list[bool] = [
+        idx in hazard_meta_indices for idx in range(len(lines))
+    ]
+    detail = [
+        (
+            f"  [{i}] and [{j}] both role="
+            f"{(lines[i].get('message', {}).get('role') or lines[i].get('type', '?'))!r}, "
+            f"separated by: {[lines[m].get('type', '?') for m in range(i + 1, j)]}"
         )
-    return DiagnosticResult(
+        for i, j in hazard_pairs
+    ]
+    return _critical_or_ok(
         name="metadata_between_same_role",
-        severity="ok",
-        summary="No metadata-separated same-role message pairs",
-        sparkline_data=sparkline,
-        fix_description="",
-        fix_fn=None,
+        sparkline=sparkline,
+        hits=len(hazard_pairs),
+        hit_summary=lambda n: f"{n} same-role message pair(s) separated by metadata",
+        ok_summary="No metadata-separated same-role message pairs",
+        fix_description="Drop interrupting metadata entries and relink parent chains",
+        fix_fn=_fix_metadata_between_same_role,
+        detail_lines=detail,
+        severity=Severity.WARNING,
     )
 
 
@@ -1774,12 +1955,12 @@ def _message_is_api_error_artifact(obj: dict) -> bool:
         texts.append(content)
     elif isinstance(content, list):
         for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
+            if isinstance(block, dict) and block.get("type") == BlockType.TEXT:
                 texts.append(block.get("text", ""))
     return any(_text_contains_api_error(t) for t in texts)
 
 
-def _fix_api_error_artifacts(lines: list[dict]) -> dict:
+def _fix_api_error_artifacts(lines: list[dict]) -> ApiErrorArtifactsFix:
     """Drop assistant messages that are API error artifacts from failed /compact.
 
     Only scans the last 20 messages (where cascade errors accumulate).
@@ -1795,7 +1976,7 @@ def _fix_api_error_artifacts(lines: list[dict]) -> dict:
             drop_indices.add(i)
 
     if not drop_indices:
-        return {"api_errors_dropped": 0}
+        return ApiErrorArtifactsFix(api_errors_dropped=0)
 
     dropped_uuids: dict[str, str | None] = {}
     for idx in sorted(drop_indices):
@@ -1815,7 +1996,7 @@ def _fix_api_error_artifacts(lines: list[dict]) -> dict:
     for idx in sorted(drop_indices, reverse=True):
         lines.pop(idx)
 
-    return {"api_errors_dropped": len(drop_indices)}
+    return ApiErrorArtifactsFix(api_errors_dropped=len(drop_indices))
 
 
 def diagnose_api_error_artifacts(lines: list[dict], file_path: str) -> DiagnosticResult:
@@ -1825,35 +2006,24 @@ def diagnose_api_error_artifacts(lines: list[dict], file_path: str) -> Diagnosti
     Repeated retries pile up more entries.  These make the session unresumable.
     Only the last 20 messages are scanned — that's where the cascade accumulates.
     """
+    # Only scan the last 20 messages — that's where /compact retry cascades pile up.
     window_start = max(0, len(lines) - 20)
-    total = len(lines)
-    sparkline: list[bool] = [False] * total
-    artifact_indices: list[int] = []
-
-    for i in range(window_start, total):
-        if _message_is_api_error_artifact(lines[i]):
-            artifact_indices.append(i)
-            sparkline[i] = True
-
-    if artifact_indices:
-        return DiagnosticResult(
-            name="api_error_artifacts",
-            severity="critical",
-            summary=f"{len(artifact_indices)} API error artifact message(s) from failed /compact",
-            sparkline_data=sparkline,
-            fix_description="Drop error artifact messages and relink parent chains",
-            fix_fn=_fix_api_error_artifacts,
-            detail_lines=[
-                f"  [{i}] {lines[i].get('uuid', '<no-uuid>')}" for i in artifact_indices
-            ],
-        )
-    return DiagnosticResult(
+    artifact_indices = [
+        i for i in range(window_start, len(lines))
+        if _message_is_api_error_artifact(lines[i])
+    ]
+    sparkline: list[bool] = [i in set(artifact_indices) for i in range(len(lines))]
+    return _critical_or_ok(
         name="api_error_artifacts",
-        severity="ok",
-        summary="No API error artifact messages found",
-        sparkline_data=sparkline,
-        fix_description="",
-        fix_fn=None,
+        sparkline=sparkline,
+        hits=len(artifact_indices),
+        hit_summary=lambda n: f"{n} API error artifact message(s) from failed /compact",
+        ok_summary="No API error artifact messages found",
+        fix_description="Drop error artifact messages and relink parent chains",
+        fix_fn=_fix_api_error_artifacts,
+        detail_lines=[
+            f"  [{i}] {lines[i].get('uuid', '<no-uuid>')}" for i in artifact_indices
+        ],
     )
 
 
@@ -1887,27 +2057,6 @@ _FIX_ORDER = {
 }
 
 
-# All diagnostic functions in priority order (matches _FIX_ORDER).
-# Import this list in widgets / mcp_server / anywhere that needs all checks.
-ALL_DIAGNOSTICS = [
-    diagnose_compaction_summaries,
-    diagnose_corrupted_tool_use,
-    diagnose_corrupted_content_blocks,
-    diagnose_parent_chain,
-    diagnose_cycle_in_parent_chain,
-    diagnose_null_parentUuid_at_non_root,
-    diagnose_stale_tokens,
-    diagnose_overlapping_files,
-    diagnose_unreduced_metadata,
-    diagnose_reduce_tags,
-    diagnose_bloated_tur,
-    diagnose_orphaned_tool_results,
-    diagnose_stale_backups,
-    diagnose_oversized_sessions,
-    diagnose_protected_type_survival,
-]
-
-
 def apply_fixes(
     lines: list[dict],
     file_path: str,
@@ -1917,6 +2066,11 @@ def apply_fixes(
 
     Fixes are ordered so content-removing operations run first, chain
     repair runs after, and token recalibration runs last.
+
+    Each fix function returns either a frozen ``*Fix`` dataclass or, for the
+    metadata-counts case where keys are not valid Python identifiers, a
+    ``dict[str, int]``.  Both shapes are flattened into a single combined
+    ``dict[str, Any]`` for downstream UI / JSON serialization.
     """
     ordered = sorted(
         selected_diagnostics,
@@ -1926,8 +2080,10 @@ def apply_fixes(
     for diag in ordered:
         if diag.fix_fn is not None:
             stats = diag.fix_fn(lines)
-            if isinstance(stats, dict):
-                combined.update(stats)
+            if hasattr(stats, "__dataclass_fields__"):
+                combined.update(asdict(stats))
+            elif isinstance(stats, dict):
+                combined.update(stats)  # legacy compat (e.g. _fix_unreduced_metadata)
     return combined
 
 

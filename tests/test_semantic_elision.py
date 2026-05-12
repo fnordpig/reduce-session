@@ -38,27 +38,39 @@ def _make_assistant_msg(content, uuid="a1", parent="u1"):
 def test_detect_passing_builds():
     from reduce_session.reduction import detect_passing_builds
 
+    # Properly paired tool_use → tool_result records (matches real session shape).
     objs = [
+        _make_assistant_msg(
+            [_make_tool_use("t1", "Bash", {"command": "cargo build --release"})]
+        ),
         _make_user_msg(
             [_make_tool_result("t1", "Compiling foo\nFinished `release` target")]
         ),
+        _make_assistant_msg(
+            [_make_tool_use("t2", "Bash", {"command": "pytest tests/"})]
+        ),
         _make_user_msg(
             [_make_tool_result("t2", "running 42 tests\n42 passed; 0 failed")]
+        ),
+        _make_assistant_msg(
+            [_make_tool_use("t3", "Bash", {"command": "cargo build"})]
         ),
         _make_user_msg(
             [_make_tool_result("t3", "error[E0277]: trait bound not satisfied")]
         ),
     ]
     result = detect_passing_builds(objs)
-    assert 0 in result  # cargo build ok
-    assert 1 in result  # tests passed
-    assert 2 not in result  # error, not passing
+    # The positions of user records holding the tool_results.
+    assert 1 in result  # cargo build ok
+    assert 3 in result  # tests passed
+    assert 5 not in result  # error, not passing
 
 
 def test_detect_passing_builds_ignores_errors():
     from reduce_session.reduction import detect_passing_builds
 
     objs = [
+        _make_assistant_msg([_make_tool_use("t1", "Bash", {"command": "cargo build"})]),
         _make_user_msg(
             [
                 _make_tool_result(
@@ -68,7 +80,7 @@ def test_detect_passing_builds_ignores_errors():
         ),
     ]
     result = detect_passing_builds(objs)
-    assert 0 not in result  # has "error" — don't elide
+    assert 1 not in result  # has "error" — don't elide
 
 
 def test_detect_confirmations():

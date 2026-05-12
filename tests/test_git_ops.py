@@ -71,6 +71,42 @@ def test_do_apply_refuses_stale(tmp_path):
         do_apply(str(original), str(reduced), "standard", 50, 75)
 
 
+@pytest.mark.parametrize(
+    "codec,original,reduced",
+    [
+        (
+            "claude",
+            '{"type":"system","uuid":"s1","message":{"content":"system"}}\n',
+            '{"type":"system","uuid":"s1","message":{"content":"system"}}\n',
+        ),
+        (
+            "codex",
+            '{"type":"SessionMetaLine","id":"s1","content":"system","timestamp":"2026-01-01T00:00:00Z"}\n',
+            '{"type":"SessionMetaLine","id":"s1","content":"system","timestamp":"2026-01-01T00:00:00Z"}\n',
+        ),
+    ],
+)
+def test_do_apply_refuses_stale_for_format(tmp_path, codec, original, reduced):
+    ensure_git_repo(str(tmp_path))
+    session_path = tmp_path / f"session-{codec}.jsonl"
+    reduced_path = tmp_path / f"session-{codec}.jsonl.reduced"
+
+    session_path.write_text(original)
+    reduced_path.write_text(reduced)
+
+    # make the source appear later than its reduction artifact
+    now = time.time()
+    os.utime(session_path, (now - 10, now - 10))
+    os.utime(reduced_path, (now - 20, now - 20))
+
+    # ensure source changed after reduction run to exercise stale-detection
+    os.utime(session_path, (now, now + 1))
+    session_path.write_text(original)
+
+    with pytest.raises(RuntimeError, match="Source file was modified after"):
+        do_apply(str(session_path), str(reduced_path), "standard", 50, 75)
+
+
 def test_do_restore_from_bak(tmp_path):
     original = tmp_path / "session.jsonl"
     original.write_text("reduced content\n")

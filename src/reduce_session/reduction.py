@@ -12,8 +12,172 @@ import random
 import re
 import zlib
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import cast
 
+from .block_walk import block_text, for_each_text_in_tool_result, iter_blocks_of_type
+from .event_detection import compute_record_findings
 from .invariants import is_protected, relink_parent_chains
+from .session_formats import load_records
+from .typing_aliases import BlockType, MessageType
+
+
+def _elide_first_tool_result(
+    kept_objs: list,
+    pos_to_summary: dict[int, str],
+    aggr_fn,
+    *,
+    threshold: float,
+) -> int:
+    """Replace the first ``tool_result`` block in records whose position is
+    in ``pos_to_summary`` and whose aggressiveness exceeds ``threshold``.
+
+    Returns count of replacements. Consolidates three near-identical
+    semantic-elision branches (passing builds, stale read results,
+    Agent results) that each walked content lists looking for the first
+    tool_result block to overwrite."""
+    if not pos_to_summary:
+        return 0
+    total = len(kept_objs)
+    count = 0
+    for pos, obj in enumerate(kept_objs):
+        if pos not in pos_to_summary:
+            continue
+        if aggr_fn(pos / max(total - 1, 1)) <= threshold:
+            continue
+        msg = obj.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == BlockType.TOOL_RESULT:
+                block["content"] = pos_to_summary[pos]
+                count += 1
+                break
+    return count
+
+
+def _elide_superseded_edits(
+    kept_objs: list,
+    pos_to_summary: dict[int, str],
+    superseded_tool_use_ids: set[str],
+    aggr_fn,
+    *,
+    threshold: float,
+) -> int:
+    """Strip ``old_string``/``new_string`` from superseded Edit/Write tool_use
+    blocks and record a one-line summary under ``_elided``. The full edit is
+    redundant once a later edit on the same file lands.
+
+    Dispatch is by ``tool_use_id`` — the event-stream detector already
+    classified these blocks as superseded ``EditFile``/``WriteFile`` verbs,
+    so this helper does not re-check tool-name strings. The verb taxonomy
+    is the source of truth; this code consumes its output."""
+    if not pos_to_summary or not superseded_tool_use_ids:
+        return 0
+    total = len(kept_objs)
+    count = 0
+    for pos, obj in enumerate(kept_objs):
+        if pos not in pos_to_summary:
+            continue
+        if aggr_fn(pos / max(total - 1, 1)) <= threshold:
+            continue
+        for block in get_content_blocks(obj):
+            if block.get("type") != "tool_use":
+                continue
+            if block.get("id", "") not in superseded_tool_use_ids:
+                continue
+            inp = block.get("input", {})
+            if not isinstance(inp, dict):
+                continue
+            input_obj = cast(dict[str, object], inp)
+            input_obj.pop("old_string", None)
+            input_obj.pop("new_string", None)
+            input_obj["_elided"] = pos_to_summary[pos]
+            count += 1
+            break
+    return count
+
+
+def _elide_message_content(
+    kept_objs: list,
+    positions: set[int],
+    aggr_fn,
+    *,
+    threshold: float,
+    replacement: str,
+) -> int:
+    """Replace ``message.content`` wholesale on records in ``positions``
+    where aggressiveness exceeds ``threshold``. Used for confirmation
+    messages where the entire content is filler."""
+    if not positions:
+        return 0
+    total = len(kept_objs)
+    count = 0
+    for pos, obj in enumerate(kept_objs):
+        if pos not in positions:
+            continue
+        if aggr_fn(pos / max(total - 1, 1)) <= threshold:
+            continue
+        msg = obj.get("message", {})
+        if isinstance(msg, dict):
+            msg["content"] = replacement
+            count += 1
+    return count
+
+
+def _apply_mutation_pass(
+    stats: dict,
+    pass_fn,
+    kept_objs: list,
+    *args,
+    result_key: str | None = None,
+    **kwargs,
+) -> None:
+    """Run a mutate-in-place pass and merge its stats into the running totals.
+
+    Mutation passes return one of three shapes — all handled uniformly:
+      - ``dict`` of stat-key → count: merged into ``stats``.
+      - ``int`` (legacy): stored under ``result_key`` if non-zero.
+      - ``None``: nothing to merge.
+
+    Replaces the verbatim ``foo_stats = foo(...); stats.update(foo_stats)``
+    ritual that appeared 8+ times in ``reduce_session()``."""
+    result = pass_fn(kept_objs, *args, **kwargs)
+    if isinstance(result, dict):
+        stats.update(result)
+    elif isinstance(result, int) and result_key:
+        if result:
+            stats[result_key] = result
+
+
+def _replace_if_longer(threshold: int, stub: str):
+    """Return a fn that replaces strings longer than ``threshold`` with ``stub``."""
+
+    def _fn(text: str) -> str:
+        return stub if len(text) > threshold else text
+
+    return _fn
+
+
+def _prefix_with_suffix_if_longer(threshold: int, suffix: str):
+    """Return a fn that keeps the first ``threshold`` chars + suffix when long."""
+
+    def _fn(text: str) -> str:
+        return text[:threshold] + suffix if len(text) > threshold else text
+
+    return _fn
+
+
+def _truncate_if_longer(limit: int, label: str):
+    """Return a fn that calls ``truncate`` only when the text exceeds ``limit``."""
+
+    def _fn(text: str) -> str:
+        return truncate(text, limit, label) if len(text) > limit else text
+
+    return _fn
 
 # --- Limit profiles ---
 
@@ -152,15 +316,35 @@ PROFILES = {
 
 ENVELOPE_FIELDS = {"cwd", "version", "gitBranch", "slug", "userType"}
 CHARS_PER_TOKEN = 3.7
+_TEXT_BLOCK_TYPES = frozenset(
+    {"text", "input_text", "assistant_text", "output_text", "text_block"}
+)
 
-# Message types that carry canonical state and must never be mutated by reduction passes.
-PROTECTED_MSG_TYPES = {
-    "content-replacement",
-    "marble-origami-commit",
-    "marble-origami-snapshot",
-    "worktree-state",
-    "task-summary",
-}
+# Message types that carry canonical state and must never be mutated by
+# reduction passes. Canonical set; legacy aliases follow for in-file consumers.
+class ProtectedMsgType(str, Enum):
+    """Closed set of message types that reduction passes must never mutate.
+
+    Reduction is destructive — if a pass mishandles one of these the
+    canonical snapshot/commit/worktree state is lost. Enumerating the
+    set at module load makes typos fail fast (rather than silently
+    skipping the protection check). ``str`` mixin keeps backward compat:
+    ``ProtectedMsgType.CONTENT_REPLACEMENT == "content-replacement"`` is
+    True, so existing membership tests against the frozenset still pass.
+    Uses ``str, Enum`` rather than the 3.11+ ``StrEnum`` for Python 3.10
+    compatibility — project's ``requires-python = ">=3.10"``."""
+
+    CONTENT_REPLACEMENT = "content-replacement"
+    MARBLE_ORIGAMI_COMMIT = "marble-origami-commit"
+    MARBLE_ORIGAMI_SNAPSHOT = "marble-origami-snapshot"
+    WORKTREE_STATE = "worktree-state"
+    TASK_SUMMARY = "task-summary"
+
+
+# Public frozenset for membership tests (keeps `t in PROTECTED_MSG_TYPES` working).
+PROTECTED_MSG_TYPES: frozenset[str] = frozenset(v.value for v in ProtectedMsgType)
+_PROTECTED_MSG_TYPES = PROTECTED_MSG_TYPES
+_PROTECTED_TYPES = PROTECTED_MSG_TYPES
 
 # Reduction metadata tag — persisted in JSONL objects to track what
 # processing has been applied. Subsequent passes skip already-processed content.
@@ -220,7 +404,6 @@ def make_aggressiveness_fn(cut_pct=10, fade_pct=75):
     """
     cut = cut_pct / 100.0  # end of start gentle zone
     fade = fade_pct / 100.0  # start of end gentle zone
-    mid = (cut + fade) / 2.0  # midpoint of compressible zone
     # Plateau spans the middle third of [cut, fade]
     span = fade - cut
     ramp_up_end = cut + span / 3.0
@@ -332,11 +515,111 @@ class TokenBudget:
                 total += len(v)
         return total
 
+    def _iter_text_from_payload(self, value, *, allowed_keys=None, depth=0, seen=None):
+        if value is None:
+            return 0
+        if seen is None:
+            seen = set()
+
+        if isinstance(value, str):
+            return len(value)
+        if isinstance(value, list):
+            return sum(
+                self._iter_text_from_payload(
+                    item,
+                    allowed_keys=allowed_keys,
+                    depth=depth + 1,
+                    seen=seen,
+                )
+                for item in value
+            )
+        if not isinstance(value, dict):
+            return 0
+
+        if depth > 8:
+            return 0
+
+        obj_id = id(value)
+        if obj_id in seen:
+            return 0
+        seen.add(obj_id)
+
+        if allowed_keys is None:
+            allowed_keys = {
+                "content",
+                "text",
+                "output",
+                "stdout",
+                "stderr",
+                "result",
+                "results",
+                "summary",
+                "response",
+                "tool_result",
+                "tool_output",
+                "tooluseresult",
+                "tool_use_result",
+                "toolusageresult",
+                "message",
+                "input",
+                "prompt",
+                "analysis",
+                "final",
+            }
+
+        ignore_keys = {
+            "type",
+            "id",
+            "uuid",
+            "parentuuid",
+            "logicalparentuuid",
+            "timestamp",
+            "source",
+            "version",
+            "originator",
+            "gitbranch",
+            "cwd",
+            "sessionid",
+            "threadid",
+            "role",
+            "status",
+            "usage",
+        }
+
+        total = 0
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                continue
+            lk = key.lower()
+            if lk in ignore_keys:
+                continue
+            if isinstance(nested, str):
+                if (
+                    lk in allowed_keys
+                    or lk.endswith("text")
+                    or lk.endswith("output")
+                    or lk.endswith("result")
+                ):
+                    total += len(nested)
+                continue
+            if isinstance(nested, (dict, list)):
+                total += self._iter_text_from_payload(
+                    nested,
+                    allowed_keys=allowed_keys,
+                    depth=depth + 1,
+                    seen=seen,
+                )
+        return total
+
     def add_obj(self, obj):
-        t = obj.get("type", "")
+        t = get_msg_type(obj)
         if t == "system":
-            c = obj.get("message", {}).get("content", "")
-            self.add("system", len(c) if isinstance(c, str) else 0)
+            msg = obj.get("message")
+            if isinstance(msg, dict):
+                c = msg.get("content", "")
+                self.add("system", len(c) if isinstance(c, str) else 0)
+            else:
+                self.add("system", 0)
             return
 
         blocks = get_content_blocks(obj)
@@ -345,21 +628,55 @@ class TokenBudget:
             content = msg.get("content", "")
             if isinstance(content, str):
                 self.add("user_prompts", len(content))
+            elif isinstance(content, dict):
+                # Bare dict content (rare; typically `{"text": "..."}`) — read
+                # the text field directly. block_text() needs a `type` field.
+                raw = content.get("text", "")
+                self.add("user_prompts", len(raw) if isinstance(raw, str) else 0)
             for b in blocks:
                 bt = b.get("type", "")
                 if bt == "tool_result":
                     self.add("tool_results", self._tool_result_text(b))
-                elif bt == "text":
-                    self.add("user_prompts", len(b.get("text", "")))
+                elif bt == "tool_use":
+                    self.add("tool_calls", self._tool_use_text(b))
+                elif bt in _TEXT_BLOCK_TYPES:
+                    text = b.get("text", "")
+                    self.add("user_prompts", len(text) if isinstance(text, str) else 0)
+            extra_user = self._iter_text_from_payload(
+                obj.get("toolUseResult"),
+                allowed_keys={"content", "text", "output", "result", "summary"},
+            )
+            if extra_user:
+                self.add("user_prompts", extra_user)
         elif t == "assistant":
             for b in blocks:
                 bt = b.get("type", "")
-                if bt == "text":
-                    self.add("assistant_text", len(b.get("text", "")))
+                if bt in _TEXT_BLOCK_TYPES:
+                    text = b.get("text", "")
+                    self.add("assistant_text", len(text) if isinstance(text, str) else 0)
                 elif bt == "tool_use":
                     self.add("tool_calls", self._tool_use_text(b))
                 elif bt == "thinking":
-                    self.add("thinking", len(b.get("thinking", "")))
+                    thinking = b.get("thinking", "")
+                    self.add("thinking", len(thinking) if isinstance(thinking, str) else 0)
+            extra_assistant = self._iter_text_from_payload(
+                obj.get("toolUseResult"),
+                allowed_keys={"content", "text", "output", "result", "summary"},
+            )
+            extra_assistant += self._iter_text_from_payload(
+                obj.get("result"),
+                allowed_keys={"content", "text", "output", "result", "summary"},
+            )
+            if extra_assistant:
+                self.add("assistant_text", extra_assistant)
+            payload = obj.get("payload")
+            if isinstance(payload, dict):
+                payload_count = self._iter_text_from_payload(
+                    payload,
+                    allowed_keys={"content", "text", "output", "result", "summary", "message"},
+                )
+                if payload_count:
+                    self.add("assistant_text", payload_count)
 
     @property
     def context_total(self):
@@ -387,8 +704,8 @@ class TokenBudget:
                 f"\nToken estimate (heuristic: {self.cpt:.1f} chars/tok, no API data to calibrate):"
             )
 
-        lines.append(f"")
-        lines.append(f"  Breakdown by category:")
+        lines.append("")
+        lines.append("  Breakdown by category:")
         for bucket, tokens in sorted(self.context.items(), key=lambda x: -x[1]):
             if tokens > 0:
                 pct = tokens / ct * 100 if ct else 0
@@ -400,18 +717,18 @@ class TokenBudget:
                 reduced_tokens = int(self.api_tokens * ratio)
             else:
                 reduced_tokens = int(reduced_chars / self.cpt)
-            lines.append(f"")
+            lines.append("")
             lines.append(f"  Estimated after reduction: {reduced_tokens:,} tokens")
             if reduced_tokens > 1_000_000:
                 lines.append(
-                    f"  ** exceeds 1M -- Claude Code will auto-compact on resume **"
+                    "  ** exceeds 1M -- Claude Code will auto-compact on resume **"
                 )
             elif (
                 self.api_tokens
                 and self.api_tokens > 1_000_000
                 and reduced_tokens <= 1_000_000
             ):
-                lines.append(f"  ** fits in 1M context -- no auto-compact needed **")
+                lines.append("  ** fits in 1M context -- no auto-compact needed **")
 
         return "\n".join(lines)
 
@@ -836,32 +1153,69 @@ def clean_bash_text(text):
 # --- Content block helpers ---
 
 
-def get_content_blocks(msg):
-    m = msg.get("message", {})
-    content = m.get("content", [])
-    return content if isinstance(content, list) else []
+def get_content_blocks(msg: dict[str, object]) -> list[dict[str, object]]:
+    raw_message = msg.get("message", {})
+    if not isinstance(raw_message, dict):
+        return []
+    m = cast(dict[str, object], raw_message)
+    if "content" not in m:
+        return []
+    content = m["content"]
+    if isinstance(content, dict):
+        content_dict = cast(dict[str, object], content)
+        text = content_dict.get("text")
+        if isinstance(text, str):
+            return [{"type": "text", "text": text}]
+        return []
+    if isinstance(content, list):
+        blocks: list[dict[str, object]] = []
+        for block in content:
+            if isinstance(block, dict):
+                blocks.append(cast(dict[str, object], block))
+            elif isinstance(block, str):
+                blocks.append({"type": "text", "text": block})
+        return blocks
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return []
 
 
-def text_of(block):
-    for key in ("text", "thinking", "content"):
-        val = block.get(key, "")
-        if isinstance(val, str) and val:
-            return val
-        if isinstance(val, list):
-            # Handle list-content tool_results: [{"type": "text", "text": "..."}]
-            parts = []
-            for item in val:
-                if isinstance(item, dict):
-                    t = item.get("text", "")
-                    if isinstance(t, str) and t:
-                        parts.append(t)
-            if parts:
-                return "\n".join(parts)
-    return ""
+def _get_str_field(obj: dict[str, object], key: str, default: str = "") -> str:
+    value = obj.get(key)
+    return value if isinstance(value, str) else default
+
+
+def _get_int_field(obj: dict[str, object], key: str, default: int = 0) -> int:
+    value = obj.get(key)
+    return value if isinstance(value, int) else default
 
 
 def get_msg_type(msg):
-    return msg.get("type", "unknown")
+    t = str(msg.get("type", "unknown"))
+    role = ""
+    message = msg.get("message")
+    if isinstance(message, dict):
+        role = str(message.get("role", "")).lower()
+    if role == "developer":
+        role = "assistant"
+    if role in {"user", "assistant", "system", "developer", "tool"}:
+        return "assistant" if role == "developer" else role
+    if t in {"", "unknown"}:
+        return "unknown"
+    if t.lower().startswith(("event", "rollout")) or t.lower() in {
+        "sessionmetaline",
+        "session_meta",
+        "session_meta_line",
+        "responseitem",
+        "response_item",
+        "response",
+        "eventmsg",
+        "turn_context",
+    }:
+        if role in {"user", "assistant", "system", "tool"}:
+            return role
+        return "assistant"
+    return t
 
 
 # --- Metadata stripping ---
@@ -900,7 +1254,7 @@ def strip_constant_metadata(objs, aggressive=False):
 def is_droppable_line(obj):
     if is_protected(obj):
         return None
-    t = obj.get("type", "")
+    t = get_msg_type(obj)
     if t in ("progress", "queue-operation", "last-prompt"):
         return t
     if t == "user":
@@ -930,16 +1284,6 @@ def is_droppable_line(obj):
 
 # --- Small-win reduction strategies ---
 
-# Message types that must not have their content touched
-_PROTECTED_MSG_TYPES = frozenset(
-    {
-        "content-replacement",
-        "marble-origami-commit",
-        "marble-origami-snapshot",
-        "worktree-state",
-        "task-summary",
-    }
-)
 
 
 def _is_protected(obj):
@@ -989,7 +1333,7 @@ def strip_old_images(kept_objs):
         if _is_protected(obj):
             continue
         for bi, block in enumerate(get_content_blocks(obj)):
-            if isinstance(block, dict) and block.get("type") == "image":
+            if isinstance(block, dict) and block.get("type") == BlockType.IMAGE:
                 image_positions.append((oi, bi))
 
     total = len(image_positions)
@@ -1051,13 +1395,19 @@ def trim_mega_blocks(kept_objs, max_bytes=32768):
                     trimmed += 1
                 elif isinstance(content, list):
                     for item in content:
-                        if isinstance(item, dict) and item.get("type") == "text":
-                            text = item.get("text", "")
+                        if isinstance(item, dict):
+                            block = cast(dict[str, object], item)
+                            if block.get("type") == BlockType.TEXT:
+                                text = block.get("text")
+                                if not isinstance(text, str):
+                                    text = None
+                            else:
+                                text = None
                             if (
                                 isinstance(text, str)
                                 and len(text.encode("utf-8")) > max_bytes
                             ):
-                                item["text"] = truncate(
+                                block["text"] = truncate(
                                     text, max_bytes, "mega_tool_result_item"
                                 )
                                 trimmed += 1
@@ -1135,60 +1485,36 @@ def dedup_file_history_snapshots(objs):
 
 
 def detect_stale_reads(kept_objs):
-    file_events = {}
-    for pos, obj in enumerate(kept_objs):
-        for block in get_content_blocks(obj):
-            if block.get("type") == "tool_use":
-                name = block.get("name", "")
-                inp = block.get("input", {})
-                if not isinstance(inp, dict):
-                    continue
-                fp = inp.get("file_path", "")
-                if not fp:
-                    continue
-                if name in ("Read", "read"):
-                    file_events.setdefault(fp, []).append(
-                        (pos, "read", block.get("id", ""))
-                    )
-                elif name in ("Edit", "edit", "Write", "write"):
-                    file_events.setdefault(fp, []).append((pos, "edit", ""))
-    stale_ids = set()
-    for fp, events in file_events.items():
-        events.sort(key=lambda x: x[0])
-        for i, (pos, etype, tool_id) in enumerate(events):
-            if etype == "read" and tool_id:
-                if any(events[j][1] == "edit" for j in range(i + 1, len(events))):
-                    stale_ids.add(tool_id)
-    return stale_ids
+    """Legacy wrapper — delegates to the event-stream detector.
+
+    Returns the set of tool_use_ids whose Read events are stale (file later
+    edited). Implementation lives in :mod:`reduce_session.event_detection`."""
+    return compute_record_findings(kept_objs, "claude").stale_read_tool_ids
 
 
 def detect_duplicate_blocks(kept_objs, min_size=64, tool_id_map=None):
     block_hashes = {}
     for pos, obj in enumerate(kept_objs):
         for bi, block in enumerate(get_content_blocks(obj)):
-            text = text_of(block)
+            text = block_text(block)
             if len(text) >= min_size:
                 h = hashlib.md5(text.encode()).hexdigest()
                 block_hashes.setdefault(h, []).append((pos, bi, len(text)))
 
     # Prefix-based dedup for MCP tool results (often differ only in timestamps/ordering)
     PREFIX_LEN = 300
-    for pos, obj in enumerate(kept_objs):
-        for bi, block in enumerate(get_content_blocks(obj)):
-            if block.get("type") != "tool_result":
-                continue
-            tool_id = block.get("tool_use_id", "")
-            # Check if this is an MCP tool result
-            tool_name = tool_id_map.get(tool_id, "") if tool_id_map else ""
-            if not tool_name.startswith("mcp__"):
-                continue
-            text = text_of(block)
-            if len(text) < 200:
-                continue
-            prefix = text[:PREFIX_LEN]
-            prefix_hash = hashlib.md5(prefix.encode()).hexdigest()
-            key = f"mcp_prefix:{prefix_hash}"
-            block_hashes.setdefault(key, []).append((pos, bi, len(text)))
+    for pos, bi, block in iter_blocks_of_type(kept_objs, "tool_result"):
+        tool_id = block.get("tool_use_id", "")
+        tool_name = tool_id_map.get(tool_id, "") if tool_id_map else ""
+        if not tool_name.startswith("mcp__"):
+            continue
+        text = block_text(block)
+        if len(text) < 200:
+            continue
+        prefix_hash = hashlib.md5(text[:PREFIX_LEN].encode()).hexdigest()
+        block_hashes.setdefault(f"mcp_prefix:{prefix_hash}", []).append(
+            (pos, bi, len(text))
+        )
 
     duplicates = set()
     for h, occurrences in block_hashes.items():
@@ -1199,39 +1525,8 @@ def detect_duplicate_blocks(kept_objs, min_size=64, tool_id_map=None):
 
 
 def detect_error_retries(kept_objs):
-    tool_seq = []
-    for pos, obj in enumerate(kept_objs):
-        for block in get_content_blocks(obj):
-            if block.get("type") == "tool_use":
-                inp = json.dumps(block.get("input", {}), sort_keys=True)
-                h = hashlib.md5(inp.encode()).hexdigest()
-                tool_seq.append((pos, block.get("name", ""), h, False))
-            elif block.get("type") == "tool_result" and block.get("is_error"):
-                tool_seq.append((pos, "_error", "", True))
-    drop_positions = set()
-    i = 0
-    while i < len(tool_seq) - 2:
-        pos_a, name_a, hash_a, err_a = tool_seq[i]
-        if not err_a and name_a != "_error":
-            retries = []
-            j = i + 1
-            while j < len(tool_seq) - 1:
-                if not tool_seq[j][3]:
-                    break
-                if j + 1 < len(tool_seq):
-                    _, nr, hr, _ = tool_seq[j + 1]
-                    if nr == name_a and hr == hash_a:
-                        retries.append((tool_seq[j][0], tool_seq[j + 1][0]))
-                        j += 2
-                        continue
-                break
-            if retries:
-                for ep, rp in retries[:-1]:
-                    drop_positions.update((ep, rp))
-            i = j if retries else i + 1
-        else:
-            i += 1
-    return drop_positions
+    """Legacy wrapper — delegates to the event-stream detector."""
+    return compute_record_findings(kept_objs, "claude").error_retry_positions
 
 
 def dedup_system_reminders(text):
@@ -1271,7 +1566,7 @@ def _is_real_user_turn(obj):
     if not isinstance(content, list):
         return True
     return not any(
-        isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+        isinstance(b, dict) and b.get("type") == BlockType.TOOL_RESULT for b in content
     )
 
 
@@ -1405,7 +1700,6 @@ def age_tool_results(kept_objs, aggr, mid_age=15, old_age=40):
     effective_old = int(old_age - (old_age - 20) * aggr)
 
     # Compute turns_ago for each position by counting real user turns from the end
-    total = len(kept_objs)
     # Build list of positions that are real user turns (in order)
     real_turn_positions = [
         i for i, obj in enumerate(kept_objs) if _is_real_user_turn(obj)
@@ -1426,10 +1720,14 @@ def age_tool_results(kept_objs, aggr, mid_age=15, old_age=40):
         start = max(0, result_pos - window)
         for obj in kept_objs[start:result_pos]:
             for block in get_content_blocks(obj):
-                if block.get("type") == "tool_use" and block.get("id") == tool_use_id:
+                if block.get("type") == BlockType.TOOL_USE and block.get("id") == tool_use_id:
                     name = block.get("name", "unknown")
                     inp = block.get("input", {})
-                    path = inp.get("file_path", "") if isinstance(inp, dict) else ""
+                    path = (
+                        _get_str_field(cast(dict[str, object], inp), "file_path")
+                        if isinstance(inp, dict)
+                        else ""
+                    )
                     return name, path
         return None, None
 
@@ -1520,355 +1818,144 @@ def age_tool_results(kept_objs, aggr, mid_age=15, old_age=40):
     return result
 
 
-def dedup_read_results(kept_objs):
+def dedup_read_results(kept_objs, findings=None):
     """If the same file was Read multiple times, keep only the last Read's content.
 
     Earlier Reads get replaced with [Read: path - N lines, superseded by later read].
-    """
-    # Map: tool_use_id -> (file_path, position)
-    read_uses = {}
-    for pos, obj in enumerate(kept_objs):
-        for block in get_content_blocks(obj):
-            if block.get("type") == "tool_use" and block.get("name") in (
-                "Read",
-                "read",
-            ):
-                inp = block.get("input", {})
-                if isinstance(inp, dict):
-                    fp = inp.get("file_path", "")
-                    tid = block.get("id", "")
-                    if fp and tid:
-                        read_uses[tid] = (fp, pos)
 
-    # Group by file_path
-    file_reads = {}  # fp -> [(tool_id, pos)]
+    Dispatch is by verb identity (``findings.read_tool_use_ids``) when a
+    ``RecordFindings`` is supplied — no tool-name strings are checked here.
+    Backward-compat: if ``findings`` is None, computes on demand."""
+    if findings is None:
+        findings = compute_record_findings(kept_objs, "claude")
+
+    read_ids = findings.read_tool_use_ids
+    file_paths = findings.file_paths_by_tool_use_id
+    # Map: tool_use_id -> (file_path, position) for every Read tool_use.
+    read_uses: dict[str, tuple[str, int]] = {}
+    for pos, _bi, block in iter_blocks_of_type(kept_objs, "tool_use"):
+        tid = block.get("id", "")
+        if not isinstance(tid, str) or tid not in read_ids:
+            continue
+        fp = file_paths.get(tid, "")
+        if fp and tid:
+            read_uses[tid] = (fp, pos)
+
+    # For files read multiple times, mark all but last (by pos) as superseded.
+    file_reads: dict[str, list[tuple[str, int]]] = {}
     for tid, (fp, pos) in read_uses.items():
         file_reads.setdefault(fp, []).append((tid, pos))
-
-    # For files read multiple times, mark all but last as superseded
-    superseded_ids = set()
-    for fp, reads in file_reads.items():
+    superseded_ids: set[str] = set()
+    for reads in file_reads.values():
         if len(reads) < 2:
             continue
         reads.sort(key=lambda x: x[1])
-        for tid, pos in reads[:-1]:
+        for tid, _pos in reads[:-1]:
             superseded_ids.add(tid)
 
-    # Replace superseded Read results
+    # Replace superseded Read results with a one-line stub.
     deduped = 0
-    for obj in kept_objs:
-        if get_msg_type(obj) != "user":
+    for _pos, _bi, block in iter_blocks_of_type(kept_objs, "tool_result", role="user"):
+        tid = block.get("tool_use_id", "")
+        if tid not in superseded_ids:
             continue
-        content = obj.get("message", {}).get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue
-            tid = block.get("tool_use_id", "")
-            if tid in superseded_ids:
-                fp = read_uses.get(tid, ("?", 0))[0]
-                inner = block.get("content", "")
-                line_count = inner.count("\n") + 1 if isinstance(inner, str) else 0
-                block["content"] = (
-                    f"[Read: {_strip_non_ascii(fp)} - {line_count} lines, superseded by later read]"
-                )
-                deduped += 1
+        fp = read_uses.get(tid, ("?", 0))[0]
+        inner = block.get("content", "")
+        line_count = inner.count("\n") + 1 if isinstance(inner, str) else 0
+        block["content"] = (
+            f"[Read: {_strip_non_ascii(fp)} - {line_count} lines, superseded by later read]"
+        )
+        deduped += 1
 
     return {"reads_deduped": deduped} if deduped else {}
 
 
 # --- Semantic elision (heuristic, no LLM) ---
-
-CONFIRMATIONS = {
-    "yes",
-    "ok",
-    "go",
-    "sure",
-    "fine",
-    "do it",
-    "agreed",
-    "correct",
-    "sounds good",
-    "lets go",
-    "proceed",
-    "continue",
-    "yeah",
-    "yep",
-    "yup",
-    "right",
-    "exactly",
-    "perfect",
-    "good",
-    "great",
-    "nice",
-    "awesome",
-    "cool",
-    "done",
-    "a",
-    "b",
-    "c",
-    "1",
-    "2",
-    "3",
-    "y",
-}
-
-_PASSED_RE = re.compile(r"(\d+)\s+passed")
-_FAILED_COUNT_RE = re.compile(r"(\d+)\s+failed", re.IGNORECASE)
+# Semantic detection lives in event_detection; reduction.py just provides
+# legacy wrapper functions that delegate via compute_record_findings.
 
 
 def detect_passing_builds(kept_objs):
-    """Return {position: summary} for tool_result blocks with passing build/test output."""
-    results = {}
-    for pos, obj in enumerate(kept_objs):
-        if get_msg_type(obj) != "user":
-            continue
-        content = obj.get("message", {}).get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue
-            text = block.get("content", "")
-            if not isinstance(text, str):
-                continue
-            # Check for error indicators first — bail if any present
-            has_error = "error" in text or "panic" in text
-            # "failed" / "FAILED" is an error unless it's "0 failed"
-            fm = _FAILED_COUNT_RE.search(text)
-            if fm and int(fm.group(1)) > 0:
-                has_error = True
-            elif "FAILED" in text and not fm:
-                has_error = True
-            elif "failed" in text and not fm:
-                has_error = True
-            if has_error:
-                continue
-            # Cargo build success
-            if "Finished" in text and ("release" in text or "dev" in text):
-                results[pos] = "[cargo build: ok]"
-                break
-            # Test results
-            m = _PASSED_RE.search(text)
-            if m:
-                results[pos] = f"[{m.group(0)}]"
-                break
-            # Exit code 0
-            if "exit code 0" in text or "Exit code 0" in text:
-                results[pos] = "[command: ok]"
-                break
-            # Build succeeded/complete
-            if "Build succeeded" in text or "Build complete" in text:
-                results[pos] = "[build: ok]"
-                break
-    return results
+    """Legacy wrapper — delegates to the event-stream detector."""
+    return compute_record_findings(kept_objs, "claude").passing_build_positions
 
 
 def detect_confirmations(kept_objs):
-    """Return set of positions for user messages that are just confirmations."""
-    positions = set()
-    for pos, obj in enumerate(kept_objs):
-        if get_msg_type(obj) != "user":
-            continue
-        content = obj.get("message", {}).get("content")
-        if not isinstance(content, str):
-            continue
-        stripped = content.strip().lower().rstrip(".,!?;:")
-        if stripped in CONFIRMATIONS:
-            positions.add(pos)
-        elif len(content.strip()) < 20:
-            # Match if text starts with a confirmation phrase
-            for phrase in CONFIRMATIONS:
-                if stripped.startswith(phrase):
-                    positions.add(pos)
-                    break
-    return positions
+    """Legacy wrapper — delegates to the event-stream detector."""
+    return compute_record_findings(kept_objs, "claude").confirmation_positions
 
 
 def detect_stale_read_results(kept_objs):
-    """Return {position: summary} for Read tool_results where file was never later modified."""
-    # Build map: tool_use_id -> (file_path, tool_use_pos)
-    read_tool_uses = {}
-    edited_files = set()
-    for pos, obj in enumerate(kept_objs):
-        for block in get_content_blocks(obj):
-            if block.get("type") == "tool_use":
-                name = block.get("name", "")
-                inp = block.get("input", {})
-                if not isinstance(inp, dict):
-                    continue
-                fp = inp.get("file_path", "")
-                if not fp:
-                    continue
-                if name in ("Read", "read"):
-                    tool_id = block.get("id", "")
-                    if tool_id:
-                        read_tool_uses[tool_id] = (fp, pos)
-                elif name in ("Edit", "edit", "Write", "write"):
-                    edited_files.add(fp)
-
-    # Find which reads are stale (file never edited later)
-    # We need to check ordering: read must come BEFORE any edit
-    # Re-scan with position awareness
-    file_events = {}
-    for pos, obj in enumerate(kept_objs):
-        for block in get_content_blocks(obj):
-            if block.get("type") == "tool_use":
-                name = block.get("name", "")
-                inp = block.get("input", {})
-                if not isinstance(inp, dict):
-                    continue
-                fp = inp.get("file_path", "")
-                if not fp:
-                    continue
-                if name in ("Read", "read"):
-                    file_events.setdefault(fp, []).append(
-                        (pos, "read", block.get("id", ""))
-                    )
-                elif name in ("Edit", "edit", "Write", "write"):
-                    file_events.setdefault(fp, []).append((pos, "edit", ""))
-
-    # Identify stale read tool_use_ids (reads with NO subsequent edit of that file)
-    stale_read_info = {}  # tool_use_id -> file_path
-    for fp, events in file_events.items():
-        events.sort(key=lambda x: x[0])
-        for i, (pos, etype, tool_id) in enumerate(events):
-            if etype == "read" and tool_id:
-                has_later_edit = any(
-                    events[j][1] == "edit" for j in range(i + 1, len(events))
-                )
-                if not has_later_edit:
-                    stale_read_info[tool_id] = fp
-
-    # Now find tool_result blocks matching stale read tool_use_ids
-    results = {}
-    for pos, obj in enumerate(kept_objs):
-        if get_msg_type(obj) != "user":
-            continue
-        content = obj.get("message", {}).get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_result":
-                continue
-            tool_id = block.get("tool_use_id", "")
-            if tool_id in stale_read_info:
-                fp = stale_read_info[tool_id]
-                text = block.get("content", "")
-                if isinstance(text, str):
-                    line_count = text.count("\n") + (
-                        1 if text and not text.endswith("\n") else 0
-                    )
-                else:
-                    line_count = 0
-                results[pos] = (
-                    f"[Read: {_strip_non_ascii(fp)} - {line_count} lines, not modified]"
-                )
-    return results
+    """Legacy wrapper — delegates to the event-stream detector."""
+    return compute_record_findings(kept_objs, "claude").stale_read_result_positions
 
 
 def detect_superseded_edits(kept_objs):
-    """Return {position: summary} for Edit/Write tool_use blocks superseded by later edits."""
-    # Track (file_path, position) for every Edit/Write tool_use
-    file_edit_positions = {}  # file_path -> [(position, block_index)]
-    for pos, obj in enumerate(kept_objs):
-        for bi, block in enumerate(get_content_blocks(obj)):
-            if block.get("type") == "tool_use":
-                name = block.get("name", "")
-                if name in ("Edit", "edit", "Write", "write"):
-                    inp = block.get("input", {})
-                    if isinstance(inp, dict):
-                        fp = inp.get("file_path", "")
-                        if fp:
-                            file_edit_positions.setdefault(fp, []).append((pos, bi))
-
-    # For each file, all but the LAST edit position are superseded
-    results = {}
-    for fp, edits in file_edit_positions.items():
-        if len(edits) < 2:
-            continue
-        edits.sort(key=lambda x: x[0])
-        for pos, bi in edits[:-1]:
-            results[pos] = f"[Edit: {_strip_non_ascii(fp)} - superseded by later edit]"
-    return results
+    """Legacy wrapper — delegates to the event-stream detector."""
+    return compute_record_findings(kept_objs, "claude").superseded_edit_positions
 
 
 def detect_blind_edits(kept_objs):
-    """Detect Edit/Write tool_use blocks where the file was not read first.
+    """Legacy wrapper — delegates to the event-stream detector.
 
-    Returns set of (position, block_index) tuples for tool_result blocks
-    that correspond to blind edits — these can be aggressively trimmed.
-    """
-    # Build tool_use map: tool_use_id -> (pos, name, file_path)
-    tool_uses = {}
-    for pos, obj in enumerate(kept_objs):
-        for bi, block in enumerate(get_content_blocks(obj)):
-            if block.get("type") == "tool_use":
-                name = block.get("name", "")
-                inp = block.get("input", {})
-                if isinstance(inp, dict):
-                    fp = inp.get("file_path", "")
-                    tool_uses[block.get("id", "")] = (pos, name, fp)
-
-    # Track files read at each position
-    read_positions = {}  # file_path -> last position read
-
-    for pos, obj in enumerate(kept_objs):
-        for block in get_content_blocks(obj):
-            if block.get("type") == "tool_use":
-                name = block.get("name", "")
-                inp = block.get("input", {})
-                if isinstance(inp, dict):
-                    fp = inp.get("file_path", "")
-                    if name == "Read" and fp:
-                        read_positions[fp] = pos
-
-    # Find blind edits: Edit/Write without prior Read
-    blind_result_positions = set()
-    for pos, obj in enumerate(kept_objs):
-        for bi, block in enumerate(get_content_blocks(obj)):
-            if block.get("type") == "tool_result":
-                tool_id = block.get("tool_use_id", "")
-                if tool_id in tool_uses:
-                    use_pos, name, fp = tool_uses[tool_id]
-                    if name in ("Edit", "Write") and fp:
-                        # Check if file was read before this edit
-                        if fp not in read_positions or read_positions[fp] > use_pos:
-                            blind_result_positions.add((pos, bi))
-
-    return blind_result_positions
+    Returns set of ``(position, block_index)`` tuples for tool_result blocks
+    corresponding to blind edits, preserving the original API. The
+    block-index is recovered by scanning the matching record."""
+    findings = compute_record_findings(kept_objs, "claude")
+    result: set[tuple[int, int]] = set()
+    for pos in findings.blind_edit_positions:
+        if pos >= len(kept_objs):
+            continue
+        msg = kept_objs[pos].get("message", {})
+        if not isinstance(msg, dict):
+            continue
+        msg_dict: dict[str, object] = cast(dict[str, object], msg)
+        content = msg_dict.get("content")
+        if not isinstance(content, list):
+            continue
+        for bi, block in enumerate(content):
+            if not isinstance(block, dict):
+                continue
+            block_dict: dict[str, object] = cast(dict[str, object], block)
+            if block_dict.get("type") == BlockType.TOOL_RESULT:
+                result.add((pos, bi))
+                break
+    return result
 
 
-def collapse_edit_sequences(kept_objs, aggr_fn):
+def collapse_edit_sequences(kept_objs, aggr_fn, findings=None):
     """Collapse consecutive edits to the same file in the middle zone.
 
     For files with 3+ edits where aggr > 0.3, keep only the last Edit's
     full content. Replace earlier Edits' old_string/new_string with a
     one-line summary.
-    """
-    total = len(kept_objs)
-    file_edits = {}  # file_path -> [(pos, block_index)]
 
+    Dispatches on ``findings.edit_tool_use_ids`` (verb identity) — no
+    tool-name strings checked here."""
+    if findings is None:
+        findings = compute_record_findings(kept_objs, "claude")
+    edit_ids = findings.edit_tool_use_ids
+    file_paths = findings.file_paths_by_tool_use_id
+    total = len(kept_objs)
+    file_edits: dict[str, list[tuple[int, int]]] = {}
+
+    # Eligible positions: not protected, aggr > 0.3.
+    eligible: set[int] = set()
     for pos, obj in enumerate(kept_objs):
         if is_protected(obj):
             continue
-        position = pos / max(total - 1, 1)
-        aggr = aggr_fn(position)
-        if aggr <= 0.3:
+        if aggr_fn(pos / max(total - 1, 1)) > 0.3:
+            eligible.add(pos)
+
+    for pos, bi, block in iter_blocks_of_type(kept_objs, "tool_use", role="assistant"):
+        if pos not in eligible:
             continue
-        if get_msg_type(obj) != "assistant":
+        tid = block.get("id", "")
+        if not isinstance(tid, str) or tid not in edit_ids:
             continue
-        for bi, block in enumerate(get_content_blocks(obj)):
-            if block.get("type") == "tool_use" and block.get("name") in (
-                "Edit",
-                "edit",
-            ):
-                inp = block.get("input", {})
-                if isinstance(inp, dict):
-                    fp = inp.get("file_path", "")
-                    if fp:
-                        file_edits.setdefault(fp, []).append((pos, bi))
+        fp = file_paths.get(tid, "")
+        if fp:
+            file_edits.setdefault(fp, []).append((pos, bi))
 
     collapsed = 0
     for fp, edits in file_edits.items():
@@ -1880,13 +1967,16 @@ def collapse_edit_sequences(kept_objs, aggr_fn):
             blocks = get_content_blocks(kept_objs[pos])
             if bi < len(blocks):
                 block = blocks[bi]
-                inp = block.get("input", {})
-                if isinstance(inp, dict):
-                    old_len = len(inp.get("old_string", ""))
-                    new_len = len(inp.get("new_string", ""))
+                raw_inp = block.get("input", {})
+                if isinstance(raw_inp, dict):
+                    inp_dict: dict[str, object] = cast(dict[str, object], raw_inp)
+                    old_value = _get_str_field(inp_dict, "old_string")
+                    new_value = _get_str_field(inp_dict, "new_string")
+                    old_len = len(old_value)
+                    new_len = len(new_value)
                     if old_len + new_len > 100:
-                        inp["old_string"] = ""
-                        inp["new_string"] = (
+                        inp_dict["old_string"] = ""
+                        inp_dict["new_string"] = (
                             f"[collapsed: ~{old_len + new_len} chars, see later edit]"
                         )
                         collapsed += 1
@@ -1957,14 +2047,6 @@ def _replace_dead_persisted_outputs(kept_objs):
     return replaced
 
 
-_PROTECTED_MSG_TYPES = {
-    "content-replacement",
-    "marble-origami-commit",
-    "marble-origami-snapshot",
-    "worktree-state",
-    "task-summary",
-}
-
 _HTTP_TOOL_NAMES = {"WebFetch", "WebSearch", "webfetch", "websearch"}
 
 
@@ -1978,7 +2060,8 @@ def dedup_document_blocks(kept_objs, min_block_size=1024):
     Protected message types and isCompactSummary/isVisibleInTranscriptOnly messages
     are skipped entirely. tool_reference blocks are left unchanged.
 
-    Returns stats dict with keys documents_deduped and document_dedup_bytes_saved.
+    Returns stats dict with keys documents_deduped,
+    document_dedup_bytes_saved, and document_dedup_chars_saved.
     """
     import copy
 
@@ -1991,7 +2074,10 @@ def dedup_document_blocks(kept_objs, min_block_size=1024):
         if obj.get("isCompactSummary") or obj.get("isVisibleInTranscriptOnly"):
             continue
         for block in get_content_blocks(obj):
-            text = text_of(block)
+            if not isinstance(block, dict):
+                # Non-dict blocks are not duplicate-document candidates.
+                continue
+            text = block_text(block)
             if len(text.encode("utf-8")) < min_block_size:
                 continue
             h = hashlib.md5(text.encode()).hexdigest()
@@ -2001,6 +2087,7 @@ def dedup_document_blocks(kept_objs, min_block_size=1024):
     # Second pass: for each block that is a duplicate, mutate it.
     docs_deduped = 0
     bytes_saved = 0
+    chars_saved = 0
 
     for pos, obj in enumerate(kept_objs):
         msg_type = obj.get("type", "")
@@ -2015,14 +2102,18 @@ def dedup_document_blocks(kept_objs, min_block_size=1024):
 
         # Work on a deep copy of the message so we only commit if we change something.
         mutated = False
-        new_msg = None
+        obj_copy: dict[str, object] | None = None
+        copied_blocks: list[dict[str, object]] = []
 
         for i, block in enumerate(blocks):
+            if not isinstance(block, dict):
+                continue
+
             bt = block.get("type", "")
             if bt == "tool_reference":
                 continue
 
-            text = text_of(block)
+            text = block_text(block)
             byte_len = len(text.encode("utf-8"))
             if byte_len < min_block_size:
                 continue
@@ -2035,36 +2126,75 @@ def dedup_document_blocks(kept_objs, min_block_size=1024):
             # Duplicate: replace with stub.
             if not mutated:
                 # Deep-copy the object now that we know we need to mutate.
-                obj_copy = copy.deepcopy(obj)
-                new_msg = obj_copy.get("message", {})
-                blocks = new_msg.get("content", [])
+                obj_copy = cast(dict[str, object], copy.deepcopy(obj))
+                copied_blocks = get_content_blocks(obj_copy)
+                if not copied_blocks:
+                    message_raw = obj_copy.get("message")
+                    message = (
+                        cast(dict[str, object], message_raw)
+                        if isinstance(message_raw, dict)
+                        else None
+                    )
+                    if isinstance(message, dict):
+                        content = message.get("content")
+                    else:
+                        content = ""
+                    if isinstance(content, str):
+                        copied_blocks = [{"type": "text", "text": content}]
+                        message_obj = obj_copy.get("message")
+                        if isinstance(message_obj, dict):
+                            message_dict = cast(dict[str, object], message_obj)
+                            message_dict["content"] = copied_blocks
                 mutated = True
-
+                if i >= len(copied_blocks):
+                    # Content shape changed between reads, skip mutation for safety.
+                    continue
             preview = _strip_non_ascii(text[:80].replace("\n", " "))
-            stub_block = blocks[i]
+            if i >= len(copied_blocks):
+                continue
+            stub_block = copied_blocks[i]
+            if not isinstance(stub_block, dict):
+                copied_blocks[i] = {
+                    "type": bt if isinstance(bt, str) and bt else "text",
+                    "text": str(stub_block),
+                }
+                stub_block = copied_blocks[i]
+
             if bt == "text":
-                stub_block["text"] = (
-                    f"[duplicate content removed — first seen earlier: {preview}...]"
+                stub = (
+                    f"[duplicate content removed - first seen earlier: {preview}...]"
                 )
+                stub_block["text"] = stub
             elif bt == "tool_result" and isinstance(stub_block.get("content"), str):
-                stub_block["content"] = (
-                    f"[duplicate tool-result removed — first seen earlier: {preview}...]"
+                stub = (
+                    f"[duplicate tool-result removed - first seen earlier: {preview}...]"
                 )
+                stub_block["content"] = stub
             else:
                 # Not a type we can stub — leave unchanged.
                 continue
 
             docs_deduped += 1
-            bytes_saved += byte_len
+            new_byte_len = len(stub.encode("utf-8"))
+            byte_delta = byte_len - new_byte_len
+            char_delta = len(text) - len(stub)
+            bytes_saved += max(0, byte_delta)
+            chars_saved += max(0, char_delta)
+            _structural_stats["chars_saved_structural"] = (
+                _structural_stats.get("chars_saved_structural", 0)
+                + max(0, char_delta)
+            )
 
         if mutated:
             # Replace the original object in kept_objs with the mutated copy.
-            kept_objs[pos] = obj_copy
+            if obj_copy is not None:
+                kept_objs[pos] = obj_copy
 
     result = {}
     if docs_deduped:
         result["documents_deduped"] = docs_deduped
         result["document_dedup_bytes_saved"] = bytes_saved
+        result["document_dedup_chars_saved"] = chars_saved
     return result
 
 
@@ -2118,7 +2248,6 @@ def collapse_http_spam(kept_objs):
             continue
 
         # Start of a potential run.
-        run_start = i
         run_http_ids = set(http_use_ids_at[i])
         run_positions = [i]
 
@@ -2183,74 +2312,83 @@ def collapse_http_spam(kept_objs):
     return new_kept, dropped_uuids, stats
 
 
-def nuclear_tool_replace(kept_objs, aggr_fn, tool_id_map):
-    """At aggr > 0.8, replace ALL tool content with one-line summaries."""
+def nuclear_tool_replace(kept_objs, aggr_fn, tool_id_map, findings=None):
+    """At aggr > 0.8, replace ALL tool content with one-line summaries.
+
+    Verb dispatch (Read/Bash/Edit/Agent) goes through
+    ``findings.<verb>_tool_use_ids`` so this pass consumes the event-stream
+    classification rather than re-checking tool-name strings."""
+    if findings is None:
+        findings = compute_record_findings(kept_objs, "claude")
+    read_ids = findings.read_tool_use_ids
+    bash_ids = findings.bash_tool_use_ids
+    edit_ids = findings.edit_tool_use_ids
+    agent_ids = findings.agent_tool_use_ids
+
     total = len(kept_objs)
     reads = 0
     bash = 0
     edits = 0
     agents = 0
 
+    # Pre-compute the set of positions where this pass applies — avoids the
+    # per-block aggr/protected check that the original inlined.
+    nuclear_positions: set[int] = set()
     for pos, obj in enumerate(kept_objs):
         if is_protected(obj):
             continue
-        position = pos / max(total - 1, 1)
-        aggr = aggr_fn(position)
-        if aggr <= 0.8:
+        if aggr_fn(pos / max(total - 1, 1)) > 0.8:
+            nuclear_positions.add(pos)
+
+    # Replace user tool_result content with a one-line summary per verb class.
+    for pos, _bi, block in iter_blocks_of_type(kept_objs, "tool_result", role="user"):
+        if pos not in nuclear_positions:
             continue
+        tool_id = block.get("tool_use_id", "")
+        inner = block.get("content", "")
+        if not isinstance(inner, str) or len(inner) <= 200:
+            continue
+        if tool_id in read_ids:
+            lc = inner.count("\n") + 1
+            block["content"] = f"[Read: {lc} lines]"
+            reads += 1
+        elif tool_id in bash_ids:
+            preview = _strip_non_ascii(inner[:100].replace("\n", " "))
+            block["content"] = f"[Bash: {preview}...]"
+            bash += 1
+        elif tool_id in agent_ids:
+            preview = _strip_non_ascii(inner[:100].replace("\n", " "))
+            block["content"] = f"[Agent result: {preview}...]"
+            agents += 1
+        else:
+            # Fall back on tool_id_map for unrecognized verbs — preserves the
+            # display string for MCP and custom tools that the verb taxonomy
+            # doesn't yet name.
+            tool_name = tool_id_map.get(tool_id, "")
+            preview = _strip_non_ascii(inner[:80].replace("\n", " "))
+            block["content"] = f"[{tool_name}: {preview}...]"
 
-        t = get_msg_type(obj)
-        msg = obj.get("message", {})
-        content = msg.get("content")
-
-        # Replace user tool_result content
-        if t == "user" and isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_result":
-                    continue
-                tool_id = block.get("tool_use_id", "")
-                tool_name = tool_id_map.get(tool_id, "")
-                inner = block.get("content", "")
-                if not isinstance(inner, str) or len(inner) <= 200:
-                    continue
-                if tool_name in ("Read", "read"):
-                    lc = inner.count("\n") + 1
-                    block["content"] = f"[Read: {lc} lines]"
-                    reads += 1
-                elif tool_name in ("Bash", "bash"):
-                    preview = _strip_non_ascii(inner[:100].replace("\n", " "))
-                    block["content"] = f"[Bash: {preview}...]"
-                    bash += 1
-                elif tool_name in ("Agent", "agent"):
-                    preview = _strip_non_ascii(inner[:100].replace("\n", " "))
-                    block["content"] = f"[Agent result: {preview}...]"
-                    agents += 1
-                else:
-                    preview = _strip_non_ascii(inner[:80].replace("\n", " "))
-                    block["content"] = f"[{tool_name}: {preview}...]"
-
-        # Replace assistant Edit old/new strings and Agent prompts
-        if t == "assistant" and isinstance(content, list):
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
-                    continue
-                name = block.get("name", "")
-                inp = block.get("input", {})
-                if not isinstance(inp, dict):
-                    continue
-                if name in ("Edit", "edit"):
-                    old = inp.get("old_string", "")
-                    new = inp.get("new_string", "")
-                    if len(old) + len(new) > 200:
-                        inp["old_string"] = f"[~{len(old)} chars]"
-                        inp["new_string"] = f"[~{len(new)} chars]"
-                        edits += 1
-                elif name in ("Agent", "agent"):
-                    prompt = inp.get("prompt", "")
-                    if len(prompt) > 200:
-                        preview = _strip_non_ascii(prompt[:150].replace("\n", " "))
-                        inp["prompt"] = f"[Agent task: {preview}...]"
-                        agents += 1
+    # Replace assistant Edit old/new strings and Agent prompts.
+    for pos, _bi, block in iter_blocks_of_type(kept_objs, "tool_use", role="assistant"):
+        if pos not in nuclear_positions:
+            continue
+        tid = block.get("id", "")
+        inp = block.get("input", {})
+        if not isinstance(inp, dict) or not isinstance(tid, str):
+            continue
+        if tid in edit_ids:
+            old = _get_str_field(cast(dict[str, object], inp), "old_string")
+            new = _get_str_field(cast(dict[str, object], inp), "new_string")
+            if len(old) + len(new) > 200:
+                inp["old_string"] = f"[~{len(old)} chars]"
+                inp["new_string"] = f"[~{len(new)} chars]"
+                edits += 1
+        elif tid in agent_ids:
+            prompt = _get_str_field(cast(dict[str, object], inp), "prompt")
+            if len(prompt) > 200:
+                preview = _strip_non_ascii(prompt[:150].replace("\n", " "))
+                inp["prompt"] = f"[Agent task: {preview}...]"
+                agents += 1
 
     stats = {}
     if reads:
@@ -2268,7 +2406,7 @@ def fix_orphaned_tool_results(kept_objs):
     use_ids = set()
     for obj in kept_objs:
         for block in get_content_blocks(obj):
-            if block.get("type") == "tool_use":
+            if block.get("type") == BlockType.TOOL_USE:
                 uid = block.get("id", "")
                 if uid:  # empty id intentionally excluded — vacuous-key match
                     use_ids.add(uid)
@@ -2280,7 +2418,7 @@ def fix_orphaned_tool_results(kept_objs):
         # A tool_result with an empty tool_use_id is an orphan (vacuous-key
         # match would otherwise let it slip through the pairing guard).
         has_orphan = any(
-            b.get("type") == "tool_result"
+            b.get("type") == BlockType.TOOL_RESULT
             and (
                 not b.get("tool_use_id", "") or b.get("tool_use_id", "") not in use_ids
             )
@@ -2293,7 +2431,7 @@ def fix_orphaned_tool_results(kept_objs):
             b
             for b in blocks
             if not (
-                b.get("type") == "tool_result"
+                b.get("type") == BlockType.TOOL_RESULT
                 and (
                     not b.get("tool_use_id", "")
                     or b.get("tool_use_id", "") not in use_ids
@@ -2335,7 +2473,13 @@ def _entropy_modulated_limit(text: str, limit: int) -> int:
     return limit
 
 
-def trim_tool_result(block, tool_name, aggr, agg_lim, gen_lim):
+def trim_tool_result(block, tool_name, aggr, agg_lim, gen_lim, *, is_bash: bool = False):
+    """Compress + truncate a tool_result block.
+
+    ``is_bash`` is passed by callers based on verb-stream classification —
+    the function no longer inspects ``tool_name`` to decide bash semantics.
+    ``tool_name`` is retained only as a label for limit lookup and truncate
+    diagnostics (which still benefit from the human-readable name)."""
     inner = block.get("content")
     key = (
         tool_name
@@ -2344,7 +2488,7 @@ def trim_tool_result(block, tool_name, aggr, agg_lim, gen_lim):
     )
     limit = blended_limit(key, aggr, agg_lim, gen_lim)
     if isinstance(inner, str):
-        if tool_name == "Bash":
+        if is_bash:
             inner = clean_bash_text(inner)
         inner = dedup_system_reminders(inner)
         inner = structural_compress(inner, aggr)
@@ -2352,14 +2496,65 @@ def trim_tool_result(block, tool_name, aggr, agg_lim, gen_lim):
         block["content"] = truncate(inner, limit, tool_name)
     elif isinstance(inner, list):
         for item in inner:
-            if isinstance(item, dict) and item.get("type") == "text":
+            if isinstance(item, dict) and item.get("type") == BlockType.TEXT:
                 text = item.get("text", "")
-                if tool_name == "Bash":
+                if is_bash:
                     text = clean_bash_text(text)
                 text = dedup_system_reminders(text)
                 text = structural_compress(text, aggr)
                 item_limit = _entropy_modulated_limit(text, limit)
                 item["text"] = truncate(text, item_limit, tool_name)
+
+
+def _trim_tool_use_input(
+    input_obj: dict[str, object],
+    name: str,
+    aggr: float,
+    bl,
+) -> None:
+    """Apply structural compression + per-tool field-specific trimming.
+
+    Centralizes the per-tool dispatch (Write/Edit/Agent/Bash) that the
+    assistant-side Pass 4 used to inline. New tools register here, not by
+    adding another ``elif`` to Pass 4.
+
+    Note: this is the one site where tool-NAME (string) is the right
+    discriminator rather than verb-class. The dispatch selects which
+    *input field* to trim (``content`` for Write, ``old_string``/
+    ``new_string`` for Edit, ``prompt`` for Agent, ``command`` for Bash),
+    and those field names belong to Claude Code's tool-DSL, not to the
+    verb taxonomy. A future per-tool trim registry keyed by tool name
+    would consolidate this, but the verb stream is not the right
+    abstraction for it."""
+    # Compress every string field first; per-tool trim afterward.
+    for k, v in input_obj.items():
+        if isinstance(v, str):
+            input_obj[k] = structural_compress(v, aggr)
+
+    if name == "Write":
+        trim_string(input_obj, "content", bl("tool_input.Write", aggr), "Write.content")
+    elif name == "Edit":
+        lim = bl("tool_input.Edit", aggr)
+        trim_string(input_obj, "old_string", lim, "Edit.old_string")
+        trim_string(input_obj, "new_string", lim, "Edit.new_string")
+    elif name == "Agent":
+        trim_string(
+            input_obj, "prompt", bl("tool_input.Agent", aggr), "Agent.prompt"
+        )
+    elif name == "Bash":
+        cmd_limit = bl("tool_input.Bash", aggr)
+        trim_string(input_obj, "command", cmd_limit, "tool_input.Bash")
+
+
+def _compress_then_trim(target: dict, key: str, aggr: float, limit: int, label: str) -> None:
+    """The ``structural_compress`` → ``trim_string`` ritual that appears
+    ~6 times in ``trim_toolUseResult``. Skip the entropy modulation that
+    ``compress_and_trim`` applies — this is the bare two-step variant."""
+    val = target.get(key)
+    if not isinstance(val, str):
+        return
+    target[key] = structural_compress(val, aggr)
+    trim_string(target, key, limit, label)
 
 
 def _trim_tur_deep(tur, key, aggr, limit):
@@ -2370,8 +2565,7 @@ def _trim_tur_deep(tur, key, aggr, limit):
         tur[key] = truncate(val, limit, f"tur.{key}") if len(val) > limit else val
     elif isinstance(val, dict):
         # Recursively compress/truncate all string values in the dict
-        total = len(json.dumps(val))
-        if total > limit:
+        if len(json.dumps(val)) > limit:
             for k, v in val.items():
                 if isinstance(v, str) and len(v) > 200:
                     v = structural_compress(v, aggr)
@@ -2387,24 +2581,17 @@ def _trim_tur_deep(tur, key, aggr, limit):
 def trim_toolUseResult(tur, aggr, agg_lim, gen_lim):
     if not isinstance(tur, dict):
         return
-    bl = lambda k: blended_limit(k, aggr, agg_lim, gen_lim)
-    # structural_compress all string fields, then truncate
-    if isinstance(tur.get("originalFile"), str):
-        tur["originalFile"] = structural_compress(tur["originalFile"], aggr)
-    trim_string(tur, "originalFile", bl("tur.originalFile"), "tur.originalFile")
+    def bl(key: str) -> int:
+        return blended_limit(key, aggr, agg_lim, gen_lim)
+
+    _compress_then_trim(tur, "originalFile", aggr, bl("tur.originalFile"), "tur.originalFile")
     if isinstance(tur.get("stdout"), str):
         tur["stdout"] = clean_bash_text(tur["stdout"])
-        tur["stdout"] = structural_compress(tur["stdout"], aggr)
-        trim_string(tur, "stdout", bl("tur.stdout"), "tur.stdout")
-    if isinstance(tur.get("content"), str):
-        tur["content"] = structural_compress(tur["content"], aggr)
-    trim_string(tur, "content", bl("tur.content"), "tur.content")
-    if isinstance(tur.get("oldString"), str):
-        tur["oldString"] = structural_compress(tur["oldString"], aggr)
-    trim_string(tur, "oldString", bl("tur.oldString"), "tur.oldString")
-    if isinstance(tur.get("newString"), str):
-        tur["newString"] = structural_compress(tur["newString"], aggr)
-    trim_string(tur, "newString", bl("tur.newString"), "tur.newString")
+    _compress_then_trim(tur, "stdout", aggr, bl("tur.stdout"), "tur.stdout")
+    _compress_then_trim(tur, "content", aggr, bl("tur.content"), "tur.content")
+    _compress_then_trim(tur, "oldString", aggr, bl("tur.oldString"), "tur.oldString")
+    _compress_then_trim(tur, "newString", aggr, bl("tur.newString"), "tur.newString")
+
     sp = tur.get("structuredPatch")
     if isinstance(sp, list):
         max_lines = int(20 + (1 - aggr) * 40)
@@ -2414,24 +2601,21 @@ def trim_toolUseResult(tur, aggr, agg_lim, gen_lim):
                 if isinstance(pl, list) and len(pl) > max_lines:
                     half = max_lines // 2
                     patch["lines"] = pl[:half] + ["[...truncated...]"] + pl[-half:]
+
     # Agent task/prompt/result fields
     _trim_tur_deep(tur, "task", aggr, bl("tur.content"))
-    if isinstance(tur.get("prompt"), str):
-        tur["prompt"] = structural_compress(tur["prompt"], aggr)
-    trim_string(tur, "prompt", bl("tur.content"), "tur.prompt")
-    if isinstance(tur.get("result"), str):
-        tur["result"] = structural_compress(tur["result"], aggr)
-    trim_string(tur, "result", bl("tur.content"), "tur.result")
+    _compress_then_trim(tur, "prompt", aggr, bl("tur.content"), "tur.prompt")
+    _compress_then_trim(tur, "result", aggr, bl("tur.content"), "tur.result")
+
     file_val = tur.get("file")
     fl = bl("tur.file")
     if isinstance(file_val, dict):
-        if isinstance(file_val.get("content"), str):
-            file_val["content"] = structural_compress(file_val["content"], aggr)
-        trim_string(file_val, "content", fl, "tur.file.content")
+        _compress_then_trim(file_val, "content", aggr, fl, "tur.file.content")
     elif isinstance(file_val, str):
         tur["file"] = structural_compress(file_val, aggr)
-        if len(tur["file"]) > fl:
-            tur["file"] = truncate(tur["file"], fl, "tur.file")
+        trim_string(tur, "file", fl, "tur.file")
+
+    # Agent-specific second pass on content + prompt
     if isinstance(tur.get("prompt"), str):
         tur["prompt"] = structural_compress(tur["prompt"], aggr)
     if isinstance(tur.get("content"), str) and "prompt" in tur:
@@ -2515,7 +2699,7 @@ def _extract_exchange_text(obj):
             if not isinstance(block, dict):
                 continue
             bt = block.get("type", "")
-            if bt == "text":
+            if bt in _TEXT_BLOCK_TYPES:
                 text_parts.append(block.get("text", ""))
             elif bt == "tool_use":
                 tool_name = block.get("name")
@@ -2535,7 +2719,7 @@ def _extract_assistant_text(obj):
     blocks = get_content_blocks(obj)
     parts = []
     for b in blocks:
-        if b.get("type") == "text":
+        if b.get("type") in _TEXT_BLOCK_TYPES:
             parts.append(b.get("text", ""))
     return "\n".join(parts)
 
@@ -2548,7 +2732,7 @@ def _replace_assistant_text(obj, new_text):
         replaced = False
         new_content = []
         for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
+            if isinstance(block, dict) and block.get("type") in _TEXT_BLOCK_TYPES:
                 if not replaced:
                     block["text"] = new_text
                     new_content.append(block)
@@ -2571,9 +2755,17 @@ def _batched(iterable, n):
 
 
 async def _llm_compression_pass(
-    kept_objs, aggr_fn, provider, progress_callback=None, profile="standard"
+    kept_objs,
+    aggr_fn,
+    provider,
+    progress_callback=None,
+    profile="standard",
+    findings=None,
 ):
     """Pass 3.6 + 3.7: LLM classification, distillation, and scaffold stripping."""
+    if findings is None:
+        findings = compute_record_findings(kept_objs, "claude")
+    _agent_ids = findings.agent_tool_use_ids
     import asyncio
     from collections import Counter
     from reduce_session.llm.base import ROUTING_MAP, Route
@@ -2779,7 +2971,7 @@ async def _llm_compression_pass(
                 continue
 
             # Distill tool_result content
-            if t == "user" and block.get("type") == "tool_result":
+            if t == "user" and block.get("type") == BlockType.TOOL_RESULT:
                 inner = block.get("content", "")
                 if isinstance(inner, str) and len(inner) > 200:
                     original_len = len(inner)
@@ -2793,13 +2985,15 @@ async def _llm_compression_pass(
                         tool_distill_count += 1
                         tool_distill_chars += original_len - len(summary)
 
-            # Distill Agent prompts
-            if t == "assistant" and block.get("type") == "tool_use":
-                name = block.get("name", "")
-                if name in ("Agent", "agent"):
+            # Distill Agent prompts — dispatch via verb-stream id set.
+            if t == "assistant" and block.get("type") == BlockType.TOOL_USE:
+                tid = block.get("id", "")
+                if isinstance(tid, str) and tid in _agent_ids:
                     inp = block.get("input", {})
                     if isinstance(inp, dict):
-                        prompt_text = inp.get("prompt", "")
+                        prompt_text = _get_str_field(
+                            cast(dict[str, object], inp), "prompt"
+                        )
                         if isinstance(prompt_text, str) and len(prompt_text) > 200:
                             original_len = len(prompt_text)
                             summary = await provider.distill(
@@ -2896,16 +3090,6 @@ async def _llm_compression_pass(
 
 # --- Compact summary collapse ---
 
-_PROTECTED_TYPES = frozenset(
-    {
-        "content-replacement",
-        "marble-origami-commit",
-        "marble-origami-snapshot",
-        "worktree-state",
-        "task-summary",
-    }
-)
-
 _METADATA_SINGLETON_TYPES = frozenset(
     {
         "last-prompt",
@@ -2951,7 +3135,7 @@ def collapse_compact_summary(parsed_objs: list[dict]) -> tuple[list[dict], dict]
     # Find the last compact boundary index
     last_boundary_idx = None
     for i, obj in enumerate(parsed_objs):
-        if obj.get("type") == "system":
+        if obj.get("type") == MessageType.SYSTEM:
             sub = obj.get("subtype") or obj.get("message", {}).get("subtype", "")
             if sub in ("compact_boundary", "microcompact_boundary"):
                 last_boundary_idx = i
@@ -3042,6 +3226,10 @@ def reduce_session(
     estimate_tokens: bool = False,
     llm_provider: object | None = None,
     progress_callback: object | None = None,
+    session_format: str | None = None,
+    validate_records: bool = False,
+    schema_path: str | None = None,
+    strict_schema_validation: bool = False,
 ) -> ReductionResult:
     """Run the full reduction pipeline on a session JSONL file.
 
@@ -3060,32 +3248,50 @@ def reduce_session(
     with open(path) as f:
         lines = f.readlines()
 
+    outcome = load_records(
+        path,
+        format_hint=session_format,
+        validate=validate_records,
+        schema_path=schema_path,
+        strict=strict_schema_validation,
+    )
+
     # Extract API token count before we strip usage fields (for calibration)
     api_tokens = extract_last_usage(lines) if estimate_tokens else None
     budget = TokenBudget(chars_per_token, api_tokens) if estimate_tokens else None
 
-    orig_size = sum(len(l) for l in lines)
+    parsed = outcome.records
+    orig_size = sum(len(line) for line in lines)
     orig_count = len(lines)
     stats = {}
+    stats["session_format"] = outcome.codec
+    if outcome.errors:
+        stats["record_errors"] = len(outcome.errors)
+    if outcome.warnings:
+        stats["record_warnings"] = len(outcome.warnings)
+    if outcome.schema_warnings:
+        stats["schema_warnings"] = outcome.schema_warnings
+    if outcome.schema_errors:
+        stats["schema_errors"] = outcome.schema_errors
 
     def count(reason):
         stats[reason] = stats.get(reason, 0) + 1
 
     # -- Pass 1: Build maps --
     tool_id_map = {}
-    for line in lines:
-        obj = json.loads(line)
-        if obj.get("type") == "assistant":
+
+    for obj in parsed:
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") == MessageType.ASSISTANT:
             for block in get_content_blocks(obj):
-                if block.get("type") == "tool_use":
+                if block.get("type") == BlockType.TOOL_USE:
                     tool_id_map[block.get("id", "")] = block.get("name", "unknown")
 
     # -- Pass 2: Drop noise, reparent --
     dropped_uuids = {}
     kept_objs = []
     seen_system = set()
-
-    parsed = [json.loads(line) for line in lines]
 
     # -- Compact summary collapse (EARLY: shrinks dataset before noise loop) --
     parsed, compact_stats = collapse_compact_summary(parsed)
@@ -3151,14 +3357,18 @@ def reduce_session(
                     parent = dropped_uuids[parent]
                 obj["parentUuid"] = parent
 
-    # -- Pass 3: Cross-message intelligence --
-    stale_read_ids = detect_stale_reads(kept_objs)
+    # -- Pass 3: Cross-message intelligence (event-stream powered) --
+    # Verb-level detectors fire on Claude AND Codex via the codec projection.
+    # The byte-level duplicate_blocks pass stays inline because text-hash
+    # dedup operates below the verb layer (raw block content, not semantics).
+    findings = compute_record_findings(kept_objs, outcome.codec)
+    stale_read_ids = findings.stale_read_tool_ids
     if stale_read_ids:
         stats["stale_reads_detected"] = len(stale_read_ids)
     duplicate_blocks = detect_duplicate_blocks(kept_objs, tool_id_map=tool_id_map)
     if duplicate_blocks:
         stats["duplicate_blocks_detected"] = len(duplicate_blocks)
-    error_retry_drops = detect_error_retries(kept_objs)
+    error_retry_drops = findings.error_retry_positions
     if error_retry_drops:
         stats["error_retries_collapsed"] = len(error_retry_drops)
     constant_fields = detect_constant_envelope_fields(kept_objs)
@@ -3177,115 +3387,68 @@ def reduce_session(
         relink_parent_chains(new_kept, retry_dropped)
         kept_objs = new_kept
 
-    # -- Pass 2.5: HTTP tool-spam run collapse --
+    # -- Pass 2.5: HTTP tool-spam run collapse (returns new list) --
     kept_objs, http_dropped_uuids, http_spam_stats = collapse_http_spam(kept_objs)
     if http_dropped_uuids:
         dropped_uuids.update(http_dropped_uuids)
     stats.update(http_spam_stats)
 
-    # -- Read result deduplication --
-    read_dedup_stats = dedup_read_results(kept_objs)
-    stats.update(read_dedup_stats)
+    _apply_mutation_pass(stats, dedup_read_results, kept_objs, findings)
 
     # -- Pass 3.5: Semantic elision (safe heuristics) --
-    passing_builds = detect_passing_builds(kept_objs)
-    confirmations = detect_confirmations(kept_objs)
-    stale_read_results = detect_stale_read_results(kept_objs)
-    superseded_edits = detect_superseded_edits(kept_objs)
-    blind_edits = detect_blind_edits(kept_objs)
-    if blind_edits:
-        stats["blind_edits_detected"] = len(blind_edits)
+    # Recompute findings after read-dedup may have mutated kept_objs.
+    findings = compute_record_findings(kept_objs, outcome.codec)
+    passing_builds = findings.passing_build_positions
+    confirmations = findings.confirmation_positions
+    stale_read_results = findings.stale_read_result_positions
+    superseded_edits = findings.superseded_edit_positions
+    blind_edits = findings.blind_edit_positions
+    if findings.blind_edit_count:
+        stats["blind_edits_detected"] = findings.blind_edit_count
 
-    total = len(kept_objs)
-    sem_passing = 0
-    sem_confirmations = 0
-    sem_stale_reads = 0
-    sem_superseded = 0
+    sem_passing = _elide_first_tool_result(
+        kept_objs, passing_builds, aggr_fn, threshold=0.3
+    )
+    sem_stale_reads = _elide_first_tool_result(
+        kept_objs, stale_read_results, aggr_fn, threshold=0.5
+    )
+    sem_confirmations = _elide_message_content(
+        kept_objs, confirmations, aggr_fn, threshold=0.2, replacement="[confirmed]"
+    )
+    sem_superseded = _elide_superseded_edits(
+        kept_objs,
+        superseded_edits,
+        findings.superseded_edit_tool_use_ids,
+        aggr_fn,
+        threshold=0.5,
+    )
 
-    for pos, obj in enumerate(kept_objs):
-        position = pos / max(total - 1, 1)
-        aggr = aggr_fn(position)
+    for _stat_name, _n in (
+        ("passing_builds_collapsed", sem_passing),
+        ("confirmations_removed", sem_confirmations),
+        ("stale_reads_promoted", sem_stale_reads),
+        ("superseded_edits_summarized", sem_superseded),
+    ):
+        if _n:
+            stats[_stat_name] = _n
 
-        # Passing builds: elide when aggr > 0.3
-        if pos in passing_builds and aggr > 0.3:
-            msg = obj.get("message", {})
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        block["content"] = passing_builds[pos]
-                        sem_passing += 1
-                        break
-
-        # Confirmations: elide when aggr > 0.2
-        if pos in confirmations and aggr > 0.2:
-            msg = obj.get("message", {})
-            msg["content"] = "[confirmed]"
-            sem_confirmations += 1
-
-        # Stale read results: elide when aggr > 0.5
-        if pos in stale_read_results and aggr > 0.5:
-            msg = obj.get("message", {})
-            content = msg.get("content")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_result":
-                        tid = block.get("tool_use_id", "")
-                        # Only replace the matching tool_result
-                        if pos in stale_read_results:
-                            block["content"] = stale_read_results[pos]
-                            sem_stale_reads += 1
-                            break
-
-        # Superseded edits: elide when aggr > 0.5
-        if pos in superseded_edits and aggr > 0.5:
-            for block in get_content_blocks(obj):
-                if block.get("type") == "tool_use":
-                    name = block.get("name", "")
-                    if name in ("Edit", "edit", "Write", "write"):
-                        inp = block.get("input", {})
-                        if isinstance(inp, dict):
-                            summary = superseded_edits[pos]
-                            inp.pop("old_string", None)
-                            inp.pop("new_string", None)
-                            inp["_elided"] = summary
-                            sem_superseded += 1
-                            break
-
-    if sem_passing:
-        stats["passing_builds_collapsed"] = sem_passing
-    if sem_confirmations:
-        stats["confirmations_removed"] = sem_confirmations
-    if sem_stale_reads:
-        stats["stale_reads_promoted"] = sem_stale_reads
-    if sem_superseded:
-        stats["superseded_edits_summarized"] = sem_superseded
-
-    # -- Pass 3.55: Collapse edit sequences --
-    edit_collapse_stats = collapse_edit_sequences(kept_objs, aggr_fn)
-    stats.update(edit_collapse_stats)
-
-    # -- Pass 3.55: Replace dead persisted-output references --
-    dead_output_count = _replace_dead_persisted_outputs(kept_objs)
-    if dead_output_count:
-        stats["dead_output_refs_replaced"] = dead_output_count
-
-    # -- Pass 3.56: Age-based tool-result compaction --
+    # -- Mutation passes (collapse / age / dedup / nuclear) --
+    # All mutate kept_objs in place; their return value is a stats dict
+    # (or None / int, normalized by ``_apply_mutation_pass``).
     mid_aggr = aggr_fn(0.5)
-    age_stats = age_tool_results(kept_objs, mid_aggr)
-    stats.update(age_stats)
-
-    # -- Pass 3.57: Strip old images --
-    img_stats = strip_old_images(kept_objs)
-    stats.update(img_stats)
-
-    # -- Pass 3.58: Block-level document dedup (re-injected CLAUDE.md etc.) --
-    doc_dedup_stats = dedup_document_blocks(kept_objs)
-    stats.update(doc_dedup_stats)
-
-    # -- Pass 3.6: Nuclear tool content replacement (deep middle zone) --
-    nuclear_stats = nuclear_tool_replace(kept_objs, aggr_fn, tool_id_map)
-    stats.update(nuclear_stats)
+    _apply_mutation_pass(stats, collapse_edit_sequences, kept_objs, aggr_fn, findings)
+    _apply_mutation_pass(
+        stats,
+        _replace_dead_persisted_outputs,
+        kept_objs,
+        result_key="dead_output_refs_replaced",
+    )
+    _apply_mutation_pass(stats, age_tool_results, kept_objs, mid_aggr)
+    _apply_mutation_pass(stats, strip_old_images, kept_objs)
+    _apply_mutation_pass(stats, dedup_document_blocks, kept_objs)
+    _apply_mutation_pass(
+        stats, nuclear_tool_replace, kept_objs, aggr_fn, tool_id_map, findings
+    )
 
     # -- Pass 3.65 + 3.7: LLM compression (optional) --
     if llm_provider is not None:
@@ -3293,7 +3456,12 @@ def reduce_session(
 
         llm_stats = asyncio.run(
             _llm_compression_pass(
-                kept_objs, aggr_fn, llm_provider, progress_callback, profile=profile
+                kept_objs,
+                aggr_fn,
+                llm_provider,
+                progress_callback,
+                profile=profile,
+                findings=findings,
             )
         )
         stats.update(llm_stats)
@@ -3301,12 +3469,11 @@ def reduce_session(
     total = len(kept_objs)
 
     # -- Pass 3.9: Envelope field stripping --
-    # Strip constant envelope fields from all non-first, non-protected messages.
-    env_stats = strip_envelope_fields(kept_objs, constant_fields)
-    stats.update(env_stats)
+    _apply_mutation_pass(stats, strip_envelope_fields, kept_objs, constant_fields)
 
     # -- Pass 4: Position-aware trimming --
-    bl = lambda key, aggr: blended_limit(key, aggr, agg_lim, gen_lim)
+    def bl(cache_key: str, zone_aggr: float) -> int:
+        return blended_limit(cache_key, zone_aggr, agg_lim, gen_lim)
 
     for pos, obj in enumerate(kept_objs):
         position = pos / max(total - 1, 1)
@@ -3333,105 +3500,80 @@ def reduce_session(
                 for bi, block in enumerate(content):
                     if not isinstance(block, dict):
                         continue
-                    bt = block.get("type")
+                    block_obj = cast(dict[str, object], block)
+                    bt = block_obj.get("type")
 
                     if bt == "text":
-                        text = block.get("text", "")
+                        text = block_obj.get("text", "")
                         if isinstance(text, str):
                             text = structural_compress(text, aggr)
                             ul = _entropy_modulated_limit(text, user_limit)
                             if len(text) > ul:
-                                block["text"] = truncate(text, ul, "user_text")
+                                block_obj["text"] = truncate(text, ul, "user_text")
                                 count("user_prompt_trimmed")
                             else:
-                                block["text"] = text
+                                block_obj["text"] = text
 
                     elif bt == "tool_result":
-                        tool_id = block.get("tool_use_id", "")
+                        tool_id = block_obj.get("tool_use_id", "")
                         tool_name = tool_id_map.get(tool_id, "unknown")
 
+                        # Stale-read / blind-edit / Agent: same str-or-list
+                        # dispatch handled uniformly. The "list shape always
+                        # continues" quirk of the original is preserved by
+                        # checking content-shape after the rewrite count.
+                        inner_is_list = isinstance(block_obj.get("content"), list)
+
                         if tool_id in stale_read_ids and aggr > 0.5:
-                            inner = block.get("content")
-                            if isinstance(inner, str) and len(inner) > 200:
-                                block["content"] = "[stale: file was later edited]"
+                            n = for_each_text_in_tool_result(
+                                block_obj,
+                                _replace_if_longer(200, "[stale: file was later edited]"),
+                            )
+                            for _ in range(n):
                                 count("stale_reads_trimmed")
-                                continue
-                            elif isinstance(inner, list):
-                                for item in inner:
-                                    if (
-                                        isinstance(item, dict)
-                                        and item.get("type") == "text"
-                                    ):
-                                        if len(item.get("text", "")) > 200:
-                                            item["text"] = (
-                                                "[stale: file was later edited]"
-                                            )
-                                            count("stale_reads_trimmed")
+                            if n or inner_is_list:
                                 continue
 
-                        if (pos, bi) in blind_edits and aggr > 0.3:
-                            inner = block.get("content")
-                            if isinstance(inner, str) and len(inner) > 100:
-                                block["content"] = (
-                                    inner[:100] + " [blind edit — file not read first]"
-                                )
+                        if pos in blind_edits and aggr > 0.3:
+                            n = for_each_text_in_tool_result(
+                                block_obj,
+                                _prefix_with_suffix_if_longer(
+                                    100, " [blind edit — file not read first]"
+                                ),
+                            )
+                            for _ in range(n):
                                 count("blind_edits_trimmed")
-                                continue
-                            elif isinstance(inner, list):
-                                for item in inner:
-                                    if (
-                                        isinstance(item, dict)
-                                        and item.get("type") == "text"
-                                    ):
-                                        text = item.get("text", "")
-                                        if len(text) > 100:
-                                            item["text"] = (
-                                                text[:100]
-                                                + " [blind edit — file not read first]"
-                                            )
-                                            count("blind_edits_trimmed")
+                            if n or inner_is_list:
                                 continue
 
-                        # Agent results: compress aggressively in middle zone
-                        # Agent output is redundant with the code it produced
-                        if tool_name == "Agent" and aggr > 0.4:
-                            inner = block.get("content")
-                            agent_limit = max(
-                                200, int(800 * (1 - aggr))
-                            )  # 800 at aggr=0.4, 200 at aggr=0.75+
-                            if isinstance(inner, str) and len(inner) > agent_limit:
-                                block["content"] = truncate(
-                                    inner, agent_limit, "Agent.result"
-                                )
+                        if tool_id in findings.agent_tool_use_ids and aggr > 0.4:
+                            # 800 chars at aggr=0.4, 200 at aggr=0.75+
+                            agent_limit = max(200, int(800 * (1 - aggr)))
+                            n = for_each_text_in_tool_result(
+                                block_obj,
+                                _truncate_if_longer(agent_limit, "Agent.result"),
+                            )
+                            for _ in range(n):
                                 count("agent_results_compressed")
-                                continue
-                            elif isinstance(inner, list):
-                                for item in inner:
-                                    if (
-                                        isinstance(item, dict)
-                                        and item.get("type") == "text"
-                                    ):
-                                        text = item.get("text", "")
-                                        if len(text) > agent_limit:
-                                            item["text"] = truncate(
-                                                text, agent_limit, "Agent.result"
-                                            )
-                                            count("agent_results_compressed")
+                            if n or inner_is_list:
                                 continue
 
-                        trim_tool_result(block, tool_name, aggr, agg_lim, gen_lim)
+                        is_bash = tool_id in findings.bash_tool_use_ids
+                        trim_tool_result(
+                            block_obj, tool_name, aggr, agg_lim, gen_lim, is_bash=is_bash
+                        )
 
                     if (pos, bi) in duplicate_blocks:
-                        text = text_of(block)
+                        text = block_text(block_obj)
                         preview = _strip_non_ascii(text[:60].replace("\n", " "))
                         if bt == "text":
-                            block["text"] = (
+                            block_obj["text"] = (
                                 f"[duplicate content, first seen earlier: {preview}...]"
                             )
                         elif bt == "tool_result" and isinstance(
-                            block.get("content"), str
+                            block_obj.get("content"), str
                         ):
-                            block["content"] = f"[duplicate content: {preview}...]"
+                            block_obj["content"] = f"[duplicate content: {preview}...]"
                         count("duplicate_blocks_deduped")
 
         # -- System messages --
@@ -3460,15 +3602,19 @@ def reduce_session(
                     if not isinstance(block, dict):
                         new_content.append(block)
                         continue
-                    bt = block.get("type")
+                    block_obj = cast(dict[str, object], block)
+                    bt = block_obj.get("type")
 
                     if bt == "thinking":
                         think_limit = bl("thinking", aggr)
-                        thinking = block.get("thinking", "")
+                        thinking = block_obj.get("thinking", "")
+                        if not isinstance(thinking, str):
+                            new_content.append(block_obj)
+                            continue
                         if think_limit == 0:
                             count("thinking_removed")
                             continue
-                        block = dict(block)
+                        block = dict(block_obj)
                         original_thinking = thinking
                         thinking = structural_compress(thinking, aggr)
                         if len(thinking) > think_limit:
@@ -3495,52 +3641,24 @@ def reduce_session(
                         continue
 
                     if bt == "text":
-                        text = block.get("text", "")
+                        text = block_obj.get("text", "")
                         if isinstance(text, str) and text:
-                            block["text"] = structural_compress(text, aggr)
+                            block_obj["text"] = structural_compress(text, aggr)
 
                     if bt == "tool_use":
-                        inp = block.get("input", {})
-                        name = block.get("name", "")
-                        if isinstance(inp, dict):
-                            # Apply structural compression to string inputs
-                            for inp_key, inp_val in inp.items():
-                                if isinstance(inp_val, str):
-                                    inp[inp_key] = structural_compress(inp_val, aggr)
-                            if name == "Write":
-                                trim_string(
-                                    inp,
-                                    "content",
-                                    bl("tool_input.Write", aggr),
-                                    "Write.content",
-                                )
-                            elif name == "Edit":
-                                lim = bl("tool_input.Edit", aggr)
-                                trim_string(inp, "old_string", lim, "Edit.old_string")
-                                trim_string(inp, "new_string", lim, "Edit.new_string")
-                            elif name == "Agent":
-                                trim_string(
-                                    inp,
-                                    "prompt",
-                                    bl("tool_input.Agent", aggr),
-                                    "Agent.prompt",
-                                )
-                            elif name == "Bash":
-                                if isinstance(inp.get("command"), str):
-                                    cmd = inp["command"]
-                                    cmd = structural_compress(cmd, aggr)
-                                    cmd_limit = bl("tool_input.Bash", aggr)
-                                    if len(cmd) > cmd_limit:
-                                        inp["command"] = truncate(
-                                            cmd, cmd_limit, "tool_input.Bash"
-                                        )
+                        inp = block_obj.get("input", {})
+                        name = block_obj.get("name", "")
+                        if isinstance(inp, dict) and isinstance(name, str):
+                            _trim_tool_use_input(
+                                cast(dict[str, object], inp), name, aggr, bl
+                            )
 
                     if (pos, bi) in duplicate_blocks:
-                        text = text_of(block)
+                        text = block_text(block_obj)
                         preview = _strip_non_ascii(text[:60].replace("\n", " "))
                         if bt == "text":
                             block = dict(block)
-                            block["text"] = f"[duplicate content: {preview}...]"
+                            block_obj["text"] = f"[duplicate content: {preview}...]"
                         count("duplicate_blocks_deduped")
 
                     new_content.append(block)
@@ -3550,11 +3668,11 @@ def reduce_session(
         if t in ("user", "assistant"):
             for block in get_content_blocks(obj):
                 if isinstance(block, dict):
-                    if block.get("type") == "text" and isinstance(
+                    if block.get("type") == BlockType.TEXT and isinstance(
                         block.get("text"), str
                     ):
                         block["text"] = dedup_system_reminders(block["text"])
-                    elif block.get("type") == "tool_result" and isinstance(
+                    elif block.get("type") == BlockType.TOOL_RESULT and isinstance(
                         block.get("content"), str
                     ):
                         block["content"] = dedup_system_reminders(block["content"])
@@ -3566,11 +3684,33 @@ def reduce_session(
 
         # Stamp reduce tag on every message
         # structural=True only when compression was actually applied (aggr > 0.2)
-        if aggr > 0.2:
-            stamp_reduce_tag(obj, structural=True, profile=profile)
-        elif not get_reduce_tag(obj):
-            # Tag unprocessed messages so they show as "seen but not compressed"
-            stamp_reduce_tag(obj, profile=profile)
+        msg = obj.get("message")
+        has_message_payload = False
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            if isinstance(content, str):
+                has_message_payload = bool(content.strip())
+            elif isinstance(content, list):
+                has_message_payload = len(content) > 0
+            elif isinstance(content, dict):
+                for value in content.values():
+                    if isinstance(value, str):
+                        if value.strip():
+                            has_message_payload = True
+                            break
+                    elif value:
+                        has_message_payload = True
+                        break
+        if (
+            llm_provider is not None
+            and t in ("user", "assistant", "system")
+            and has_message_payload
+        ):
+            if aggr > 0.2:
+                stamp_reduce_tag(obj, structural=True, profile=profile)
+            elif not get_reduce_tag(obj):
+                # Tag unprocessed messages so they show as "seen but not compressed"
+                stamp_reduce_tag(obj, profile=profile)
 
     # -- Strip constant/redundant metadata fields --
     meta_stripped = strip_constant_metadata(
@@ -3605,7 +3745,7 @@ def reduce_session(
 
     # -- Serialize to JSON lines --
     kept_lines = [json.dumps(obj, separators=(",", ":")) + "\n" for obj in kept_objs]
-    new_size = sum(len(l) for l in kept_lines)
+    new_size = sum(len(line) for line in kept_lines)
 
     return ReductionResult(
         kept_lines=kept_lines,

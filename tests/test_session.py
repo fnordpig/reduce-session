@@ -1,13 +1,9 @@
 import json
 import shutil
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-import pytest
 
 from reduce_session.session import (
-    Exchange,
-    SessionInfo,
     derive_project_name,
     format_age,
     parse_tail,
@@ -223,6 +219,316 @@ def test_scan_projects_skips_zero_byte(sample_project_dir, tmp_path):
     empty.write_text("")
     sessions = scan_projects(tmp_path / "projects")
     assert len(sessions) == 1  # only the non-empty one
+
+
+def test_scan_projects_discover_codex_sessions(tmp_path):
+    codex_dir = tmp_path / "codex_sessions"
+    codex_dir.mkdir()
+
+    # Flat root file (not inside a project folder)
+    root_file = codex_dir / "session-root.jsonl"
+    root_file.write_text(
+        json.dumps(
+            {
+                "type": "SessionMetaLine",
+                "id": "deadbeef-0000-0000-0000-000000000001",
+                "message": {"role": "system", "content": "root"},
+                "timestamp": "2026-03-23T01:00:00Z",
+            }
+        )
+        + "\n"
+    )
+
+    # Nested project file
+    project_dir = codex_dir / "workspace-a"
+    project_dir.mkdir()
+    project_file = project_dir / "session-nested.jsonl"
+    project_file.write_text(
+        json.dumps(
+            {
+                "type": "SessionMetaLine",
+                "id": "deadbeef-0000-0000-0000-000000000002",
+                "message": {"role": "system", "content": "nested"},
+                "timestamp": "2026-03-23T02:00:00Z",
+            }
+        )
+        + "\n"
+    )
+
+    sessions = scan_projects(codex_dir, provider="codex")
+    assert len(sessions) == 2
+    assert {s.project_name for s in sessions} == {"codex", "workspace-a"}
+
+
+def test_scan_projects_codex_default_branch(tmp_path):
+    """Codex sessions without gitBranch should still have a concrete branch label."""
+    codex_dir = tmp_path / "codex_sessions"
+    codex_dir.mkdir()
+
+    nested = codex_dir / "workspace-a"
+    nested.mkdir()
+    session_file = nested / "session-no-branch.jsonl"
+    session_file.write_text(
+        json.dumps(
+            {
+                "type": "SessionMetaLine",
+                "id": "deadbeef-0000-0000-0000-000000000005",
+                "message": {
+                    "id": "deadbeef-0000-0000-0000-000000000005",
+                    "role": "system",
+                    "content": "no branch",
+                },
+                "timestamp": "2026-03-23T03:00:00Z",
+            }
+        )
+        + "\n"
+    )
+
+    sessions = scan_projects(codex_dir, provider="codex")
+    assert len(sessions) == 1
+    assert sessions[0].branch == "main"
+
+
+def test_scan_projects_codex_derive_project_and_branch_from_payload_cwd(tmp_path):
+    """Codex sessions with payload.cwd should infer branch from git HEAD."""
+    codex_dir = tmp_path / "codex_sessions"
+    codex_dir.mkdir()
+
+    workspace = codex_dir / "workspace-a"
+    workspace.mkdir()
+
+    repo_root = tmp_path / "src" / "mine" / "workspace-a"
+    repo_root.mkdir(parents=True)
+    (repo_root / ".git").mkdir()
+    (repo_root / ".git" / "HEAD").write_text("ref: refs/heads/feature/infer-test\n")
+
+    session_file = workspace / "session-with-cwd.jsonl"
+    session_file.write_text(
+        json.dumps(
+            {
+                "type": "SessionMetaLine",
+                "id": "deadbeef-0000-0000-0000-000000000006",
+                "message": {
+                    "id": "deadbeef-0000-0000-0000-000000000006",
+                    "role": "system",
+                    "content": "cwd-based session",
+                },
+                "payload": {
+                    "cwd": str(repo_root),
+                },
+                "timestamp": "2026-03-23T04:00:00Z",
+            }
+        )
+        + "\n"
+    )
+
+    sessions = scan_projects(codex_dir, provider="codex")
+    assert len(sessions) == 1
+    assert sessions[0].project_name == "workspace-a"
+    assert sessions[0].branch == "infer-test"
+
+
+def test_scan_projects_codex_sorted_newest_first(tmp_path):
+    codex_dir = tmp_path / "codex_sessions"
+    codex_dir.mkdir()
+    old = codex_dir / "session-old.jsonl"
+    old.write_text(
+        json.dumps(
+            {
+                "type": "SessionMetaLine",
+                "id": "deadbeef-0000-0000-0000-000000000003",
+                "timestamp": "2026-03-20T00:00:00Z",
+            }
+        )
+        + "\n"
+    )
+    new = codex_dir / "session-new.jsonl"
+    new.write_text(
+        json.dumps(
+            {
+                "type": "SessionMetaLine",
+                "id": "deadbeef-0000-0000-0000-000000000004",
+                "timestamp": "2026-03-23T00:00:00Z",
+            }
+        )
+        + "\n"
+    )
+
+    sessions = scan_projects(codex_dir, provider="codex")
+    assert len(sessions) == 2
+    # Newest first
+    assert sessions[0].path.name == new.name
+    assert sessions[1].path.name == old.name
+
+
+def test_parse_tail_normalizes_codex_sessionmeta_records(tmp_path):
+    f = tmp_path / "session.jsonl"
+    lines = [
+        json.dumps(
+            {
+                "type": "SessionMetaLine",
+                "id": "123e4567-e89b-12d3-a456-426614174000",
+                "content": "session start",
+                "timestamp": "2026-04-06T14:27:53.463300",
+            }
+        ),
+        json.dumps({"type": "EventMsg", "content": "follow-up", "id": "x"}),
+    ]
+    f.write_text("\n".join(lines) + "\n")
+    exchanges, token_est, last_ts = parse_tail(f)
+    assert len(exchanges) == 2
+    assert exchanges[0].text == "session start"
+    assert exchanges[1].text == "follow-up"
+    assert last_ts is not None
+
+
+def test_scan_projects_rollout_continuations_are_merged(tmp_path):
+    codex_dir = tmp_path / "codex_sessions"
+    codex_dir.mkdir()
+    repo = codex_dir / "workspace-a"
+    repo.mkdir()
+
+    main_file = repo / "main.jsonl"
+    main_file.write_text(
+        json.dumps(
+            {
+                "type": "SessionMetaLine",
+                "id": "11111111-1111-1111-1111-111111111111",
+                "content": "main only",
+                "timestamp": "2026-03-23T01:00:00Z",
+            }
+        )
+        + "\n"
+    )
+
+    (repo / "rollout-a.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "EventMsg",
+                "content": "continuation content",
+                "id": "22222222-2222-2222-2222-222222222222",
+            }
+        )
+        + "\n"
+    )
+
+    sessions = scan_projects(codex_dir, provider="codex")
+    assert len(sessions) == 1
+    assert sessions[0].path == main_file
+    assert len(sessions[0].continuation_files) == 1
+    assert sessions[0].continuation_files[0].name.startswith("rollout-")
+    assert any(ex.text == "continuation content" for ex in sessions[0].last_exchanges)
+
+
+def test_scan_projects_codex_bundles_rollouts_by_parent_thread(tmp_path):
+    codex_dir = tmp_path / "codex_sessions"
+    codex_dir.mkdir()
+    repo_dir = codex_dir / "workspace-a"
+    repo_dir.mkdir()
+
+    parent = "019e0e49-8998-7701-942b-9877a56bdfaf"
+    child = "019e0eb0-59c9-75f2-ab61-2f7cd1f21bf0"
+
+    (repo_dir / f"rollout-root-{parent}.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {"id": parent, "source": "cli", "thread_source": "user"},
+                        "timestamp": "2026-05-09T19:53:02.814Z",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": "parent request",
+                        },
+                        "timestamp": "2026-05-09T19:53:03.000Z",
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+
+    (repo_dir / f"rollout-child-{child}.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": child,
+                            "source": {
+                                "subagent": {
+                                    "thread_spawn": {
+                                        "parent_thread_id": parent,
+                                    }
+                                }
+                            },
+                        },
+                        "timestamp": "2026-05-09T19:53:04.814Z",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": "agent reply",
+                        },
+                        "timestamp": "2026-05-09T19:53:05.000Z",
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+
+    sessions = scan_projects(codex_dir, provider="codex")
+    assert len(sessions) == 1
+    assert sessions[0].session_id == parent
+    assert len(sessions[0].continuation_files) == 1
+
+
+def test_scan_projects_codex_does_not_bundle_unrelated_rollout_threads(tmp_path):
+    codex_dir = tmp_path / "codex_sessions"
+    codex_dir.mkdir()
+    repo_dir = codex_dir / "workspace-a"
+    repo_dir.mkdir()
+
+    parent_a = "019e0e49-8998-7701-942b-9877a56bdfaf"
+    parent_b = "019e0f24-487a-7543-a662-8c083ba44716"
+
+    (repo_dir / f"rollout-a-{parent_a}.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": parent_a, "source": "cli"},
+                "timestamp": "2026-05-09T19:53:02.814Z",
+            }
+        )
+        + "\n"
+    )
+    (repo_dir / f"rollout-b-{parent_b}.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {"id": parent_b, "source": "cli"},
+                "timestamp": "2026-05-09T19:55:02.814Z",
+            }
+        )
+        + "\n"
+    )
+
+    sessions = scan_projects(codex_dir, provider="codex")
+    assert len(sessions) == 2
+    assert {s.session_id for s in sessions} == {parent_a, parent_b}
 
 
 def test_continuation_file_grouping(sample_project_dir, tmp_path):

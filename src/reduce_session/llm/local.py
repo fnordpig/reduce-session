@@ -4,15 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import importlib
 import logging
 import os
 import sys
+from typing import Any, cast
 
 from reduce_session.llm.base import Category
 from reduce_session.llm.prompts import (
     CLASSIFY_SYSTEM,
-    DISTILL_STRIP_SYSTEM,
-    DISTILL_SUMMARIZE_SYSTEM,
     format_classify_prompt,
     format_distill_prompt,
     parse_classify_response,
@@ -107,6 +107,12 @@ class LocalProvider:
         # Lazy-loaded model handles
         self._models: dict[str, object] = {}
 
+    def _require_module(self, module_name: str) -> Any:
+        try:
+            return importlib.import_module(module_name)
+        except ImportError as exc:
+            raise RuntimeError(f"Required optional dependency '{module_name}' is missing.") from exc
+
     def _load_model(self, model_key: str) -> object:
         """Lazy-load a model on first use."""
         if model_key in self._models:
@@ -118,19 +124,20 @@ class LocalProvider:
             path = self._distiller_path
 
         if self._backend == "mlx":
-            import mlx_lm  # type: ignore[import-not-found]
+            mlx_lm = self._require_module("mlx_lm")
 
             repo = (
                 self._classifier_repo
                 if model_key == "classifier"
                 else self._distiller_repo
             )
-            model, tokenizer = mlx_lm.load(repo)
+            model, tokenizer = mlx_lm.load(repo)  # type: ignore[misc]
             self._models[model_key] = (model, tokenizer)
         else:
-            from llama_cpp import Llama  # type: ignore[import-not-found]
+            llama_module = self._require_module("llama_cpp")
+            llama_class = llama_module.Llama
 
-            llama = Llama(model_path=path, n_ctx=4096, verbose=False)
+            llama = llama_class(model_path=path, n_ctx=4096, verbose=False)
             self._models[model_key] = llama
 
         log.info("Loaded %s model (%s backend)", model_key, self._backend)
@@ -144,9 +151,9 @@ class LocalProvider:
         model = self._load_model(model_key)
 
         if self._backend == "mlx":
-            import mlx_lm  # type: ignore[import-not-found]
+            mlx_lm = self._require_module("mlx_lm")
 
-            mdl, tokenizer = model  # type: ignore[misc]
+            mdl, tokenizer = cast(tuple[Any, Any], model)
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -159,7 +166,7 @@ class LocalProvider:
                 )
 
         else:
-            llama = model  # type: ignore[assignment]
+            llama = cast(Any, model)
 
             def _run() -> str:
                 response = llama.create_chat_completion(

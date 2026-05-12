@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from .invariants import PruneLockError, atomic_write_bytes, prune_lock
+from .invariants import atomic_write_bytes, prune_lock
 
 
 GITIGNORE_CONTENT = """\

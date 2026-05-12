@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from pathlib import Path
 
 from .invariants import atomic_write_jsonl, atomic_write_text
@@ -18,8 +17,6 @@ from fastmcp import FastMCP
 from .session import (
     scan_projects,
     SessionInfo,
-    resolve_slug_to_path,
-    derive_project_name,
 )
 from .widgets import parse_browse_exchanges, BrowseExchange, get_section_snippet
 
@@ -34,11 +31,46 @@ mcp = FastMCP(
 )
 
 
-def _get_projects_dir() -> Path:
+def _get_codex_roots() -> list[Path]:
+    candidates: list[Path] = []
+    code_home = os.environ.get("CODEX_HOME")
+    if code_home:
+        code_home_path = Path(code_home).expanduser()
+        candidates.extend([code_home_path / "sessions", code_home_path / "projects"])
+    candidates.extend([Path.home() / ".codex" / "sessions", Path.home() / ".codex" / "projects"])
+
+    deduped: list[Path] = []
+    for candidate in candidates:
+        expanded = candidate.expanduser()
+        if expanded.exists() and expanded not in deduped:
+            deduped.append(expanded)
+    return deduped
+
+
+def _get_projects_dir() -> dict[str, Path | list[Path]]:
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     if config_dir:
-        return Path(config_dir) / "projects"
-    return Path.home() / ".claude" / "projects"
+        claude_dir = Path(config_dir) / "projects"
+    else:
+        claude_dir = Path.home() / ".claude" / "projects"
+    codex_roots = _get_codex_roots()
+    if not codex_roots:
+        return {"claude": claude_dir}
+    if len(codex_roots) == 1:
+        return {"claude": claude_dir, "codex": codex_roots[0]}
+    return {"claude": claude_dir, "codex": codex_roots}
+
+
+def _resolve_schema_path(session_format: str | None) -> str | None:
+    if session_format in (None, "auto"):
+        return None
+    base = Path(__file__).resolve().parent.parent.parent / "schemas"
+    mapping = {"claude": "claude.json", "codex": "codex_session_schema.json"}
+    file_name = mapping.get(session_format.lower())
+    if file_name is None:
+        return None
+    candidate = base / file_name
+    return str(candidate) if candidate.exists() else None
 
 
 def _session_to_dict(s: SessionInfo) -> dict:
@@ -56,6 +88,11 @@ def _session_to_dict(s: SessionInfo) -> dict:
         "is_dangling": s.is_dangling,
         "continuation_count": len(s.continuation_files),
         "parse_error": s.parse_error,
+        "provider": s.provider,
+        "branch": s.branch,
+        "branch_last_timestamp": s.branch_last_timestamp.isoformat()
+        if s.branch_last_timestamp
+        else None,
     }
 
 
@@ -86,20 +123,41 @@ def _exchange_to_dict(ex: BrowseExchange) -> dict:
 def list_sessions() -> str:
     """List all Claude Code sessions with metadata.
 
-    Returns sessions grouped by project, sorted alphabetically.
+    Returns sessions grouped by provider and project, sorted alphabetically.
     Each session includes: project name, resolved directory path,
     session ID, file size, estimated tokens, age, line count.
     """
-    sessions = scan_projects(_get_projects_dir())
-    projects: dict[str, list[dict]] = {}
+    sessions = []
+    for provider, root in _get_projects_dir().items():
+        roots = [root] if isinstance(root, Path) else root
+        for provider_root in roots:
+            if provider_root.exists():
+                sessions.extend(scan_projects(provider_root, provider=provider))
+    providers: dict[str, dict[str, list[dict]]] = {}
     for s in sessions:
-        projects.setdefault(s.project_name, []).append(_session_to_dict(s))
+        provider_projects = providers.setdefault(s.provider, {})
+        provider_projects.setdefault(s.project_name, []).append(_session_to_dict(s))
+
+    provider_rows: dict[str, dict[str, list[dict]]] = {}
+    for provider, projects in providers.items():
+        provider_rows[provider] = {
+            project_name: sorted(
+                project_sessions,
+                key=lambda session: (
+                    session.get("branch_last_timestamp") or "",
+                    session.get("branch") or "",
+                    session.get("line_count", 0),
+                ),
+                reverse=True,
+            )
+            for project_name, project_sessions in sorted(projects.items())
+        }
 
     result = {
         "total_sessions": len(sessions),
         "total_tokens": sum(s.token_estimate for s in sessions),
         "total_size_mb": round(sum(s.size_bytes for s in sessions) / 1_000_000, 2),
-        "projects": projects,
+        "providers": provider_rows,
     }
     return json.dumps(result, indent=2)
 
@@ -384,8 +442,12 @@ def reduce(
     session_path: str,
     profile: str = "standard",
     llm: str | None = None,
-    cut: float = 0.1,
-    fade: float = 0.3,
+    cut: int = 10,
+    fade: int = 75,
+    session_format: str = "auto",
+    validate_schema: bool = False,
+    schema_path: str | None = None,
+    validate_schema_strict: bool = False,
 ) -> str:
     """Run the full reduction pipeline on a session file.
 
@@ -393,8 +455,12 @@ def reduce(
         session_path: Full path to the .jsonl file
         profile: Reduction profile — "standard" or "aggressive"
         llm: LLM provider spec for classification (e.g., "anthropic", "ollama:llama3.2")
-        cut: Head-zone cutoff fraction (default 0.1)
-        fade: Fade-in fraction after cutoff (default 0.3)
+        cut: Head-zone cutoff percentage (default 10)
+        fade: Fade-in percentage after cutoff (default 75)
+        session_format: Force codec to claude or codex; "auto" to detect
+        validate_schema: Validate normalized records against schema
+        schema_path: Optional explicit schema path (defaults by format)
+        validate_schema_strict: Treat schema issues as hard failures
     """
     from .reduction import reduce_session
     from .git_ops import do_apply
@@ -411,7 +477,26 @@ def reduce(
         fade=fade,
         profile=profile,
         llm_provider=llm_provider,
+        session_format=None if session_format == "auto" else session_format,
+        validate_records=validate_schema,
+        schema_path=(
+            schema_path
+            if schema_path
+            else _resolve_schema_path(None if session_format == "auto" else session_format)
+        ),
+        strict_schema_validation=validate_schema_strict,
     )
+
+    if validate_schema and validate_schema_strict and result.stats.get("schema_errors", 0):
+        return json.dumps(
+            {
+                "error": "schema_validation_failed",
+                "schema_errors": result.stats.get("schema_errors", 0),
+                "schema_warnings": result.stats.get("schema_warnings", 0),
+                "stats": result.stats,
+            },
+            indent=2,
+        )
 
     # Write the result
     reduced_path = session_path + ".reduced"
@@ -602,12 +687,7 @@ def classify_exchange(
 # ── Helpers ──────────────────────────────────────────────────────────
 
 
-def _format_tokens(tokens: int) -> str:
-    if tokens >= 1_000_000:
-        return f"{tokens / 1_000_000:.1f}M"
-    if tokens >= 1_000:
-        return f"{tokens // 1_000}k"
-    return str(tokens)
+from .formatting import format_tokens as _format_tokens  # noqa: E402
 
 
 def main():
