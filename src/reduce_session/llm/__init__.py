@@ -32,30 +32,38 @@ def _detect_ollama_model() -> str:
     return "qwen3:4b"  # fallback default
 
 
+_ANTHROPIC_ALIASES = {
+    "haiku": "claude-haiku-4-5-20251001",
+    "sonnet": "claude-sonnet-4-6-20250514",
+    "opus": "claude-opus-4-6-20250514",
+}
+
+
 def _resolve_anthropic_model(spec: str) -> str:
-    """Resolve an alias like 'haiku' to the latest matching Anthropic model ID."""
-    # If it looks like a full model ID already, use it
+    """Resolve an alias like 'haiku' to a matching Anthropic model ID.
+
+    Hits the known-alias table first to avoid an api.anthropic.com round-trip
+    on every startup. Set REDUCE_SESSION_ANTHROPIC_RESOLVE=1 to force the
+    network discovery path (picks up newer model versions, but adds ~1s).
+    """
     if spec.startswith("claude-"):
         return spec
+    alias_key = spec.lower()
+    if alias_key in _ANTHROPIC_ALIASES and not os.environ.get(
+        "REDUCE_SESSION_ANTHROPIC_RESOLVE"
+    ):
+        return _ANTHROPIC_ALIASES[alias_key]
     try:
         import anthropic
 
         client = anthropic.Anthropic()
         models = client.models.list()
-        # Find all models matching the alias (e.g., "haiku" matches "claude-haiku-*")
-        matches = [m.id for m in models.data if spec.lower() in m.id.lower()]
+        matches = [m.id for m in models.data if alias_key in m.id.lower()]
         if matches:
-            # Sort lexicographically — later dates/versions sort higher
             return sorted(matches)[-1]
     except Exception:
         pass
-    # Fallback: construct a reasonable guess
-    _fallbacks = {
-        "haiku": "claude-haiku-4-5-20251001",
-        "sonnet": "claude-sonnet-4-6-20250514",
-        "opus": "claude-opus-4-6-20250514",
-    }
-    return _fallbacks.get(spec.lower(), f"claude-{spec}")
+    return _ANTHROPIC_ALIASES.get(alias_key, f"claude-{spec}")
 
 
 def _resolve_openai_model(spec: str) -> str:

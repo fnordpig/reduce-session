@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
-from .session_formats import detect_codec
+from .session_formats import SessionCodec, detect_codec
 from .typing_aliases import BlockType
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -297,13 +297,21 @@ def _ensure_aware_utc(ts: datetime | None) -> datetime | None:
     return ts
 
 
-def _normalize_session_record(record: object) -> dict[str, object] | None:
-    """Normalize format-specific session records into a common structure."""
+def _normalize_session_record(
+    record: object, codec: SessionCodec | None = None
+) -> dict[str, object] | None:
+    """Normalize format-specific session records into a common structure.
+
+    Pass ``codec`` when normalizing records from a single file in a loop —
+    all records in one session share a codec, and detect_codec is expensive
+    enough to be worth caching.
+    """
     if not isinstance(record, dict):
         return None
     try:
         typed_record = cast(dict[str, Any], record)
-        codec = detect_codec([typed_record])
+        if codec is None:
+            codec = detect_codec([typed_record])
         normalized = codec.normalize(typed_record)
         if isinstance(normalized, dict):
             return cast(dict[str, object], normalized)
@@ -484,6 +492,7 @@ def _derive_codex_project_name(parent_dir: Path, root: Path) -> str | None:
 def _extract_session_id_from_file(path: Path) -> str | None:
     """Read a session file and return a best-effort session identifier."""
     try:
+        cached_codec: SessionCodec | None = None
         with open(path, "r", errors="replace") as f:
             for raw in f:
                 raw = raw.strip()
@@ -494,7 +503,9 @@ def _extract_session_id_from_file(path: Path) -> str | None:
                 except (json.JSONDecodeError, ValueError):
                     continue
 
-                record = _normalize_session_record(record)
+                if cached_codec is None and isinstance(record, dict):
+                    cached_codec = detect_codec([cast(dict[str, Any], record)])
+                record = _normalize_session_record(record, codec=cached_codec)
                 if not isinstance(record, dict):
                     continue
 
@@ -620,6 +631,7 @@ def _extract_codex_bundle_id(
         return None
 
     try:
+        cached_codec: SessionCodec | None = None
         with open(path, "r", errors="replace") as f:
             for raw in f:
                 raw = raw.strip()
@@ -630,7 +642,9 @@ def _extract_codex_bundle_id(
                 except (json.JSONDecodeError, ValueError):
                     continue
 
-                record = _normalize_session_record(record)
+                if cached_codec is None and isinstance(record, dict):
+                    cached_codec = detect_codec([cast(dict[str, Any], record)])
+                record = _normalize_session_record(record, codec=cached_codec)
                 if not isinstance(record, dict):
                     continue
                 record = cast(dict[str, Any], record)
@@ -944,6 +958,7 @@ def _parse_raw_lines(
     token_estimate = 0
     last_timestamp: datetime | None = None
     found_usage = False
+    cached_codec: SessionCodec | None = None
 
     for raw in raw_lines:
         raw = raw.strip()
@@ -954,7 +969,9 @@ def _parse_raw_lines(
         except (json.JSONDecodeError, ValueError):
             continue
 
-        record = _normalize_session_record(record)
+        if cached_codec is None and isinstance(record, dict):
+            cached_codec = detect_codec([cast(dict[str, Any], record)])
+        record = _normalize_session_record(record, codec=cached_codec)
         if not isinstance(record, dict):
             continue
         normalized_record = cast(dict[str, Any], record)
@@ -1175,6 +1192,7 @@ def _extract_branch_metadata(
     source_root: Path | None = None
 
     try:
+        cached_codec: SessionCodec | None = None
         with open(path, "r", errors="replace") as f:
             for raw in f:
                 raw = raw.strip()
@@ -1185,7 +1203,9 @@ def _extract_branch_metadata(
                 except (json.JSONDecodeError, ValueError):
                     continue
 
-                record = _normalize_session_record(record)
+                if cached_codec is None and isinstance(record, dict):
+                    cached_codec = detect_codec([cast(dict[str, Any], record)])
+                record = _normalize_session_record(record, codec=cached_codec)
                 if not isinstance(record, dict):
                     continue
                 record = cast(dict[str, Any], record)
@@ -1233,8 +1253,10 @@ def _extract_branch_metadata(
                         if branch_candidate == "main":
                             branch_candidate = None
 
-                    if not branch_candidate and cwd:
-                        branch_candidate = _derive_branch_from_head(cwd)
+                    # _derive_branch_from_head(cwd) is invariant across all records
+                    # in a single file — hoisted to the post-loop fallback at the
+                    # bottom of this function so we read .git/HEAD once instead of
+                    # ~2000× per session.
 
                     if branch_candidate and _branch_candidate_is_plausible(branch_candidate):
                         branch = branch_candidate
@@ -1465,27 +1487,14 @@ def scan_projects(projects_dir: Path, provider: str = "claude") -> list[SessionI
                 if bundle_id is None:
                     bundle_id = session_id
 
-                (
-                    _,
-                    _,
-                    project_name,
-                    _,
-                    _,
-                    source_path,
-                    source_root,
-                    discovered_session_title,
-                ) = _extract_branch_metadata(f, allow_heuristic_branch=True)
-
-                if project_name is None:
-                    if source_root is not None:
-                        project_name = _derive_codex_project_name(source_root, source_root)
-                    if project_name is None:
-                        project_name = "codex"
-
-                group_key = (bundle_id, project_name)
+                # project_name + session_title are rediscovered by
+                # _extract_codex_bundle_metadata in the second pass; calling
+                # _extract_branch_metadata here re-parses every JSONL file
+                # for fields we throw away. The bundle key only needs bundle_id;
+                # the placeholder "" keeps the existing (bundle_id, project_name)
+                # tuple shape intact for the merge logic below.
+                group_key = (bundle_id, "")
                 grouped_bundle_files.setdefault(group_key, []).append(f)
-                if discovered_session_title and session_id:
-                    codex_names.setdefault(session_id, discovered_session_title)
 
             # Codex rollout continuations: a ``rollout-*.jsonl`` file with no
             # matching non-rollout sibling in the same bundle should be merged
@@ -1623,10 +1632,11 @@ def scan_projects(projects_dir: Path, provider: str = "claude") -> list[SessionI
                     branch_last_ts = last_ts
 
                 age_display = format_age(last_ts) if last_ts else "?"
-                try:
-                    density = compute_density_profile(session_display_path)
-                except Exception:
-                    density = []
+                # density_profile is rendered only for the highlighted session
+                # in the TUI (widgets.py:312). Computing it for all sessions
+                # eats ~50ms/session of scan time. Leave empty; the widget
+                # backfills on highlight via compute_density_profile(path).
+                density: list[int] = []
 
                 sessions.append(
                     SessionInfo(
@@ -1705,7 +1715,9 @@ def scan_projects(projects_dir: Path, provider: str = "claude") -> list[SessionI
                 if tok:
                     token_estimate = tok
                 if not last_exchanges:
-                    token_estimate = sum(_count_lines(path) for _ in [path]) // 14
+                    # line_count was just computed at the top of this branch; no
+                    # need to re-read the file.
+                    token_estimate = line_count // 14
 
                 for continuation_path in continuation_map.get((parent_dir, uuid), []):
                     ce, ct, _ = parse_tail(continuation_path)
@@ -1721,10 +1733,8 @@ def scan_projects(projects_dir: Path, provider: str = "claude") -> list[SessionI
                 parse_error = True
 
             age_display = format_age(last_ts) if last_ts else "?"
-            try:
-                density = compute_density_profile(path)
-            except Exception:
-                density = []
+            # See comment above re: lazy density_profile.
+            density: list[int] = []
 
             sessions.append(
                 SessionInfo(

@@ -308,7 +308,14 @@ class InfoBar(Static):
         combined.append("\n")
         combined.append_text(gauge)
 
-        # Line 3: density heatmap
+        # Line 3: density heatmap. scan_projects no longer pre-computes the
+        # profile (saves ~50ms/session); compute on demand and cache.
+        if not session.density_profile:
+            try:
+                from .session import compute_density_profile
+                session.density_profile = compute_density_profile(session.path)
+            except Exception:
+                session.density_profile = []
         if session.density_profile:
             heatmap = render_density_heatmap(session.density_profile)
             combined.append("\n")

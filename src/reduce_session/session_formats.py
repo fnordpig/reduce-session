@@ -10,6 +10,249 @@ from typing import Any, cast
 from .typing_aliases import BlockType, Role
 
 
+# Module-level constants and helpers shared by CodexCodec.normalize.
+# These were previously rebuilt or redefined on every call (~293K times during
+# a 101-session scan), which dominated the cold-start profile. Hoisting them
+# preserves behavior while removing per-call allocation overhead.
+
+_CODEX_TYPE_TO_ROLE: dict[str, str] = {
+    "SessionMetaLine": "system",
+    "session_meta": "system",
+    "session_meta_line": "system",
+    "EventMsg": "assistant",
+    "RolloutLine": "assistant",
+    "response": "assistant",
+    "response_item": "assistant",
+}
+
+_CODEX_PAYLOAD_TYPE_TO_ROLE: dict[str, str] = {
+    "user_message": "user",
+    "assistant_message": "assistant",
+    "agent_message": "assistant",
+    "message": "assistant",
+    "function_call": "assistant",
+    "function_call_output": "assistant",
+    "tool_search_call": "assistant",
+    "tool_search_output": "assistant",
+    "custom_tool_call": "assistant",
+    "custom_tool_call_output": "assistant",
+    "reasoning": "assistant",
+    "web_search_call": "assistant",
+    "web_search_end": "assistant",
+    "patch_apply_end": "assistant",
+    "mcp_tool_call_end": "assistant",
+    "token_count": "system",
+    "task_started": "system",
+    "task_complete": "system",
+    "context_compacted": "system",
+    "turn_aborted": "system",
+}
+
+_CODEX_TOOL_NAME_MAP: dict[str, str] = {"exec_command": "Bash"}
+
+_VALID_ROLES: frozenset[str] = frozenset({"user", "assistant", "system", "tool"})
+
+
+def _codex_coerce_str(value: object) -> str | None:
+    if isinstance(value, str):
+        value = value.strip()
+        return value if value else None
+    return None
+
+
+def _codex_coerce_role(value: object) -> Role | None:
+    if not isinstance(value, str):
+        return None
+    role = value.strip().lower()
+    if not role:
+        return None
+    if role == "developer":
+        return Role.ASSISTANT
+    if role in _VALID_ROLES:
+        return cast(Role, role)
+    return None
+
+
+def _codex_normalize_content(value: object) -> object:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        blocks: list[dict[str, Any]] = []
+        for item in value:
+            if isinstance(item, str):
+                blocks.append({"type": "text", "text": item})
+            elif isinstance(item, dict):
+                blocks.append(cast(dict[str, Any], item))
+        return blocks
+    if isinstance(value, dict):
+        typed_value = cast(dict[str, Any], value)
+        if isinstance(typed_value.get("text"), str):
+            return [{"type": "text", "text": typed_value.get("text", "")}]
+        if isinstance(typed_value.get("message"), str):
+            return typed_value.get("message")
+        raw_message = typed_value.get("message")
+        if isinstance(raw_message, list):
+            parts: list[str] = []
+            for item in raw_message:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    if isinstance(item.get("text"), str):
+                        parts.append(item["text"])
+            if parts:
+                return "\n".join(parts)
+        if isinstance(typed_value.get("text_elements"), list):
+            parts2: list[str] = []
+            for item in typed_value["text_elements"]:
+                if isinstance(item, str):
+                    parts2.append(item)
+                elif isinstance(item, dict):
+                    if isinstance(item.get("text"), str):
+                        parts2.append(item["text"])
+            if parts2:
+                return "\n".join(parts2)
+        if any(
+            k in typed_value for k in ("content", "payload", "parts", "message")
+        ):
+            return str(typed_value)
+        return value
+    return value
+
+
+def _codex_coerce_payload_role(payload: dict[str, Any]) -> str:
+    payload_type = _codex_coerce_str(payload.get("type")) or ""
+    return _CODEX_PAYLOAD_TYPE_TO_ROLE.get(payload_type, "")
+
+
+def _codex_coerce_tool_name(tool_name: str | None) -> str:
+    if not tool_name:
+        return "tool"
+    return _CODEX_TOOL_NAME_MAP.get(tool_name, tool_name)
+
+
+def _codex_normalize_tool_payload(payload: dict[str, Any]) -> object:
+    payload_type = _codex_coerce_str(payload.get("type")) or ""
+    if payload_type in {"function_call", "custom_tool_call", "tool_search_call"}:
+        call_id = _codex_coerce_str(payload.get("call_id")) or ""
+        tool_name = _codex_coerce_tool_name(_codex_coerce_str(payload.get("name")))
+        arguments = payload.get("arguments")
+        if not isinstance(arguments, dict):
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError):
+                    arguments = {"input": arguments}
+            else:
+                arguments = {}
+        if arguments is None:
+            arguments = {}
+        return [
+            {
+                "type": "tool_use",
+                "id": call_id,
+                "name": tool_name,
+                "input": arguments,
+            }
+        ]
+    if payload_type in {
+        "function_call_output",
+        "custom_tool_call_output",
+        "tool_search_output",
+    }:
+        call_id = _codex_coerce_str(payload.get("call_id")) or _codex_coerce_str(
+            payload.get("tool_use_id")
+        ) or ""
+        tool_output = payload.get("output")
+        content: object = tool_output
+        if isinstance(content, str):
+            try:
+                decoded = json.loads(content)
+            except (json.JSONDecodeError, TypeError):
+                decoded = None
+            if isinstance(decoded, list):
+                content = decoded
+        return [
+            {
+                "type": "tool_result",
+                "tool_use_id": call_id,
+                "content": content,
+            }
+        ]
+    return None
+
+
+def _codex_extract_token_usage(payload: dict[str, Any]) -> dict[str, int] | None:
+    """Return token-usage dict for ``token_count`` payloads, else None.
+
+    Returning None for the (overwhelmingly common) non-``token_count`` case
+    avoids allocating a fresh zero-valued dict for every record during scan.
+    """
+    payload_type = _codex_coerce_str(payload.get("type")) or ""
+    if payload_type != "token_count":
+        return None
+
+    info = payload.get("info")
+    if not isinstance(info, dict):
+        return None
+
+    usage: dict[str, int] = {
+        "input_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+    }
+
+    total = info.get("total_token_usage")
+    if isinstance(total, dict):
+        raw_input = total.get("input_tokens")
+        if isinstance(raw_input, int):
+            usage["input_tokens"] = raw_input
+
+        raw_cached = total.get("cached_input_tokens")
+        if isinstance(raw_cached, int):
+            usage["cache_read_input_tokens"] = raw_cached
+
+        raw_cached_create = total.get("cache_creation_input_tokens")
+        if isinstance(raw_cached_create, int):
+            usage["cache_creation_input_tokens"] = raw_cached_create
+
+    last = info.get("last_token_usage")
+    if isinstance(last, dict):
+        raw_input = last.get("input_tokens")
+        if isinstance(raw_input, int):
+            usage["input_tokens"] = max(usage["input_tokens"], raw_input)
+
+        raw_cached = last.get("cached_input_tokens")
+        if isinstance(raw_cached, int):
+            usage["cache_read_input_tokens"] = max(
+                usage["cache_read_input_tokens"], raw_cached
+            )
+
+        raw_cached_create = last.get("cache_creation_input_tokens")
+        if isinstance(raw_cached_create, int):
+            usage["cache_creation_input_tokens"] = max(
+                usage["cache_creation_input_tokens"], raw_cached_create
+            )
+
+    return usage
+
+
+def _codex_extract_role_from_source(payload: object) -> Role | None:
+    if isinstance(payload, dict):
+        payload_dict = cast(dict[str, Any], payload)
+        return _codex_coerce_role(payload_dict.get("role"))
+    if isinstance(payload, str):
+        payload = payload.strip()
+        if payload.startswith("{") and payload.endswith("}"):
+            try:
+                decoded = json.loads(payload)
+            except (json.JSONDecodeError, TypeError):
+                return None
+            if isinstance(decoded, dict):
+                decoded_dict = cast(dict[str, Any], decoded)
+                return _codex_coerce_role(decoded_dict.get("role"))
+    return None
+
+
 @dataclass
 class ValidationOutcome:
     records: list[dict[str, Any]]
@@ -256,227 +499,9 @@ class CodexCodec(SessionCodec):
             msg = {}
         msg = cast(dict[str, Any], msg)
 
-        type_to_role = {
-            "SessionMetaLine": "system",
-            "session_meta": "system",
-            "session_meta_line": "system",
-            "EventMsg": "assistant",
-            "RolloutLine": "assistant",
-            "response": "assistant",
-            "response_item": "assistant",
-        }
-
-        def _coerce_str(value: object) -> str | None:
-            if isinstance(value, str):
-                value = value.strip()
-                return value if value else None
-            return None
-
-        def _coerce_role(value: object) -> Role | None:
-            role = _coerce_str(value) or ""
-            role = role.lower()
-            if role == "developer":
-                return Role.ASSISTANT
-            if role in {"user", "assistant", "system", "tool"}:
-                return cast(Role, role)
-            return None
-
-        def _normalize_content(value: object) -> object:
-            if isinstance(value, str):
-                return value
-            if isinstance(value, list):
-                blocks: list[dict[str, Any]] = []
-                for item in value:
-                    if isinstance(item, str):
-                        blocks.append({"type": "text", "text": item})
-                    elif isinstance(item, dict):
-                        blocks.append(cast(dict[str, Any], item))
-                return blocks
-            if isinstance(value, dict):
-                typed_value = cast(dict[str, Any], value)
-                if isinstance(typed_value.get("text"), str):
-                    return [
-                        {"type": "text", "text": typed_value.get("text", "")}
-                    ]
-                if isinstance(typed_value.get("message"), str):
-                    return typed_value.get("message")
-                raw_message = typed_value.get("message")
-                if isinstance(raw_message, list):
-                    parts = []
-                    for item in raw_message:
-                        if isinstance(item, str):
-                            parts.append(item)
-                        elif isinstance(item, dict):
-                            if isinstance(item.get("text"), str):
-                                parts.append(item["text"])
-                    if parts:
-                        return "\n".join(parts)
-                if isinstance(typed_value.get("text_elements"), list):
-                    parts = []
-                    for item in typed_value["text_elements"]:
-                        if isinstance(item, str):
-                            parts.append(item)
-                        elif isinstance(item, dict):
-                            if isinstance(item.get("text"), str):
-                                parts.append(item["text"])
-                    if parts:
-                        return "\n".join(parts)
-                if any(
-                    k in typed_value for k in ("content", "payload", "parts", "message")
-                ):
-                    return str(typed_value)
-                return value
-            return value
-
-        def _coerce_payload_role(payload: dict[str, Any]) -> str:
-            payload_type = _coerce_str(payload.get("type")) or ""
-            payload_role = {
-                "user_message": "user",
-                "assistant_message": "assistant",
-                "agent_message": "assistant",
-                "message": "assistant",
-                "function_call": "assistant",
-                "function_call_output": "assistant",
-                "tool_search_call": "assistant",
-                "tool_search_output": "assistant",
-                "custom_tool_call": "assistant",
-                "custom_tool_call_output": "assistant",
-                "reasoning": "assistant",
-                "web_search_call": "assistant",
-                "web_search_end": "assistant",
-                "patch_apply_end": "assistant",
-                "mcp_tool_call_end": "assistant",
-                "token_count": "system",
-                "task_started": "system",
-                "task_complete": "system",
-                "context_compacted": "system",
-                "turn_aborted": "system",
-            }.get(payload_type, "")
-            return payload_role
-
-        def _coerce_tool_name(tool_name: str | None) -> str:
-            if not tool_name:
-                return "tool"
-            return {"exec_command": "Bash"}.get(tool_name, tool_name)
-
-        def _normalize_tool_payload(payload: dict[str, Any]) -> object:
-            payload_type = _coerce_str(payload.get("type")) or ""
-            if payload_type in {"function_call", "custom_tool_call", "tool_search_call"}:
-                call_id = _coerce_str(payload.get("call_id")) or ""
-                tool_name = _coerce_tool_name(_coerce_str(payload.get("name")))
-                arguments = payload.get("arguments")
-                if not isinstance(arguments, dict):
-                    if isinstance(arguments, str):
-                        try:
-                            arguments = json.loads(arguments)
-                        except (json.JSONDecodeError, TypeError):
-                            arguments = {"input": arguments}
-                    else:
-                        arguments = {}
-                if arguments is None:
-                    arguments = {}
-                return [
-                    {
-                        "type": "tool_use",
-                        "id": call_id,
-                        "name": tool_name,
-                        "input": arguments,
-                    }
-                ]
-            if payload_type in {
-                "function_call_output",
-                "custom_tool_call_output",
-                "tool_search_output",
-            }:
-                call_id = _coerce_str(payload.get("call_id")) or _coerce_str(
-                    payload.get("tool_use_id")
-                ) or ""
-                tool_output = payload.get("output")
-                content: object = tool_output
-                if isinstance(content, str):
-                    try:
-                        decoded = json.loads(content)
-                    except (json.JSONDecodeError, TypeError):
-                        decoded = None
-                    if isinstance(decoded, list):
-                        content = decoded
-                return [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": call_id,
-                        "content": content,
-                    }
-                ]
-            return None
-
-        def _extract_token_usage(payload: dict[str, Any]) -> dict[str, int]:
-            usage: dict[str, int] = {
-                "input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-            }
-
-            payload_type = _coerce_str(payload.get("type")) or ""
-            if payload_type != "token_count":
-                return usage
-
-            info = payload.get("info")
-            if not isinstance(info, dict):
-                return usage
-
-            total = info.get("total_token_usage")
-            if isinstance(total, dict):
-                raw_input = total.get("input_tokens")
-                if isinstance(raw_input, int):
-                    usage["input_tokens"] = raw_input
-
-                raw_cached = total.get("cached_input_tokens")
-                if isinstance(raw_cached, int):
-                    usage["cache_read_input_tokens"] = raw_cached
-
-                raw_cached_create = total.get("cache_creation_input_tokens")
-                if isinstance(raw_cached_create, int):
-                    usage["cache_creation_input_tokens"] = raw_cached_create
-
-            last = info.get("last_token_usage")
-            if isinstance(last, dict):
-                raw_input = last.get("input_tokens")
-                if isinstance(raw_input, int):
-                    usage["input_tokens"] = max(usage["input_tokens"], raw_input)
-
-                raw_cached = last.get("cached_input_tokens")
-                if isinstance(raw_cached, int):
-                    usage["cache_read_input_tokens"] = max(
-                        usage["cache_read_input_tokens"], raw_cached
-                    )
-
-                raw_cached_create = last.get("cache_creation_input_tokens")
-                if isinstance(raw_cached_create, int):
-                    usage["cache_creation_input_tokens"] = max(
-                        usage["cache_creation_input_tokens"], raw_cached_create
-                    )
-
-            return usage
-
-        def _extract_role_from_source(payload: object) -> Role | None:
-            if isinstance(payload, dict):
-                payload_dict = cast(dict[str, Any], payload)
-                return _coerce_role(payload_dict.get("role"))
-            if isinstance(payload, str):
-                payload = payload.strip()
-                if payload.startswith("{") and payload.endswith("}"):
-                    try:
-                        decoded = json.loads(payload)
-                    except (json.JSONDecodeError, TypeError):
-                        return None
-                    if isinstance(decoded, dict):
-                        decoded_dict = cast(dict[str, Any], decoded)
-                        return _coerce_role(decoded_dict.get("role"))
-            return None
-
         # Normalize identifier fields used for Codex session bundling.
         for alias in ("thread_id", "session_id", "conversation_id", "turn_id", "id"):
-            candidate = _coerce_str(normalized.get(alias))
+            candidate = _codex_coerce_str(normalized.get(alias))
             if candidate:
                 if alias == "id" and candidate and "uuid" not in normalized:
                     normalized["uuid"] = candidate
@@ -486,9 +511,9 @@ class CodexCodec(SessionCodec):
         payload = normalized.get("payload")
         msg_derived_from_payload_content = False
         if isinstance(payload, dict):
-            payload_type = _coerce_str(payload.get("type")) or ""
-            token_usage = _extract_token_usage(payload)
-            if any(v > 0 for v in token_usage.values()):
+            payload_type = _codex_coerce_str(payload.get("type")) or ""
+            token_usage = _codex_extract_token_usage(payload)
+            if token_usage is not None and any(v > 0 for v in token_usage.values()):
                 normalized["usage"] = {
                     "input_tokens": token_usage["input_tokens"],
                     "cache_read_input_tokens": token_usage["cache_read_input_tokens"],
@@ -504,13 +529,13 @@ class CodexCodec(SessionCodec):
             elif isinstance(payload_msg, str):
                 msg = {
                     "content": payload_msg,
-                    "role": _coerce_role(payload.get("originator")),
+                    "role": _codex_coerce_role(payload.get("originator")),
                 }
                 msg_derived_from_payload_content = True
             elif isinstance(payload.get("content"), str):
                 msg = {
                     "content": payload.get("content"),
-                    "role": _coerce_role(payload.get("originator")) or "assistant",
+                    "role": _codex_coerce_role(payload.get("originator")) or "assistant",
                 }
                 msg_derived_from_payload_content = True
             elif isinstance(payload.get("content"), list):
@@ -525,25 +550,25 @@ class CodexCodec(SessionCodec):
                 if pieces:
                     msg = {
                         "content": "\n".join(pieces),
-                        "role": _coerce_role(payload.get("originator")) or "assistant",
+                        "role": _codex_coerce_role(payload.get("originator")) or "assistant",
                     }
                     msg_derived_from_payload_content = True
             if not msg:
-                normalized_tool_blocks = _normalize_tool_payload(payload)
+                normalized_tool_blocks = _codex_normalize_tool_payload(payload)
                 if isinstance(normalized_tool_blocks, list) and normalized_tool_blocks:
                     msg = {
                         "content": normalized_tool_blocks,
-                        "role": _coerce_payload_role(payload) or "assistant",
+                        "role": _codex_coerce_payload_role(payload) or "assistant",
                     }
                     msg_derived_from_payload_content = True
 
                 if not msg:
                     for key in ("response", "event_msg", "response_item"):
-                        candidate = _coerce_str(payload.get(key))
+                        candidate = _codex_coerce_str(payload.get(key))
                         if candidate:
                             msg = {
                                 "content": candidate,
-                                "role": _coerce_role(payload.get("originator"))
+                                "role": _codex_coerce_role(payload.get("originator"))
                                 or "assistant",
                             }
                             msg_derived_from_payload_content = True
@@ -551,7 +576,7 @@ class CodexCodec(SessionCodec):
 
                 if not msg and payload_type == "token_count":
                     msg = {
-                        "role": _coerce_payload_role(payload) or "system",
+                        "role": _codex_coerce_payload_role(payload) or "system",
                         "content": "codex token_count",
                     }
                     msg_derived_from_payload_content = True
@@ -559,7 +584,7 @@ class CodexCodec(SessionCodec):
                 if not msg:
                     # Fallback: preserve event-style payloads as content-bearing
                     # messages so reduction can estimate and route them correctly.
-                    payload_role = _coerce_payload_role(payload)
+                    payload_role = _codex_coerce_payload_role(payload)
                     if payload_role:
                         payload_content = payload.get("content")
                         if not isinstance(payload_content, str):
@@ -584,33 +609,33 @@ class CodexCodec(SessionCodec):
         content = normalized.get("content")
         if "content" in normalized and content is not None and "content" not in msg:
             msg = cast(dict[str, Any], msg)
-            msg["content"] = cast(Any, _normalize_content(content))
+            msg["content"] = cast(Any, _codex_normalize_content(content))
             normalized.pop("content", None)
 
         if isinstance(msg, dict):
-            role = _coerce_role(msg.get("role"))
+            role = _codex_coerce_role(msg.get("role"))
             if not role:
-                role = _coerce_role(normalized.get("role"))
+                role = _codex_coerce_role(normalized.get("role"))
             if not role:
-                role = _coerce_role(normalized.get("originator"))
+                role = _codex_coerce_role(normalized.get("originator"))
             if not role:
                 if isinstance(payload, dict):
-                    role = _coerce_payload_role(payload)
+                    role = _codex_coerce_payload_role(payload)
             if not role:
-                role = _extract_role_from_source(normalized.get("source"))
+                role = _codex_extract_role_from_source(normalized.get("source"))
             if not role:
-                role = type_to_role.get(str(normalized.get("type")), "assistant")
+                role = _CODEX_TYPE_TO_ROLE.get(str(normalized.get("type")), "assistant")
             msg = cast(dict[str, Any], msg)
             msg["role"] = role
-            msg["content"] = cast(Any, _normalize_content(msg.get("content")))
+            msg["content"] = cast(Any, _codex_normalize_content(msg.get("content")))
 
             # Carry thread identifiers through from nested sources for
             # downstream rollup reconstruction.
             if isinstance(payload, dict):
-                thread_id = _coerce_str(payload.get("thread_id"))
+                thread_id = _codex_coerce_str(payload.get("thread_id"))
                 if thread_id:
                     normalized.setdefault("thread_id", thread_id)
-                session_id = _coerce_str(payload.get("session_id"))
+                session_id = _codex_coerce_str(payload.get("session_id"))
                 if session_id:
                     normalized.setdefault("session_id", session_id)
 
@@ -633,11 +658,11 @@ class CodexCodec(SessionCodec):
                 msg = {"content": raw_content, "role": "assistant"}
             elif isinstance(raw_content, dict) and raw_content:
                 msg = {
-                    "content": _normalize_content(raw_content),
+                    "content": _codex_normalize_content(raw_content),
                     "role": "assistant",
                 }
             elif isinstance(raw_content, list) and raw_content:
-                msg = {"content": _normalize_content(raw_content), "role": "assistant"}
+                msg = {"content": _codex_normalize_content(raw_content), "role": "assistant"}
             else:
                 msg = {}
 
@@ -750,7 +775,9 @@ class CodexCodec(SessionCodec):
         return new
 
 
-_CODECS: tuple[SessionCodec, ...] = (ClaudeCodec(), CodexCodec())
+_CLAUDE_CODEC: SessionCodec = ClaudeCodec()
+_CODEX_CODEC: SessionCodec = CodexCodec()
+_CODECS: tuple[SessionCodec, ...] = (_CLAUDE_CODEC, _CODEX_CODEC)
 
 
 def _available_codecs() -> tuple[SessionCodec, ...]:
@@ -759,27 +786,45 @@ def _available_codecs() -> tuple[SessionCodec, ...]:
 
 def get_codec(format_name: str | None) -> SessionCodec:
     if not format_name:
-        return ClaudeCodec()
+        return _CLAUDE_CODEC
     by_name = {codec.name: codec for codec in _available_codecs()}
-    return by_name.get(format_name.lower(), ClaudeCodec())
+    return by_name.get(format_name.lower(), _CLAUDE_CODEC)
 
 
 def detect_codec(raw_records: list[dict[str, Any]]) -> SessionCodec:
     """Pick the best codec for the given sample of records."""
     if not raw_records:
-        return ClaudeCodec()
+        return _CLAUDE_CODEC
 
-    scores: dict[str, int] = {codec.name: 0 for codec in _available_codecs()}
+    codecs = _CODECS
+
+    # Fast path: a single record can short-circuit to the highest-priority
+    # codec that claims it without building a full score dict or iterating
+    # twice. The hot scan path normalizes records one at a time, so this
+    # case dominates.
+    if len(raw_records) == 1:
+        record = raw_records[0]
+        best: SessionCodec | None = None
+        best_priority = -1
+        for codec in codecs:
+            if codec.detects(record) and codec.priority > best_priority:
+                best = codec
+                best_priority = codec.priority
+        return best if best is not None else _CLAUDE_CODEC
+
+    scores: list[int] = [0] * len(codecs)
     for record in raw_records:
-        for codec in _available_codecs():
+        for idx, codec in enumerate(codecs):
             if codec.detects(record):
-                scores[codec.name] += codec.priority
+                scores[idx] += codec.priority
 
-    best_name = max(scores.items(), key=lambda item: item[1])[0]
-    for codec in _available_codecs():
-        if codec.name == best_name:
-            return codec
-    return ClaudeCodec()
+    best_idx = 0
+    best_score = scores[0]
+    for idx in range(1, len(scores)):
+        if scores[idx] > best_score:
+            best_score = scores[idx]
+            best_idx = idx
+    return codecs[best_idx]
 
 
 def _default_schema_path(codec_name: str | None) -> str | None:
